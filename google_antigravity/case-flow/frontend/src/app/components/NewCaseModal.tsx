@@ -1,6 +1,7 @@
 import { Modal, Button, TextInput, Select, Textarea, Stack } from '@mantine/core';
 import { useForm } from '@mantine/form';
 import { useState } from 'react';
+import { apiUrl } from '../lib/api';
 
 interface NewCaseModalProps {
   opened: boolean;
@@ -28,7 +29,7 @@ export default function NewCaseModal({ opened, onClose, onCaseCreated }: NewCase
   const handleSubmit = async (values: typeof form.values) => {
     setLoading(true);
     try {
-      const response = await fetch('http://localhost:8000/api/cases/', {
+      const response = await fetch(apiUrl('/api/cases/'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

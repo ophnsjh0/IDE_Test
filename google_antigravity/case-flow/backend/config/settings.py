@@ -10,10 +10,17 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+import os
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Load environment variables from the project-root .env file
+# (case-flow/.env). Existing shell variables take precedence.
+load_dotenv(BASE_DIR.parent / '.env')
 
 
 # Quick-start development settings - unsuitable for production
@@ -25,11 +32,13 @@ SECRET_KEY = 'django-insecure-nf+jom4-at!bh3m)_a6a#_!jzpekr!7t#d%(vtv7kin$^)xcn_
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+# 사내망의 다른 PC에서 IP로 접근할 수 있도록 허용 (개발용 — 운영 전환 시 도메인으로 제한할 것)
+ALLOWED_HOSTS = ['*']
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-]
+# CORS_ALLOWED_ORIGINS = [
+#     "http://localhost:3000",
+# ]
+CORS_ALLOW_ALL_ORIGINS = True
 
 
 # Application definition
@@ -123,3 +132,49 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+
+
+# Gmail integration
+# credentials.json: OAuth client downloaded from Google Cloud Console
+# token.json: created automatically after the first OAuth consent
+GMAIL_CREDENTIALS_FILE = os.environ.get('GMAIL_CREDENTIALS_FILE', str(BASE_DIR / 'credentials.json'))
+GMAIL_TOKEN_FILE = os.environ.get('GMAIL_TOKEN_FILE', str(BASE_DIR / 'token.json'))
+
+# Gmail sync filters
+# Only fetch mail newer than this many days (0 = no limit).
+GMAIL_SYNC_LOOKBACK_DAYS = int(os.environ.get('GMAIL_SYNC_LOOKBACK_DAYS', '30'))
+# Mail whose subject contains any of these keywords is labeled
+# CaseFlow/Ignored and never registered as a case.
+GMAIL_SYNC_EXCLUDE_SUBJECTS = [
+    keyword.strip()
+    for keyword in os.environ.get(
+        'GMAIL_SYNC_EXCLUDE_SUBJECTS',
+        'newsletter,webinar,survey,digest,invitation,promotion',
+    ).split(',')
+    if keyword.strip()
+]
+
+# AI 분석용 API 키 (email translation). 키가 비어 있으면 해당 제공자 모델 사용 불가.
+# ANTHROPIC_API_KEY is preferred; CLAUDE_API_KEY is accepted as an alias.
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('CLAUDE_API_KEY', '')
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY') or os.environ.get('GEMINI_API_KEY', '')
+
+# 번역/분석 모델 선택 — 사용할 모델 한 줄만 활성화하고 나머지는 주석 처리.
+# 모델 이름 접두어(claude-/gpt-/gemini-)로 제공자를 자동 판별해 해당 API 키를 사용한다.
+# 환경변수 CASEFLOW_TRANSLATION_MODEL이 설정되어 있으면 그 값이 우선한다.
+#
+# --- Anthropic Claude (ANTHROPIC_API_KEY / CLAUDE_API_KEY) ---
+# _TRANSLATION_MODEL_DEFAULT = 'claude-opus-4-8'        # $5/$25 per 1M tokens — 최고 품질
+# _TRANSLATION_MODEL_DEFAULT = 'claude-sonnet-5'        # $3/$15 — 품질/비용 중간
+_TRANSLATION_MODEL_DEFAULT = 'claude-haiku-4-5'         # $1/$5 — 최저 비용
+#
+# --- OpenAI (OPENAI_API_KEY) ---
+# _TRANSLATION_MODEL_DEFAULT = 'gpt-5.5'                # $5/$30 — 하이 (플래그십)
+# _TRANSLATION_MODEL_DEFAULT = 'gpt-5.4'                # $2.5/$15 — 중간
+# _TRANSLATION_MODEL_DEFAULT = 'gpt-5.4-nano'           # $0.2/$1.25 — 로우 (대량 처리용)
+#
+# --- Google Gemini (GOOGLE_API_KEY / GEMINI_API_KEY, 무료 티어 1,500건/일) ---
+# _TRANSLATION_MODEL_DEFAULT = 'gemini-3.5-flash'       # 무료 티어 — Flash (최신 GA)
+# _TRANSLATION_MODEL_DEFAULT = 'gemini-3.1-flash-lite'  # 무료 티어 — Flash-Lite (최저 비용)
+TRANSLATION_MODEL = os.environ.get('CASEFLOW_TRANSLATION_MODEL', _TRANSLATION_MODEL_DEFAULT)

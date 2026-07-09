@@ -8,3 +8,12 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Environment variables — API keys live here, never commit
+.env
+
+# Gmail OAuth secrets — never commit these
+backend/credentials.json
+backend/token.json
+credentials.json
+token.json

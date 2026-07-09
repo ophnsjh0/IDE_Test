@@ -20,7 +20,28 @@ import {
   Select,
 } from '@mantine/core';
 import { useForm } from '@mantine/form';
-import { IconArrowLeft, IconEdit, IconDeviceFloppy } from '@tabler/icons-react'; // IconDeviceFloppy for Save
+import {
+  IconArrowLeft,
+  IconEdit,
+  IconDeviceFloppy,
+  IconMailDown,
+  IconMailUp,
+  IconLanguage,
+} from '@tabler/icons-react'; // IconDeviceFloppy for Save
+import AppHeader from '../../components/AppHeader';
+import { apiUrl } from '../../lib/api';
+
+interface CaseEmail {
+  id: number;
+  direction: string;
+  sender: string;
+  recipient: string;
+  subject: string;
+  subject_ko: string;
+  body_original: string;
+  body_ko: string;
+  received_at: string;
+}
 
 interface CaseDetail {
   id: number;
@@ -31,8 +52,12 @@ interface CaseDetail {
   description: string;
   action_steps: string;
   resolution: string;
+  source: string;
+  analyzed_by: string;
+  vendor_case_number: string | null;
   date: string;
   created_at: string;
+  emails: CaseEmail[];
 }
 
 export default function CaseDetailPage() {
@@ -56,7 +81,7 @@ export default function CaseDetailPage() {
 
   useEffect(() => {
     if (id) {
-      fetch(`http://localhost:8000/api/cases/${id}/`)
+      fetch(apiUrl(`/api/cases/${id}/`))
         .then((res) => {
           if (res.ok) return res.json();
           throw new Error('Failed to fetch case');
@@ -80,7 +105,7 @@ export default function CaseDetailPage() {
   const handleSave = async () => {
       setSaving(true);
       try {
-          const response = await fetch(`http://localhost:8000/api/cases/${id}/`, {
+          const response = await fetch(apiUrl(`/api/cases/${id}/`), {
               method: 'PATCH',
               headers: {
                   'Content-Type': 'application/json',
@@ -135,9 +160,7 @@ export default function CaseDetailPage() {
   return (
     <AppShell header={{ height: 60 }} padding="md">
         <AppShell.Header>
-        <Group h="100%" px="md">
-            <Title order={3} c="blue">Case-Flow UV</Title>
-        </Group>
+        <AppHeader />
       </AppShell.Header>
 
       <AppShell.Main>
@@ -198,6 +221,12 @@ export default function CaseDetailPage() {
               )}
             </Group>
 
+            {caseDetail.analyzed_by && (
+              <Text size="xs" c="dimmed">
+                AI 분석: {caseDetail.analyzed_by}
+              </Text>
+            )}
+
             <Divider my="sm" />
 
             <Stack gap="md" mt="md">
@@ -251,12 +280,71 @@ export default function CaseDetailPage() {
 
               <Text c="dimmed" size="sm" mt="xl">
                 Created on: {new Date(caseDetail.created_at).toLocaleString()}
+                {caseDetail.vendor_case_number && ` · Vendor Case #${caseDetail.vendor_case_number}`}
+                {caseDetail.source === 'email' && ' · Gmail에서 자동 등록됨'}
               </Text>
             </Stack>
           </Paper>
+
+          {caseDetail.emails && caseDetail.emails.length > 0 && (
+            <Paper shadow="xs" p="xl" withBorder mt="lg">
+              <Title order={3} mb="md">이메일 타임라인 ({caseDetail.emails.length})</Title>
+              <Stack gap="md">
+                {caseDetail.emails.map((email) => (
+                  <EmailCard key={email.id} email={email} />
+                ))}
+              </Stack>
+            </Paper>
+          )}
         </Container>
       </AppShell.Main>
     </AppShell>
+  );
+}
+
+function EmailCard({ email }: { email: CaseEmail }) {
+  const [showOriginal, setShowOriginal] = useState(false);
+  const inbound = email.direction === 'inbound';
+  const hasTranslation = !!email.body_ko;
+  // 번역이 없으면 원문만 표시
+  const body = showOriginal || !hasTranslation ? email.body_original : email.body_ko;
+  const subject = showOriginal || !email.subject_ko ? email.subject : email.subject_ko;
+
+  return (
+    <Paper withBorder p="md" bg={inbound ? 'blue.0' : 'gray.0'}>
+      <Group justify="space-between" mb="xs">
+        <Group gap="xs">
+          <Badge
+            color={inbound ? 'blue' : 'gray'}
+            variant="light"
+            leftSection={inbound ? <IconMailDown size={12} /> : <IconMailUp size={12} />}
+          >
+            {inbound ? '수신 (벤더)' : '발신'}
+          </Badge>
+          <Text size="sm" c="dimmed">{email.sender}</Text>
+        </Group>
+        <Group gap="xs">
+          <Text size="sm" c="dimmed">{new Date(email.received_at).toLocaleString()}</Text>
+          {hasTranslation && (
+            <Button
+              size="compact-xs"
+              variant={showOriginal ? 'filled' : 'default'}
+              leftSection={<IconLanguage size={12} />}
+              onClick={() => setShowOriginal((v) => !v)}
+            >
+              {showOriginal ? '번역 보기' : '원문 보기'}
+            </Button>
+          )}
+        </Group>
+      </Group>
+      <Text fw={600} mb="xs">{subject}</Text>
+      <Text size="sm" style={{ whiteSpace: 'pre-wrap' }}>{body}</Text>
+      {!hasTranslation && (
+        <Text size="xs" c="dimmed" fs="italic" mt="xs">
+          번역본이 없습니다 (원문 표시 중)
+        </Text>
+      )}
+    </Paper>
   );
 }
 
