@@ -81,6 +81,18 @@ def detect_vendor_and_direction(sender, recipient, original_sender='', cc=''):
         recipient_vendor = vendor_from_domain(domain_of(addr))
         if recipient_vendor:
             return recipient_vendor, 'outbound'
+    # 고객사↔당사 스레드([Caseopen] 등)는 벤더 도메인이 어디에도 없다.
+    # 수신자/참조에 낀 사내 그룹 주소(adc@ → A10)로 벤더를 추정하고,
+    # 방향은 작성자가 당사 도메인이면 outbound(당사→고객), 아니면 inbound.
+    hints = settings.GROUP_VENDOR_HINTS
+    if hints:
+        our_domains = {address.split('@', 1)[1] for address in hints if '@' in address}
+        for _, addr in getaddresses(recipient_fields + [sender or '', original_sender or '']):
+            hinted_vendor = hints.get(addr.lower())
+            if hinted_vendor:
+                author_domain = domain_of(sender) or domain_of(original_sender)
+                direction = 'outbound' if author_domain in our_domains else 'inbound'
+                return hinted_vendor, direction
     return None, 'inbound'
 
 
@@ -169,6 +181,9 @@ def build_gmail_query():
     for domain in VENDOR_DOMAINS:
         parts.append(f'from:{domain}')
         parts.append(f'to:{domain}')
+    # 벤더 도메인이 없는 고객사↔당사 케이스 스레드([Caseopen] 등)도 수집
+    for keyword in settings.GMAIL_SYNC_INCLUDE_SUBJECTS:
+        parts.append(f'subject:"{keyword}"' if ' ' in keyword else f'subject:{keyword}')
     query = '{' + ' '.join(parts) + '}'
 
     if settings.GMAIL_SYNC_LOOKBACK_DAYS > 0:

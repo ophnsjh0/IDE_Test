@@ -205,6 +205,28 @@ GMAIL_SYNC_EXCLUDE_SUBJECTS = [
     if keyword.strip()
 ]
 
+# 벤더 도메인이 from/to 어디에도 없어도 수집할 제목 키워드.
+# 고객사↔당사 간 케이스 스레드([Caseopen] ...)는 벤더 도메인 매칭에
+# 걸리지 않아 이 키워드로 건져낸다.
+GMAIL_SYNC_INCLUDE_SUBJECTS = [
+    keyword.strip()
+    for keyword in os.environ.get('GMAIL_SYNC_INCLUDE_SUBJECTS', 'Caseopen').split(',')
+    if keyword.strip()
+]
+
+# 사내 그룹 주소 → 벤더 매핑. 벤더 도메인이 없는 메일(고객사↔당사)의
+# 수신자/참조에 낀 그룹 주소로 벤더를 추정한다. 값은 Case.VENDOR_CHOICES와
+# 일치해야 함. 형식: 'adc@ubersys.co.kr=A10,other@ubersys.co.kr=Arista'
+GROUP_VENDOR_HINTS = {
+    address.strip().lower(): vendor.strip()
+    for address, _, vendor in (
+        entry.partition('=')
+        for entry in os.environ.get(
+            'CASEFLOW_GROUP_VENDOR_HINTS', 'adc@ubersys.co.kr=A10').split(',')
+    )
+    if address.strip() and vendor.strip()
+}
+
 # AI 분석용 API 키 (email translation). 키가 비어 있으면 해당 제공자 모델 사용 불가.
 # ANTHROPIC_API_KEY is preferred; CLAUDE_API_KEY is accepted as an alias.
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('CLAUDE_API_KEY', '')

@@ -1,8 +1,9 @@
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from .models import Case, CaseEmail
-from .services.email_parser import extract_device_info, normalize_body
+from .services.email_parser import (build_gmail_query, detect_vendor_and_direction,
+                                    extract_device_info, normalize_body)
 from .services.gmail_sync import _find_case, apply_device_info
 
 
@@ -588,3 +589,44 @@ class CaseRelationTests(TestCase):
                                {'case_id': f'C-{1000 + self.a.id}'},
                                content_type='application/json')
         self.assertEqual(own.status_code, 400)
+
+
+@override_settings(GROUP_VENDOR_HINTS={'adc@ubersys.co.kr': 'A10'},
+                   GMAIL_SYNC_INCLUDE_SUBJECTS=['Caseopen'])
+class CustomerThreadVendorTests(TestCase):
+    """벤더 도메인이 없는 고객사↔당사 스레드([Caseopen])의 벤더 추정."""
+
+    def test_customer_mail_with_group_cc_gets_hinted_vendor(self):
+        vendor, direction = detect_vendor_and_direction(
+            '"엄현식" <hyunsik.um@samsung.com>',
+            '"성의제" <ujseong22@ubersys.co.kr>',
+            cc='"위버시스템즈(A10)" <adc@ubersys.co.kr>, IaaS NW <iaas.nw@samsung.com>',
+        )
+        self.assertEqual((vendor, direction), ('A10', 'inbound'))
+
+    def test_our_reply_to_customer_is_outbound(self):
+        vendor, direction = detect_vendor_and_direction(
+            '"성의제" <ujseong22@ubersys.co.kr>',
+            'hyunsik.um@samsung.com',
+            cc='"adc@ubersys.co.kr" <adc@ubersys.co.kr>',
+        )
+        self.assertEqual((vendor, direction), ('A10', 'outbound'))
+
+    def test_vendor_domain_still_wins_over_group_hint(self):
+        vendor, direction = detect_vendor_and_direction(
+            'tac@arista.com',
+            'eng@ubersys.co.kr',
+            cc='adc@ubersys.co.kr',
+        )
+        self.assertEqual((vendor, direction), ('Arista', 'inbound'))
+
+    def test_no_hint_and_no_vendor_domain_returns_none(self):
+        vendor, direction = detect_vendor_and_direction(
+            'someone@samsung.com', 'eng@ubersys.co.kr', cc='other@ubersys.co.kr')
+        self.assertIsNone(vendor)
+
+    def test_gmail_query_includes_subject_keywords(self):
+        query = build_gmail_query()
+        self.assertIn('subject:Caseopen', query)
+        # OR 그룹({}) 안에 들어가야 벤더 도메인 조건과 합집합이 된다
+        self.assertIn('subject:Caseopen', query.split('}')[0])
