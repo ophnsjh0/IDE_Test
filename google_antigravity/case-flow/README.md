@@ -12,7 +12,8 @@
 ```bash
 # 터미널 1 — 백엔드 (프로젝트 루트에서)
 export ANTHROPIC_API_KEY="sk-ant-..."   # ~/.zshrc에 설정했다면 생략
-uv run python backend/manage.py runserver
+# 0.0.0.0 바인딩 필수 — 빼면 localhost 전용이 되어 사내망 접속이 안 됨
+uv run python backend/manage.py runserver 0.0.0.0:8000
 # → http://localhost:8000
 
 # 터미널 2 — 프론트엔드
@@ -60,7 +61,8 @@ npm run dev
 
 3. **Start the Development Server**:
    ```bash
-   uv run python backend/manage.py runserver
+   # 0.0.0.0 바인딩 필수 — 빼면 localhost 전용이 되어 사내망 접속이 안 됨
+uv run python backend/manage.py runserver 0.0.0.0:8000
    ```
    The backend will start at `http://localhost:8000`.
    - Health Check: `http://localhost:8000/api/health/`

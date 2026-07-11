@@ -1,6 +1,7 @@
-"""Gmail API client: OAuth handling, message fetch, label management."""
+"""Gmail API client: OAuth handling, message fetch/send, label management."""
 import base64
 import os
+from email.mime.text import MIMEText
 
 from django.conf import settings
 from google.auth.transport.requests import Request
@@ -54,6 +55,19 @@ def get_gmail_service():
             f.write(creds.to_json())
 
     return build('gmail', 'v1', credentials=creds)
+
+
+def send_email(to, subject, html_body):
+    """HTML 메일 발송. 동기화에 쓰는 OAuth 토큰(gmail.modify가 발송 권한 포함)을 재사용한다.
+
+    발신자는 토큰을 발급한 계정이 되고, 보낸 메일은 그 계정의 보낸편지함에 남는다.
+    """
+    service = get_gmail_service()
+    message = MIMEText(html_body, 'html', 'utf-8')
+    message['To'] = to
+    message['Subject'] = subject
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    return service.users().messages().send(userId='me', body={'raw': raw}).execute()
 
 
 def get_or_create_label(service, name=PROCESSED_LABEL):

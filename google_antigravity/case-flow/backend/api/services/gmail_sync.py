@@ -1,6 +1,9 @@
 """Orchestrates a Gmail sync run: fetch -> parse -> AI analyze -> save."""
+import difflib
 import logging
+from datetime import timedelta
 
+from django.db.models import Q
 from django.utils import timezone
 
 from ..models import Case, CaseEmail
@@ -96,7 +99,7 @@ def _process_message(message):
     received_at = _ensure_aware(email_parser.parse_received_at(date_header)) or timezone.now()
 
     case_number = email_parser.extract_case_number(subject)
-    case = _find_case(case_number, thread_id)
+    case = _find_case(case_number, thread_id, vendor, subject, body)
     is_new = case is None
 
     analysis = analyze_email(
@@ -114,6 +117,7 @@ def _process_message(message):
 
     _create_case_email(case, message_id, thread_id, direction, sender, recipient,
                        subject, body, received_at, analysis)
+    apply_device_info(case, subject, body, analysis)
     apply_analysis_to_case(case, analysis, direction, received_at)
     return 'created' if is_new else 'added'
 
@@ -128,6 +132,24 @@ def build_case_context(case):
         # 최근 조치 이력만 (너무 길어지지 않게 뒤에서 1500자)
         lines.append(f"최근 조치 이력:\n{case.action_steps[-1500:]}")
     return '\n'.join(lines)
+
+
+DEVICE_INFO_FIELDS = ('device_model', 'device_serial', 'software_version')
+
+
+def apply_device_info(case, subject, body, analysis):
+    """장비 정보 추출·반영: 정규식 1차 -> AI 분석값 2차, 빈 필드만 채운다.
+
+    저장은 이후 apply_analysis_to_case의 save()가 담당한다.
+    """
+    extracted = email_parser.extract_device_info(subject, body)
+    for field in DEVICE_INFO_FIELDS:
+        if getattr(case, field):
+            continue
+        value = extracted.get(field) or ((analysis or {}).get(field) or '').strip()
+        if value:
+            max_length = case._meta.get_field(field).max_length
+            setattr(case, field, value[:max_length])
 
 
 def apply_analysis_to_case(case, analysis, direction, received_at):
@@ -181,15 +203,121 @@ def _create_case_email(case, message_id, thread_id, direction, sender, recipient
     )
 
 
-def _find_case(case_number, thread_id):
-    """Match by vendor case number first, then by Gmail thread."""
+def _find_case(case_number, thread_id, vendor=None, subject='', body=''):
+    """4단계 케이스 매칭: 벤더 케이스 번호 -> Gmail 스레드 ->
+    확인 메일에 포함된 원본 제목 -> 본문 유사도."""
     if case_number:
         case = Case.objects.filter(vendor_case_number=case_number).first()
         if case:
             return case
     if thread_id:
-        return Case.objects.filter(gmail_thread_id=thread_id).first()
+        case = Case.objects.filter(gmail_thread_id=thread_id).first()
+        if case:
+            return case
+        # 케이스 병합 등으로 대표 스레드가 아니게 된 스레드는 이메일로 역추적
+        email = (CaseEmail.objects.filter(gmail_thread_id=thread_id)
+                 .select_related('case').first())
+        if email:
+            return email.case
+    if vendor:
+        case = _find_case_by_embedded_subject(vendor, subject, case_number)
+        if case:
+            return case
+        return _find_case_by_body_similarity(vendor, body)
     return None
+
+
+# 제목 폴백 매칭 파라미터: 짧은 제목 오탐 방지 최소 길이, 후보 케이스 탐색 기간
+SUBJECT_MATCH_MIN_LENGTH = 10
+SUBJECT_MATCH_WINDOW_DAYS = 60
+
+
+def _find_case_by_embedded_subject(vendor, subject, case_number):
+    """케이스 오픈 메일과 벤더 접수 확인 메일이 서로 다른 스레드로 갈릴 때의 폴백.
+
+    Arista는 엔지니어가 보낸 오픈 메일(SR 번호 없음)과 별개 스레드로
+    'New ... Case: SR 834065 <원본 제목>' 확인 메일을 보내므로 번호/스레드
+    매칭이 모두 실패해 케이스가 중복 생성된다. 확인 메일 제목에 원본 제목이
+    그대로 포함되는 점을 이용해, 두 제목 중 짧은 쪽이 긴 쪽에 포함되면 같은
+    케이스로 본다. 케이스 번호 유무가 서로 반대인 후보만 보므로(번호 달린
+    메일 ↔ 번호 없는 케이스, 또는 그 반대) 제목이 똑같이 반복되는 공지성
+    메일끼리 오병합되지는 않는다.
+    """
+    cleaned = email_parser.clean_subject(subject).lower()
+    if len(cleaned) < SUBJECT_MATCH_MIN_LENGTH:
+        return None
+
+    no_number = Q(vendor_case_number__isnull=True) | Q(vendor_case_number='')
+    candidates = Case.objects.filter(
+        vendor=vendor,
+        created_at__gte=timezone.now() - timedelta(days=SUBJECT_MATCH_WINDOW_DAYS),
+    )
+    candidates = candidates.filter(no_number) if case_number else candidates.exclude(no_number)
+
+    for case in candidates.order_by('-created_at'):
+        first_email = case.emails.order_by('received_at').first()
+        if first_email is None:
+            continue
+        original = email_parser.clean_subject(first_email.subject).lower()
+        shorter, longer = sorted((cleaned, original), key=len)
+        if len(shorter) >= SUBJECT_MATCH_MIN_LENGTH and shorter in longer:
+            return case
+    return None
+
+
+# 본문 유사도 폴백 파라미터: 후보 탐색 기간/개수, 오탐 방지 최소 본문 길이,
+# 병합 임계값(시리얼 번호가 일치하면 재발송 시 로그 몇 줄 추가된 경우까지 완화)
+BODY_MATCH_WINDOW_DAYS = 14
+BODY_MATCH_MAX_CANDIDATES = 200
+BODY_MATCH_MIN_LENGTH = 200
+BODY_MATCH_THRESHOLD = 0.95
+BODY_MATCH_SERIAL_THRESHOLD = 0.90
+
+
+def _find_case_by_body_similarity(vendor, body):
+    """제목을 바꿔 재발송해 스레드가 갈린 동일 접수 메일의 폴백 매칭.
+
+    엔지니어가 같은 케이스 오픈 메일을 제목만 수정해 다시 보내면 Gmail
+    스레드가 분리되어 번호/스레드/제목 매칭이 모두 실패한다. 같은 벤더의
+    최근 이메일과 정규화 본문 유사도를 비교해 사실상 같은 본문이면 기존
+    케이스로 병합하고, 케이스에 병합 표시를 남긴다.
+    """
+    normalized = email_parser.normalize_body(body)
+    if len(normalized) < BODY_MATCH_MIN_LENGTH:
+        return None
+
+    serial = email_parser.extract_serial_number(body)
+    since = timezone.now() - timedelta(days=BODY_MATCH_WINDOW_DAYS)
+    emails = (CaseEmail.objects
+              .filter(case__vendor=vendor, created_at__gte=since)
+              .select_related('case')
+              .order_by('-received_at')[:BODY_MATCH_MAX_CANDIDATES])
+
+    for email in emails:
+        candidate = email_parser.normalize_body(email.body_original)
+        if len(candidate) < BODY_MATCH_MIN_LENGTH:
+            continue
+        threshold = BODY_MATCH_THRESHOLD
+        if serial and serial == email_parser.extract_serial_number(email.body_original):
+            threshold = BODY_MATCH_SERIAL_THRESHOLD
+        matcher = difflib.SequenceMatcher(None, normalized, candidate)
+        # ratio()는 비싸므로 상한 근사치로 먼저 거른다
+        if matcher.real_quick_ratio() < threshold or matcher.quick_ratio() < threshold:
+            continue
+        ratio = matcher.ratio()
+        if ratio >= threshold:
+            logger.info("Body-similarity merge (%.3f) into case %s", ratio, email.case_id)
+            _mark_duplicate_merge(email.case, ratio)
+            return email.case
+    return None
+
+
+def _mark_duplicate_merge(case, ratio):
+    """유사도 병합을 케이스 타임라인에 남겨 오병합 시 추적 가능하게 한다."""
+    stamp = timezone.localtime(timezone.now()).strftime('%Y-%m-%d %H:%M')
+    block = (f"[{stamp} 시스템] 제목이 다른 중복 접수 메일을 "
+             f"본문 유사도({ratio:.0%})로 이 케이스에 병합했습니다.")
+    case.action_steps = f"{case.action_steps}\n\n{block}" if case.action_steps else block
 
 
 def _backfill_identifiers(case, case_number, thread_id):

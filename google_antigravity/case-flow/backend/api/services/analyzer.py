@@ -18,9 +18,13 @@ ANALYSIS_SCHEMA = {
         "action_update": {"type": "string"},
         "resolution": {"type": "string"},
         "suggested_status": {"type": "string", "enum": ["Open", "Pending", "Resolved"]},
+        "device_model": {"type": "string"},
+        "device_serial": {"type": "string"},
+        "software_version": {"type": "string"},
     },
     "required": ["subject_ko", "body_ko", "summary", "description",
-                 "action_update", "resolution", "suggested_status"],
+                 "action_update", "resolution", "suggested_status",
+                 "device_model", "device_serial", "software_version"],
     "additionalProperties": False,
 }
 
@@ -43,7 +47,12 @@ SYSTEM_PROMPT = """당신은 네트워크 벤더(A10/Arista/HPE Aruba/Juniper) T
 - suggested_status: 케이스 이력과 이번 메일을 종합한 현재 상태 판단.
   - "Resolved": 벤더가 해결을 확인했거나 케이스 종료가 통보된 경우
   - "Pending": 상대방의 회신·정보 제공·조치를 기다리는 상태 (예: 벤더가 로그를 요청하고 대기 중)
-  - "Open": 그 외 진행 중인 상태"""
+  - "Open": 그 외 진행 중인 상태
+- device_model: 이 케이스의 대상 장비 모델명 원문 그대로 (예: TH1040-F, DCS-7050SX3-48YC12, Aruba 7205).
+  메일에 없으면 "".
+- device_serial: 대상 장비의 시리얼 번호 원문 그대로. 여러 개면 쉼표로 나열 (최대 5개). 없으면 "".
+- software_version: 대상 장비의 소프트웨어/OS 버전 원문 그대로 (예: 6.0.8-SP1, ACOS 5.2.1-P10이면 5.2.1-P10,
+  EOS 4.32.4M이면 4.32.4M). 없으면 ""."""
 
 
 # 프론트/설정 API에서 선택 가능한 모델 카탈로그.

@@ -27,7 +27,10 @@ load_dotenv(BASE_DIR.parent / '.env')
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-nf+jom4-at!bh3m)_a6a#_!jzpekr!7t#d%(vtv7kin$^)xcn_'
+# 운영 전환 시 .env에 DJANGO_SECRET_KEY를 설정할 것.
+SECRET_KEY = os.environ.get(
+    'DJANGO_SECRET_KEY',
+    'django-insecure-nf+jom4-at!bh3m)_a6a#_!jzpekr!7t#d%(vtv7kin$^)xcn_')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
@@ -39,6 +42,54 @@ ALLOWED_HOSTS = ['*']
 #     "http://localhost:3000",
 # ]
 CORS_ALLOW_ALL_ORIGINS = True
+# 세션 쿠키 인증: 프론트(:3000)에서 쿠키를 주고받으려면 credentials 허용 필요
+CORS_ALLOW_CREDENTIALS = True
+
+# 프론트 origin(포트가 달라 cross-origin)에서 오는 쓰기 요청의 CSRF 검증 허용 목록.
+# 사내망 서버 IP가 바뀌면 .env의 CASEFLOW_FRONTEND_ORIGINS에 추가할 것.
+# 항목은 'http://IP:포트' 전체 형태 또는 IP만 써도 된다 (http://…:3000으로 보정).
+def _normalize_origin(value):
+    value = value.strip()
+    if not value:
+        return None
+    if '://' not in value:
+        host = value
+        if ':' not in host:
+            host += ':3000'  # 프론트 기본 포트
+        value = f'http://{host}'
+    return value
+
+
+CSRF_TRUSTED_ORIGINS = [
+    origin
+    for origin in (
+        _normalize_origin(entry)
+        for entry in os.environ.get(
+            'CASEFLOW_FRONTEND_ORIGINS',
+            'localhost,127.0.0.1,192.168.54.37',
+        ).split(',')
+    )
+    if origin
+]
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.SessionAuthentication',
+    ],
+    # 로그인 없이는 어떤 API도 접근 불가 (예외는 뷰에서 AllowAny로 명시)
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+}
+
+# 세션 만료: 12시간 (매 요청마다 연장하지 않음)
+SESSION_COOKIE_AGE = 12 * 3600
+
+# 계정 발급 요청의 승인 메일 수신자
+SIGNUP_APPROVER_EMAIL = os.environ.get('CASEFLOW_SIGNUP_APPROVER_EMAIL',
+                                       'jhshin@ubersys.co.kr')
+# 승인 링크 유효기간 (초)
+SIGNUP_APPROVAL_MAX_AGE = 7 * 24 * 3600
 
 
 # Application definition

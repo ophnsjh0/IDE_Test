@@ -19,7 +19,7 @@ import {
 } from '@mantine/core';
 import { IconArrowUpRight, IconRefreshDot } from '@tabler/icons-react';
 import AppHeader from '../components/AppHeader';
-import { apiUrl } from '../lib/api';
+import { apiFetch } from '../lib/api';
 
 interface VendorStats {
   vendor: string;
@@ -58,7 +58,7 @@ export default function DashboardPage() {
 
   useEffect(() => {
     setLoading(true);
-    fetch(apiUrl(`/api/dashboard/stats/?days=${days}`))
+    apiFetch(`/api/dashboard/stats/?days=${days}`)
       .then((res) => {
         if (res.ok) return res.json();
         throw new Error('Failed to fetch stats');

@@ -1,10 +1,24 @@
 from django.urls import path
-from . import views
+from . import auth_views, views
 
 urlpatterns = [
     path('health/', views.health_check, name='health_check'),
+    path('auth/login/', auth_views.LoginView.as_view(), name='auth-login'),
+    path('auth/logout/', auth_views.LogoutView.as_view(), name='auth-logout'),
+    path('auth/me/', auth_views.MeView.as_view(), name='auth-me'),
+    path('auth/users/', auth_views.UserListCreateView.as_view(), name='auth-users'),
+    path('auth/signup-requests/', auth_views.SignupRequestView.as_view(),
+         name='auth-signup-request'),
+    path('auth/signup-approve/', auth_views.SignupApproveView.as_view(),
+         name='auth-signup-approve'),
+    path('auth/users/<int:user_id>/', auth_views.UserDetailView.as_view(),
+         name='auth-user-detail'),
     path('cases/', views.CaseListCreateView.as_view(), name='case-list-create'),
     path('cases/<int:id>/', views.CaseDetailView.as_view(), name='case-detail'),
+    path('cases/<int:id>/relations/', views.CaseRelationView.as_view(),
+         name='case-relation-add'),
+    path('cases/<int:id>/relations/<int:other_id>/', views.CaseRelationView.as_view(),
+         name='case-relation-remove'),
     path('gmail/sync/', views.GmailSyncView.as_view(), name='gmail-sync'),
     path('dashboard/stats/', views.DashboardStatsView.as_view(), name='dashboard-stats'),
     path('settings/translation-model/', views.TranslationModelView.as_view(),

@@ -29,7 +29,8 @@ import {
   IconLanguage,
 } from '@tabler/icons-react'; // IconDeviceFloppy for Save
 import AppHeader from '../../components/AppHeader';
-import { apiUrl } from '../../lib/api';
+import { apiFetch } from '../../lib/api';
+import { useMe } from '../../lib/useMe';
 
 interface CaseEmail {
   id: number;
@@ -41,6 +42,15 @@ interface CaseEmail {
   body_original: string;
   body_ko: string;
   received_at: string;
+}
+
+interface RelatedCase {
+  id: number;
+  case_id: string;
+  vendor: string;
+  status: string;
+  summary: string;
+  vendor_case_number: string | null;
 }
 
 interface CaseDetail {
@@ -55,9 +65,13 @@ interface CaseDetail {
   source: string;
   analyzed_by: string;
   vendor_case_number: string | null;
+  device_model: string;
+  device_serial: string;
+  software_version: string;
   date: string;
   created_at: string;
   emails: CaseEmail[];
+  related_cases: RelatedCase[];
 }
 
 export default function CaseDetailPage() {
@@ -67,6 +81,7 @@ export default function CaseDetailPage() {
   const [loading, setLoading] = useState(true);
   const [isEditing, setIsEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const { canWrite } = useMe();
 
   const form = useForm({
     initialValues: {
@@ -79,33 +94,63 @@ export default function CaseDetailPage() {
     },
   });
 
+  const loadCase = () => {
+    apiFetch(`/api/cases/${id}/`)
+      .then((res) => {
+        if (res.ok) return res.json();
+        throw new Error('Failed to fetch case');
+      })
+      .then((data) => {
+          setCaseDetail(data);
+          form.setValues({
+              vendor: data.vendor,
+              status: data.status,
+              summary: data.summary,
+              description: data.description || '',
+              action_steps: data.action_steps || '',
+              resolution: data.resolution || '',
+          });
+      })
+      .catch((err) => console.error(err))
+      .finally(() => setLoading(false));
+  };
+
   useEffect(() => {
-    if (id) {
-      fetch(apiUrl(`/api/cases/${id}/`))
-        .then((res) => {
-          if (res.ok) return res.json();
-          throw new Error('Failed to fetch case');
-        })
-        .then((data) => {
-            setCaseDetail(data);
-            form.setValues({
-                vendor: data.vendor,
-                status: data.status,
-                summary: data.summary,
-                description: data.description || '',
-                action_steps: data.action_steps || '',
-                resolution: data.resolution || '',
-            });
-        })
-        .catch((err) => console.error(err))
-        .finally(() => setLoading(false));
-    }
+    if (id) loadCase();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  const [relationInput, setRelationInput] = useState('');
+  const [relationError, setRelationError] = useState('');
+
+  const addRelation = async () => {
+    if (!relationInput.trim()) return;
+    const response = await apiFetch(`/api/cases/${id}/relations/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ case_id: relationInput }),
+    });
+    const data = await response.json().catch(() => null);
+    if (response.ok) {
+      setRelationInput('');
+      setRelationError('');
+      loadCase();
+    } else {
+      setRelationError(data?.error || '참조 추가에 실패했습니다.');
+    }
+  };
+
+  const removeRelation = async (otherId: number) => {
+    const response = await apiFetch(`/api/cases/${id}/relations/${otherId}/`, {
+      method: 'DELETE',
+    });
+    if (response.ok) loadCase();
+  };
 
   const handleSave = async () => {
       setSaving(true);
       try {
-          const response = await fetch(apiUrl(`/api/cases/${id}/`), {
+          const response = await apiFetch(`/api/cases/${id}/`, {
               method: 'PATCH',
               headers: {
                   'Content-Type': 'application/json',
@@ -175,12 +220,14 @@ export default function CaseDetailPage() {
             </Button>
             
             {!isEditing ? (
+                canWrite && (
                 <Button 
                     leftSection={<IconEdit size={16} />} 
                     onClick={() => setIsEditing(true)}
                 >
                     Edit Case
                 </Button>
+                )
             ) : (
                 <Group>
                     <Button variant="default" onClick={handleCancel} disabled={saving}>Cancel</Button>
@@ -221,8 +268,28 @@ export default function CaseDetailPage() {
               )}
             </Group>
 
+            {(caseDetail.device_model || caseDetail.device_serial || caseDetail.software_version) && (
+              <Group gap="xs" mt="xs">
+                {caseDetail.device_model && (
+                  <Badge variant="outline" color="gray" radius="sm">
+                    장비 {caseDetail.device_model}
+                  </Badge>
+                )}
+                {caseDetail.software_version && (
+                  <Badge variant="outline" color="gray" radius="sm">
+                    SW {caseDetail.software_version}
+                  </Badge>
+                )}
+                {caseDetail.device_serial && (
+                  <Badge variant="outline" color="gray" radius="sm" style={{ textTransform: 'none' }}>
+                    S/N {caseDetail.device_serial}
+                  </Badge>
+                )}
+              </Group>
+            )}
+
             {caseDetail.analyzed_by && (
-              <Text size="xs" c="dimmed">
+              <Text size="xs" c="dimmed" mt="xs">
                 AI 분석: {caseDetail.analyzed_by}
               </Text>
             )}
@@ -284,6 +351,51 @@ export default function CaseDetailPage() {
                 {caseDetail.source === 'email' && ' · Gmail에서 자동 등록됨'}
               </Text>
             </Stack>
+          </Paper>
+
+          <Paper shadow="xs" p="xl" withBorder mt="lg">
+            <Title order={3} mb="md">관련 케이스 ({caseDetail.related_cases?.length ?? 0})</Title>
+            <Stack gap="xs">
+              {(caseDetail.related_cases ?? []).map((rc) => (
+                <Group key={rc.id} justify="space-between" wrap="nowrap">
+                  <Group
+                    gap="xs"
+                    wrap="nowrap"
+                    style={{ cursor: 'pointer', flex: 1, minWidth: 0 }}
+                    onClick={() => { setLoading(true); router.push(`/cases/${rc.id}`); }}
+                  >
+                    <Text fw={600} style={{ whiteSpace: 'nowrap' }}>{rc.case_id}</Text>
+                    <Badge color={getVendorColor(rc.vendor)} variant="light">{rc.vendor}</Badge>
+                    <Badge color={getStatusColor(rc.status)} variant="dot">{rc.status}</Badge>
+                    <Text size="sm" lineClamp={1} style={{ flex: 1 }}>
+                      {rc.vendor_case_number && `[#${rc.vendor_case_number}] `}{rc.summary}
+                    </Text>
+                  </Group>
+                  {canWrite && (
+                    <Button size="xs" variant="subtle" color="red" onClick={() => removeRelation(rc.id)}>
+                      해제
+                    </Button>
+                  )}
+                </Group>
+              ))}
+              {(caseDetail.related_cases ?? []).length === 0 && (
+                <Text c="dimmed" size="sm">연결된 케이스가 없습니다. 같은 사건의 별도 트랙 케이스를 참조로 연결하세요.</Text>
+              )}
+            </Stack>
+            {canWrite && (
+              <Group mt="md" gap="xs" align="flex-start">
+                <TextInput
+                  placeholder="예: C-1118"
+                  value={relationInput}
+                  onChange={(e) => setRelationInput(e.currentTarget.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && addRelation()}
+                  size="xs"
+                  w={140}
+                  error={relationError || undefined}
+                />
+                <Button size="xs" variant="light" onClick={addRelation}>참조 추가</Button>
+              </Group>
+            )}
           </Paper>
 
           {caseDetail.emails && caseDetail.emails.length > 0 && (

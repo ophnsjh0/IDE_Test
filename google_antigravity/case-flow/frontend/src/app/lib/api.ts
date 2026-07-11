@@ -8,3 +8,29 @@ export function apiUrl(path: string): string {
       : 'http://localhost:8000');
   return `${base}${path}`;
 }
+
+function getCookie(name: string): string | null {
+  if (typeof document === 'undefined') return null;
+  const match = document.cookie.match(new RegExp('(^|; )' + name + '=([^;]*)'));
+  return match ? decodeURIComponent(match[2]) : null;
+}
+
+// 세션 쿠키를 포함하고, 쓰기 요청에는 CSRF 토큰을 자동으로 붙이는 공용 fetch.
+// 인증이 만료되면(401/403) 로그인 페이지로 이동한다.
+export async function apiFetch(path: string, options: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(options.headers);
+  const method = (options.method || 'GET').toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD') {
+    const token = getCookie('csrftoken');
+    if (token) headers.set('X-CSRFToken', token);
+  }
+  const response = await fetch(apiUrl(path), { ...options, headers, credentials: 'include' });
+  if (
+    (response.status === 401 || response.status === 403) &&
+    typeof window !== 'undefined' &&
+    !window.location.pathname.startsWith('/login')
+  ) {
+    window.location.href = '/login';
+  }
+  return response;
+}

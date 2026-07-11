@@ -23,6 +23,29 @@ CASE_NUMBER_PATTERNS = [
 
 RE_PREFIX = re.compile(r'^\s*((re|fw|fwd|답장|전달)\s*:\s*)+', re.IGNORECASE)
 
+# 케이스 오픈 템플릿의 'Serial Number : TH1015...' / 'Serial : HBG...' 줄
+RE_SERIAL_NUMBER = re.compile(
+    r'serial\s*(?:number|no\.?)?\s*[:\-]\s*([A-Z0-9][A-Z0-9\-]{5,})', re.IGNORECASE)
+
+# 장비 정보 추출 패턴 (라벨 기반 우선, 토큰 폴백)
+RE_LABEL_MODEL = re.compile(
+    r'(?:hardware\s*platform|device\s*model|model)\s*(?:name|number)?\s*[:\-]\s*'
+    r'([A-Za-z]{2,10}[\- ]?[0-9][\w\-]{0,25})', re.IGNORECASE)
+RE_LABEL_VERSION = re.compile(
+    r'(?:software|acos|eos|aos|firmware)[\s\-]*(?:version|ver\.?)?\s*[:\-]\s*'
+    r'v?([0-9]+\.[0-9][\w\.\-]*)', re.IGNORECASE)
+# 산문 속 'EOS 4.32.4M', 'ACOS 5.2.1-P10' 류 (벤더 OS명 + 버전)
+RE_OS_VERSION = re.compile(r'\b(?:EOS|ACOS|AOS-CX|AOS)\s+v?([0-9]+\.[0-9][\w\.\-]*)')
+# 제목의 [NHN-6.0.8], [samsung-4.32.4M] 류 버전 표기 (EOS의 4.32.4M처럼 접미 문자 허용)
+RE_SUBJECT_VERSION = re.compile(
+    r'\[[^\]]*?[\- ]([0-9]+\.[0-9]+(?:\.[0-9]+)?[A-Za-z]{0,2}(?:-[\w]+)?)\]')
+# HPE RMA 부품 목록의 'EC-SFP-SR, S/N N4QAJHS' 줄
+RE_SN_ITEM = re.compile(r'\bS/N\s*[:\-]?\s*([A-Z0-9]{6,20})\b', re.IGNORECASE)
+# 라벨 없이 본문에 등장하는 장비명 토큰 (A10 TH계열, Arista DCS계열)
+RE_MODEL_TOKEN = re.compile(r'\b(TH[0-9]{3,4}[A-Z]?(?:-[A-Z0-9]+)*|DCS-[0-9A-Za-z\-]+)\b')
+
+DEVICE_SERIAL_MAX_ITEMS = 5
+
 
 def domain_of(address):
     _, email = parseaddr(address or '')
@@ -71,6 +94,57 @@ def extract_case_number(subject):
 
 def clean_subject(subject):
     return RE_PREFIX.sub('', subject or '').strip()
+
+
+def extract_serial_number(body):
+    match = RE_SERIAL_NUMBER.search(body or '')
+    if not match:
+        return None
+    serial = match.group(1).upper()
+    # 'Serial : expired' 류 오탐 방지 — 실제 시리얼은 항상 숫자를 포함
+    return serial if any(ch.isdigit() for ch in serial) else None
+
+
+def extract_device_info(subject, body):
+    """메일에서 장비 모델/시리얼/버전을 정규식으로 추출 (고신뢰 1차 패스).
+
+    라벨이 명시된 패턴(A10 오픈 템플릿, S/N 라인아이템)을 우선하고,
+    없으면 장비명 토큰/제목 버전 표기로 폴백한다. 못 찾은 필드는 빈 문자열 —
+    산문에 박힌 정보는 2차 패스(AI 분석)가 채운다.
+    """
+    subject = subject or ''
+    body = body or ''
+    text = f'{subject}\n{body}'
+
+    serial = extract_serial_number(body) or ''
+    if not serial:
+        # HPE RMA 부품 목록처럼 S/N이 여러 개인 경우 쉼표 병기
+        items = list(dict.fromkeys(m.group(1).upper() for m in RE_SN_ITEM.finditer(body)))
+        if items:
+            serial = ', '.join(items[:DEVICE_SERIAL_MAX_ITEMS])
+            if len(items) > DEVICE_SERIAL_MAX_ITEMS:
+                serial += f' 외 {len(items) - DEVICE_SERIAL_MAX_ITEMS}개'
+
+    model_match = RE_LABEL_MODEL.search(body) or RE_MODEL_TOKEN.search(text)
+    model = model_match.group(1).strip('-') if model_match else ''
+
+    version_match = (RE_LABEL_VERSION.search(body) or RE_SUBJECT_VERSION.search(subject)
+                     or RE_OS_VERSION.search(body))
+    version = version_match.group(1).rstrip('.-') if version_match else ''
+
+    return {
+        'device_model': model,
+        'device_serial': serial,
+        'software_version': version,
+    }
+
+
+def normalize_body(body, limit=10000):
+    """본문 유사도 비교용 정규화: 인용줄(>) 제거, 공백 압축, 소문자화."""
+    lines = [line for line in (body or '').splitlines()
+             if not line.lstrip().startswith('>')]
+    text = re.sub(r'\s+', ' ', ' '.join(lines)).strip().lower()
+    return text[:limit]
 
 
 def parse_received_at(date_header):

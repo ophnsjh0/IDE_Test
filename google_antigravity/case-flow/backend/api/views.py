@@ -5,13 +5,15 @@ from django.db.models import Count, Max, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import generics, status
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from django.conf import settings
 
 from .models import AppSetting, Case
+from .permissions import IsAdminRole, IsEngineerOrAbove
 from .serializers import CaseSerializer, CaseDetailSerializer
 from .services.analyzer import (
     AVAILABLE_MODELS,
@@ -27,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 @api_view(['GET'])
+@permission_classes([AllowAny])
 def health_check(request):
     return Response({"status": "ok", "message": "Backend is running!"})
 
@@ -44,11 +47,73 @@ class CaseListCreateView(generics.ListCreateAPIView):
     )
     serializer_class = CaseSerializer
 
+    def get_permissions(self):
+        # 조회는 전 역할, 생성은 엔지니어 이상
+        if self.request.method == 'POST':
+            return [IsEngineerOrAbove()]
+        return super().get_permissions()
+
 
 class CaseDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = CASES_WITH_LAST_EMAIL
     serializer_class = CaseDetailSerializer
     lookup_field = 'id'
+
+    def get_permissions(self):
+        # 조회는 전 역할, 수정은 엔지니어 이상, 삭제는 관리자만
+        if self.request.method == 'DELETE':
+            return [IsAdminRole()]
+        if self.request.method in ('PUT', 'PATCH'):
+            return [IsEngineerOrAbove()]
+        return super().get_permissions()
+
+
+def _resolve_case_ref(ref):
+    """'C-1118', '1118'(표시 번호) 또는 DB id 문자열을 Case로 변환."""
+    ref = str(ref or '').strip().upper()
+    if ref.startswith('C-'):
+        ref = ref[2:]
+    if not ref.isdigit():
+        return None
+    number = int(ref)
+    if number > 1000:  # 표시 번호(C-{1000+id}) -> DB id
+        number -= 1000
+    return Case.objects.filter(id=number).first()
+
+
+class CaseRelationView(APIView):
+    """케이스 간 상호 참조 관리 (엔지니어 이상).
+
+    POST   /api/cases/<id>/relations/          {case_id: "C-1118"}  — 참조 추가
+    DELETE /api/cases/<id>/relations/<other>/                        — 참조 해제
+    관계는 대칭(M2M symmetrical)이라 어느 쪽에서 추가/해제해도 양쪽에 반영된다.
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    def post(self, request, id):
+        case = Case.objects.filter(id=id).first()
+        if case is None:
+            return Response({'error': '존재하지 않는 케이스입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        other = _resolve_case_ref(request.data.get('case_id'))
+        if other is None:
+            return Response({'error': '케이스를 찾을 수 없습니다. C-1118 형식으로 입력하세요.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if other == case:
+            return Response({'error': '자기 자신은 참조로 추가할 수 없습니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        case.related_cases.add(other)
+        return Response({'message': f'{other.case_id} 참조가 추가되었습니다.'},
+                        status=status.HTTP_201_CREATED)
+
+    def delete(self, request, id, other_id):
+        case = Case.objects.filter(id=id).first()
+        other = Case.objects.filter(id=other_id).first()
+        if case is None or other is None:
+            return Response({'error': '존재하지 않는 케이스입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        case.related_cases.remove(other)
+        return Response({'message': f'{other.case_id} 참조가 해제되었습니다.'})
 
 
 class TranslationModelView(APIView):
@@ -57,6 +122,12 @@ class TranslationModelView(APIView):
     프론트에서 선택한 모델은 AppSetting(DB)에 저장되어 서버 재시작 후에도 유지되며,
     settings.py의 기본값보다 우선한다. {"model": "default"}를 보내면 기본값으로 복귀.
     """
+
+    def get_permissions(self):
+        # 모델 변경은 비용에 영향 -> 관리자만. 조회는 전 역할.
+        if self.request.method == 'PUT':
+            return [IsAdminRole()]
+        return super().get_permissions()
 
     def get(self, request):
         return Response(self._payload())
@@ -131,6 +202,7 @@ class DashboardStatsView(APIView):
 
 class GmailSyncView(APIView):
     """POST /api/gmail/sync/ — pull vendor case mail from Gmail into Case-Flow."""
+    permission_classes = [IsEngineerOrAbove]
 
     def post(self, request):
         try:

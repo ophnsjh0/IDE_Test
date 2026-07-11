@@ -1,4 +1,44 @@
+from django.conf import settings as django_settings
 from django.db import models
+
+
+class UserProfile(models.Model):
+    """계정별 역할. viewer(조회) < engineer(케이스 조작) < admin(삭제/설정/계정 관리)."""
+    ROLE_CHOICES = [
+        ('viewer', 'Viewer'),
+        ('engineer', 'Engineer'),
+        ('admin', 'Admin'),
+    ]
+
+    user = models.OneToOneField(django_settings.AUTH_USER_MODEL,
+                                on_delete=models.CASCADE, related_name='profile')
+    role = models.CharField(max_length=10, choices=ROLE_CHOICES, default='viewer')
+
+    def __str__(self):
+        return f"{self.user.username} ({self.role})"
+
+
+class SignupRequest(models.Model):
+    """로그인 화면의 계정 발급 요청. 승인자가 메일의 승인 링크를 누르면 계정이 생성된다.
+
+    비밀번호는 요청 시점에 해시로만 저장되고(평문 미보관), 승인 시 그 해시가
+    그대로 User.password가 된다.
+    """
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('approved', 'Approved'),
+    ]
+
+    username = models.CharField(max_length=150)
+    name = models.CharField(max_length=100, blank=True, default='')
+    reason = models.CharField(max_length=300, blank=True, default='')
+    password_hash = models.CharField(max_length=128)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
+    created_at = models.DateTimeField(auto_now_add=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.username} ({self.status})"
 
 
 class AppSetting(models.Model):
@@ -49,6 +89,12 @@ class Case(models.Model):
     analyzed_by = models.CharField(max_length=100, blank=True, default='')
     vendor_case_number = models.CharField(max_length=100, blank=True, null=True, unique=True)
     gmail_thread_id = models.CharField(max_length=100, blank=True, null=True)
+    # 메일에서 추출한 장비 정보 (정규식 1차 -> AI 분석 2차, 없으면 빈 값)
+    device_model = models.CharField(max_length=100, blank=True, default='')
+    device_serial = models.CharField(max_length=200, blank=True, default='')  # 여러 개면 쉼표 병기
+    software_version = models.CharField(max_length=50, blank=True, default='')
+    # 같은 사건에서 파생됐지만 별도 트랙인 케이스들의 상호 참조 (병합 대신 링크)
+    related_cases = models.ManyToManyField('self', blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

@@ -1,7 +1,7 @@
-import { Modal, Button, TextInput, Select, Textarea, Stack } from '@mantine/core';
+import { Modal, Button, TextInput, Select, Textarea, Stack, Group } from '@mantine/core';
 import { useForm } from '@mantine/form';
 import { useState } from 'react';
-import { apiUrl } from '../lib/api';
+import { apiFetch } from '../lib/api';
 
 interface NewCaseModalProps {
   opened: boolean;
@@ -20,6 +20,9 @@ export default function NewCaseModal({ opened, onClose, onCaseCreated }: NewCase
       description: '',
       action_steps: '',
       resolution: '',
+      device_model: '',
+      device_serial: '',
+      software_version: '',
     },
     validate: {
         summary: (value) => (value.length < 5 ? 'Summary must have at least 5 letters' : null),
@@ -29,7 +32,7 @@ export default function NewCaseModal({ opened, onClose, onCaseCreated }: NewCase
   const handleSubmit = async (values: typeof form.values) => {
     setLoading(true);
     try {
-      const response = await fetch(apiUrl('/api/cases/'), {
+      const response = await apiFetch('/api/cases/', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -67,6 +70,26 @@ export default function NewCaseModal({ opened, onClose, onCaseCreated }: NewCase
             data={['Open', 'Resolved', 'Pending']}
             {...form.getInputProps('status')}
           />
+          <Group grow>
+            <TextInput
+              label="장비 모델"
+              placeholder="예: TH1040-F"
+              maxLength={100}
+              {...form.getInputProps('device_model')}
+            />
+            <TextInput
+              label="시리얼 번호"
+              placeholder="예: TH10154022070160"
+              maxLength={200}
+              {...form.getInputProps('device_serial')}
+            />
+            <TextInput
+              label="SW 버전"
+              placeholder="예: 6.0.8-SP1"
+              maxLength={50}
+              {...form.getInputProps('software_version')}
+            />
+          </Group>
           <TextInput
             required
             label="Summary"

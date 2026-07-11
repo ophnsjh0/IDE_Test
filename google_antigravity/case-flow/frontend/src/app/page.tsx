@@ -22,7 +22,8 @@ import {
 import { IconSearch, IconPlus, IconRefresh, IconMail, IconSparkles } from '@tabler/icons-react';
 import NewCaseModal from './components/NewCaseModal';
 import AppHeader from './components/AppHeader';
-import { apiUrl } from './lib/api';
+import { apiFetch } from './lib/api';
+import { useMe } from './lib/useMe';
 
 interface Case {
   id: number;
@@ -31,6 +32,9 @@ interface Case {
   status: string;
   summary: string;
   description: string;
+  device_model: string;
+  device_serial: string;
+  software_version: string;
   date: string;
 }
 
@@ -56,16 +60,18 @@ export default function Home() {
   const [modalOpened, setModalOpened] = useState(false);
   const [cases, setCases] = useState<Case[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [syncing, setSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState('');
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [currentModel, setCurrentModel] = useState<string | null>(null);
   const [modelSaving, setModelSaving] = useState(false);
   const router = useRouter();
+  const { canWrite, isAdmin } = useMe();
 
   const fetchModelInfo = async () => {
     try {
-      const response = await fetch(apiUrl('/api/settings/translation-model/'));
+      const response = await apiFetch('/api/settings/translation-model/');
       if (response.ok) {
         const data = await response.json();
         setModels(data.models);
@@ -80,7 +86,7 @@ export default function Home() {
     if (!model || model === currentModel) return;
     setModelSaving(true);
     try {
-      const response = await fetch(apiUrl('/api/settings/translation-model/'), {
+      const response = await apiFetch('/api/settings/translation-model/', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model }),
@@ -115,16 +121,18 @@ export default function Home() {
 
   const fetchCases = async () => {
     setLoading(true);
+    setLoadError('');
     try {
-      const response = await fetch(apiUrl('/api/cases/'));
+      const response = await apiFetch('/api/cases/');
       if (response.ok) {
         const data = await response.json();
         setCases(data);
       } else {
-        console.error('Failed to fetch cases');
+        setLoadError(`케이스 목록을 불러오지 못했습니다 (HTTP ${response.status}).`);
       }
     } catch (error) {
       console.error('Error fetching cases:', error);
+      setLoadError('백엔드 서버(:8000)에 연결할 수 없습니다. 서버 실행 상태를 확인하세요.');
     } finally {
       setLoading(false);
     }
@@ -139,7 +147,7 @@ export default function Home() {
     setSyncing(true);
     setSyncMessage('');
     try {
-      const response = await fetch(apiUrl('/api/gmail/sync/'), { method: 'POST' });
+      const response = await apiFetch('/api/gmail/sync/', { method: 'POST' });
       const data = await response.json();
       if (response.ok) {
         setSyncMessage(
@@ -172,8 +180,9 @@ export default function Home() {
   const filteredCases = cases.filter(c => {
     const vendorMatch = activeTab === 'all' || c.vendor === getVendorFilter(activeTab);
     const statusMatch = statusTab === 'all' || c.status === statusTab;
-    const searchMatch = c.summary.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                        c.case_id.toLowerCase().includes(searchQuery.toLowerCase());
+    const q = searchQuery.toLowerCase();
+    const searchMatch = [c.summary, c.case_id, c.device_model, c.device_serial, c.software_version]
+      .some((field) => (field || '').toLowerCase().includes(q));
     return vendorMatch && statusMatch && searchMatch;
   });
 
@@ -212,6 +221,18 @@ export default function Home() {
       </Table.Td>
       <Table.Td style={{ wordBreak: 'break-word' }}>{element.summary}</Table.Td>
       <Table.Td style={{ whiteSpace: 'nowrap' }}>
+        {element.device_model ? (
+          <>
+            <Text size="sm" fw={500}>{element.device_model}</Text>
+            {element.software_version && (
+              <Text size="xs" c="dimmed">v{element.software_version}</Text>
+            )}
+          </>
+        ) : (
+          <Text size="sm" c="dimmed">—</Text>
+        )}
+      </Table.Td>
+      <Table.Td style={{ whiteSpace: 'nowrap' }}>
         <Text size="sm">{element.date.split(' ')[0]}</Text>
         <Text size="sm" c="dimmed">{element.date.split(' ')[1]}</Text>
       </Table.Td>
@@ -235,6 +256,7 @@ export default function Home() {
               <Text c="dimmed">Track and manage network vendor support cases</Text>
             </div>
             <Group>
+                 {isAdmin && (
                  <Select
                     leftSection={<IconSparkles size={14} />}
                     placeholder="AI 분석 모델"
@@ -248,6 +270,8 @@ export default function Home() {
                     allowDeselect={false}
                     comboboxProps={{ width: 340, position: 'bottom-end' }}
                  />
+                 )}
+                 {canWrite && (
                  <Button
                     leftSection={<IconMail size={14} />}
                     variant="light"
@@ -256,12 +280,15 @@ export default function Home() {
                  >
                     Gmail 동기화
                  </Button>
+                 )}
                  <Button leftSection={<IconRefresh size={14} />} variant="default" onClick={fetchCases}>
                     Refresh
                  </Button>
+                {canWrite && (
                 <Button leftSection={<IconPlus size={14} />} onClick={() => setModalOpened(true)}>
                     New Case
                 </Button>
+                )}
             </Group>
           </Group>
 
@@ -381,7 +408,7 @@ export default function Home() {
 
             <Group mb="md">
                <TextInput
-                  placeholder="Search cases..."
+                  placeholder="Search cases... (요약, 케이스 ID, 장비 모델, 시리얼, 버전)"
                   leftSection={<IconSearch size={14} />}
                   style={{ flex: 1 }}
                   value={searchQuery}
@@ -393,6 +420,10 @@ export default function Home() {
                 <Center py="xl">
                     <Loader size="lg" />
                 </Center>
+            ) : loadError ? (
+                <Center py="xl">
+                    <Text c="red" fw={600}>{loadError}</Text>
+                </Center>
             ) : (
                 <>
                 <Table highlightOnHover verticalSpacing="sm">
@@ -402,6 +433,7 @@ export default function Home() {
                     <Table.Th style={{ whiteSpace: 'nowrap', width: 110 }}>Vendor</Table.Th>
                     <Table.Th style={{ whiteSpace: 'nowrap', width: 110 }}>Status</Table.Th>
                     <Table.Th>Summary</Table.Th>
+                    <Table.Th style={{ whiteSpace: 'nowrap', width: 150 }}>Device</Table.Th>
                     <Table.Th style={{ whiteSpace: 'nowrap', width: 110 }}>Date</Table.Th>
                     </Table.Tr>
                 </Table.Thead>
