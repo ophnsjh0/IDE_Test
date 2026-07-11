@@ -38,9 +38,14 @@ const SUGGESTIONS = [
   'Open 상태인 A10 케이스 보여줘',
 ];
 
-// 오른쪽 하단 고정 네모 버튼(로봇) + 채팅 Drawer를 묶은 위젯.
-// AppHeader에서 렌더하지만 Affix/Drawer 모두 포털이라 위치는 화면 기준.
-export default function HelpAgentWidget() {
+// AI 도우미 런처 + 채팅 Drawer를 묶은 위젯.
+// variant='inline'  : 페이지 레이아웃 안에 일반 버튼으로 배치 (리스트 페이지)
+// variant='floating': 화면 우측 하단 고정 네모 버튼 (그 외 페이지)
+export default function HelpAgentWidget({
+  variant = 'floating',
+}: {
+  variant?: 'inline' | 'floating';
+}) {
   const [opened, setOpened] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -93,27 +98,31 @@ export default function HelpAgentWidget() {
 
   return (
     <>
-      {!opened && (
-        <Affix
-          position={{
-            bottom: 120,
-            // 큰 모니터에서 뷰포트 구석이 아니라 콘텐츠 컬럼(Container xl,
-            // 1320px) 바로 오른쪽에 붙인다. 작은 화면에선 24px로 폴백.
-            right: 'max(24px, calc((100vw - 1320px) / 2 - 68px))',
-          }}
+      {variant === 'inline' ? (
+        <button
+          type="button"
+          className={classes.launcherInline}
+          onClick={() => setOpened(true)}
         >
-          <Tooltip label="AI 도우미에게 케이스 질문" position="left">
-            <button
-              type="button"
-              className={classes.launcher}
-              aria-label="AI 도우미"
-              onClick={() => setOpened(true)}
-            >
-              <IconRobot size={26} />
-              <span className={classes.launcherLabel}>AI</span>
-            </button>
-          </Tooltip>
-        </Affix>
+          <IconRobot size={18} />
+          AI 도우미
+        </button>
+      ) : (
+        !opened && (
+          <Affix position={{ bottom: 120, right: 24 }}>
+            <Tooltip label="AI 도우미에게 케이스 질문" position="left">
+              <button
+                type="button"
+                className={classes.launcher}
+                aria-label="AI 도우미"
+                onClick={() => setOpened(true)}
+              >
+                <IconRobot size={26} />
+                <span className={classes.launcherLabel}>AI</span>
+              </button>
+            </Tooltip>
+          </Affix>
+        )
       )}
 
       <Drawer

@@ -82,7 +82,8 @@ export default function AppHeader() {
             계정 관리
           </Button>
         )}
-        <HelpAgentWidget />
+        {/* 리스트 페이지(/)는 status 필터 줄에 인라인 버튼이 있어 플로팅 생략 */}
+        {pathname !== '/' && <HelpAgentWidget />}
         {connError && (
           <Group gap={6} ml="md">
             <Text size="sm" c="red" fw={600}>

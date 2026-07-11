@@ -22,6 +22,7 @@ import {
 import { IconSearch, IconPlus, IconRefresh, IconMail, IconSparkles } from '@tabler/icons-react';
 import NewCaseModal from './components/NewCaseModal';
 import AppHeader from './components/AppHeader';
+import HelpAgentWidget from './components/HelpAgentDrawer';
 import ScrollToTopButton from './components/ScrollToTopButton';
 import { apiFetch } from './lib/api';
 import { useMe } from './lib/useMe';
@@ -359,10 +360,10 @@ export default function Home() {
               </Tabs.List>
             </Tabs>
 
+            <Group justify="space-between" align="center" mb="md">
             <Tabs
               value={statusTab}
               onChange={setStatusTab}
-              mb="md"
               variant="pills"
               radius="xl"
               autoContrast
@@ -406,6 +407,8 @@ export default function Home() {
                 })}
               </Tabs.List>
             </Tabs>
+            <HelpAgentWidget variant="inline" />
+            </Group>
 
             <Group mb="md">
                <TextInput
