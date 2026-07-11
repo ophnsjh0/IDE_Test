@@ -3,8 +3,6 @@
 import { useState, useEffect } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import {
-  ActionIcon,
-  Affix,
   AppShell,
   Container,
   Title,
@@ -20,19 +18,17 @@ import {
   TextInput,
   Textarea,
   Select,
-  Transition,
 } from '@mantine/core';
 import { useForm } from '@mantine/form';
-import { useWindowScroll } from '@mantine/hooks';
 import {
   IconArrowLeft,
-  IconArrowUp,
   IconEdit,
   IconDeviceFloppy,
   IconMailDown,
   IconMailUp,
   IconLanguage,
 } from '@tabler/icons-react'; // IconDeviceFloppy for Save
+import ScrollToTopButton from '../../components/ScrollToTopButton';
 import AppHeader from '../../components/AppHeader';
 import { apiFetch } from '../../lib/api';
 import { useMe } from '../../lib/useMe';
@@ -127,7 +123,6 @@ export default function CaseDetailPage() {
 
   const [relationInput, setRelationInput] = useState('');
   const [relationError, setRelationError] = useState('');
-  const [scroll, scrollTo] = useWindowScroll();
 
   const addRelation = async () => {
     if (!relationInput.trim()) return;
@@ -417,22 +412,7 @@ export default function CaseDetailPage() {
         </Container>
 
         {/* 이메일 타임라인이 길어 스크롤이 깊어지면 맨 위로 복귀 */}
-        <Affix position={{ bottom: 24, right: 24 }}>
-          <Transition transition="slide-up" mounted={scroll.y > 300}>
-            {(transitionStyles) => (
-              <ActionIcon
-                style={transitionStyles}
-                size="xl"
-                radius="xl"
-                variant="filled"
-                aria-label="맨 위로"
-                onClick={() => scrollTo({ y: 0 })}
-              >
-                <IconArrowUp size={22} />
-              </ActionIcon>
-            )}
-          </Transition>
-        </Affix>
+        <ScrollToTopButton />
       </AppShell.Main>
     </AppShell>
   );

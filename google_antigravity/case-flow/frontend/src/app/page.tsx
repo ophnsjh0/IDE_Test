@@ -22,6 +22,7 @@ import {
 import { IconSearch, IconPlus, IconRefresh, IconMail, IconSparkles } from '@tabler/icons-react';
 import NewCaseModal from './components/NewCaseModal';
 import AppHeader from './components/AppHeader';
+import ScrollToTopButton from './components/ScrollToTopButton';
 import { apiFetch } from './lib/api';
 import { useMe } from './lib/useMe';
 
@@ -491,9 +492,12 @@ export default function Home() {
             )}
           </Paper>
         </Container>
+
+        {/* 페이지 크기를 늘리면 목록이 길어지므로 맨 위로 복귀 버튼 */}
+        <ScrollToTopButton />
       </AppShell.Main>
-      
-      <NewCaseModal 
+
+      <NewCaseModal
         opened={modalOpened} 
         onClose={() => setModalOpened(false)}
         onCaseCreated={fetchCases}
