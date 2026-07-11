@@ -12,6 +12,9 @@ wheels/
 # Environment variables — API keys live here, never commit
 .env
 
+# Local SQLite DB — 계정 정보 포함, 커밋 금지 (Postgres 전환 시까지 로컬 전용)
+backend/db.sqlite3
+
 # Gmail OAuth secrets — never commit these
 backend/credentials.json
 backend/token.json
