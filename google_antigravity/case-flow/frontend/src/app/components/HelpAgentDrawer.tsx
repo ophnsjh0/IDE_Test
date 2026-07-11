@@ -94,7 +94,14 @@ export default function HelpAgentWidget() {
   return (
     <>
       {!opened && (
-        <Affix position={{ bottom: 90, right: 24 }}>
+        <Affix
+          position={{
+            bottom: 120,
+            // 큰 모니터에서 뷰포트 구석이 아니라 콘텐츠 컬럼(Container xl,
+            // 1320px) 바로 오른쪽에 붙인다. 작은 화면에선 24px로 폴백.
+            right: 'max(24px, calc((100vw - 1320px) / 2 - 68px))',
+          }}
+        >
           <Tooltip label="AI 도우미에게 케이스 질문" position="left">
             <button
               type="button"
