@@ -1,7 +1,13 @@
+import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from django.contrib.auth.models import User
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from .models import Case, CaseEmail
+from .services import help_agent
 from .services.email_parser import (build_gmail_query, clean_subject,
                                     detect_vendor_and_direction,
                                     extract_device_info, normalize_body)
@@ -660,3 +666,130 @@ class ExactSubjectMatchTests(TestCase):
         make_email(case, self.SUBJECT, thread_id='thread-1')
         found = _find_case(None, 'thread-2', 'A10', f'Re: {self.SUBJECT}')
         self.assertIsNone(found)
+
+
+class HelpAgentToolTests(TestCase):
+    """헬프 에이전트 DB 조회 도구의 동작 검증 (LLM 호출 없음)."""
+
+    def setUp(self):
+        self.case = make_case(
+            vendor='A10', status='Resolved',
+            summary='수원 SCPv2 DATALB 파티션 변경 오류',
+            device_model='TH1040-F',
+        )
+        make_email(self.case, '[Caseopen] 수원 SCPv2 DATALB 파티션 변경 오류')
+        make_case(vendor='Arista', summary='40G Interface Link FLAP')
+
+    def test_search_by_keyword_and_vendor(self):
+        data = json.loads(help_agent._search_cases(query='파티션', vendor='A10'))
+        self.assertEqual(len(data['results']), 1)
+        self.assertEqual(data['results'][0]['case_id'], self.case.case_id)
+
+    def test_search_by_case_ref(self):
+        data = json.loads(help_agent._search_cases(query=self.case.case_id))
+        self.assertEqual(data['results'][0]['case_id'], self.case.case_id)
+
+    def test_detail_resolves_c_format_and_includes_emails(self):
+        data = json.loads(help_agent._get_case_detail(self.case.case_id))
+        self.assertEqual(data['case_id'], self.case.case_id)
+        self.assertEqual(len(data['emails']), 1)
+
+    def test_detail_unknown_case_returns_error(self):
+        data = json.loads(help_agent._get_case_detail('C-9999'))
+        self.assertIn('error', data)
+
+    def test_stats_counts_by_vendor(self):
+        data = json.loads(help_agent._get_case_stats(days=7))
+        self.assertEqual(data['total'], 2)
+        self.assertEqual(data['by_vendor']['A10'], 1)
+
+    def test_verify_flags_hallucinated_case_ref(self):
+        reply = help_agent._verify_case_refs(
+            f'{self.case.case_id} 및 C-8888 참조')
+        self.assertIn('C-8888', reply)
+        self.assertIn('확인되지 않았습니다', reply)
+
+    def test_verify_passes_valid_refs_untouched(self):
+        reply = help_agent._verify_case_refs(f'{self.case.case_id} 참조')
+        self.assertNotIn('확인되지', reply)
+
+
+def _fake_block(**kwargs):
+    return SimpleNamespace(**kwargs)
+
+
+class HelpAgentChatLoopTests(TestCase):
+    """에이전트 루프: 도구 호출 → 결과 회신 → 최종 답변 (Anthropic 모킹)."""
+
+    def setUp(self):
+        self.case = make_case(vendor='A10', summary='VRRP failover 장애')
+
+    @override_settings(ANTHROPIC_API_KEY='test-key', HELP_AGENT_MODEL='claude-haiku-4-5')
+    def test_tool_loop_returns_final_reply_and_trace(self):
+        tool_turn = SimpleNamespace(
+            stop_reason='tool_use',
+            content=[_fake_block(type='tool_use', id='tu_1', name='search_cases',
+                                 input={'query': 'VRRP'})],
+        )
+        final_turn = SimpleNamespace(
+            stop_reason='end_turn',
+            content=[_fake_block(type='text',
+                                 text=f'{self.case.case_id} 케이스가 있습니다.')],
+        )
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [tool_turn, final_turn]
+
+        with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
+            result = help_agent.chat([{'role': 'user', 'content': 'VRRP 장애 사례 찾아줘'}])
+
+        self.assertIn(self.case.case_id, result['reply'])
+        self.assertEqual(result['tool_calls'], [{'name': 'search_cases',
+                                                 'input': {'query': 'VRRP'}}])
+        # 2번째 호출의 messages에 tool_result가 회신됐는지 확인
+        second_call_messages = fake_client.messages.create.call_args_list[1].kwargs['messages']
+        self.assertEqual(second_call_messages[-1]['content'][0]['type'], 'tool_result')
+
+    @override_settings(ANTHROPIC_API_KEY='')
+    def test_missing_api_key_raises(self):
+        with self.assertRaises(RuntimeError):
+            help_agent.chat([{'role': 'user', 'content': '안녕'}])
+
+
+class HelpAgentEndpointTests(TestCase):
+    """POST /api/help-agent/chat/ 의 인증·검증·응답."""
+
+    def setUp(self):
+        User.objects.create_user('viewer1', password='pw123456')
+
+    def login(self):
+        self.client.post('/api/auth/login/',
+                         {'username': 'viewer1', 'password': 'pw123456'},
+                         content_type='application/json')
+
+    def test_requires_login(self):
+        res = self.client.post('/api/help-agent/chat/',
+                               {'messages': [{'role': 'user', 'content': '안녕'}]},
+                               content_type='application/json')
+        self.assertIn(res.status_code, (401, 403))
+
+    def test_invalid_payload_rejected(self):
+        self.login()
+        res = self.client.post('/api/help-agent/chat/', {'messages': []},
+                               content_type='application/json')
+        self.assertEqual(res.status_code, 400)
+        res = self.client.post(
+            '/api/help-agent/chat/',
+            {'messages': [{'role': 'assistant', 'content': '내가 마지막'}]},
+            content_type='application/json')
+        self.assertEqual(res.status_code, 400)
+
+    def test_viewer_can_chat(self):
+        self.login()
+        with patch('api.views.help_agent.chat',
+                   return_value={'reply': '안녕하세요', 'tool_calls': [], 'model': 'm'}):
+            res = self.client.post(
+                '/api/help-agent/chat/',
+                {'messages': [{'role': 'user', 'content': '안녕'}]},
+                content_type='application/json')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()['reply'], '안녕하세요')

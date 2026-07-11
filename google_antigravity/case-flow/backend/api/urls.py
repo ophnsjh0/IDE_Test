@@ -20,6 +20,7 @@ urlpatterns = [
     path('cases/<int:id>/relations/<int:other_id>/', views.CaseRelationView.as_view(),
          name='case-relation-remove'),
     path('gmail/sync/', views.GmailSyncView.as_view(), name='gmail-sync'),
+    path('help-agent/chat/', views.HelpAgentChatView.as_view(), name='help-agent-chat'),
     path('dashboard/stats/', views.DashboardStatsView.as_view(), name='dashboard-stats'),
     path('settings/translation-model/', views.TranslationModelView.as_view(),
          name='translation-model'),

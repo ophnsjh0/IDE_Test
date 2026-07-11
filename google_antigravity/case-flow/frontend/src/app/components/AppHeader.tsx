@@ -8,10 +8,12 @@ import {
   IconLayoutDashboard,
   IconList,
   IconLogout,
+  IconSparkles,
   IconUserCircle,
   IconUsers,
 } from '@tabler/icons-react';
 import { apiFetch } from '../lib/api';
+import HelpAgentDrawer from './HelpAgentDrawer';
 
 export default function AppHeader() {
   const pathname = usePathname();
@@ -19,6 +21,7 @@ export default function AppHeader() {
   const [username, setUsername] = useState('');
   const [isAdmin, setIsAdmin] = useState(false);
   const [connError, setConnError] = useState(false);
+  const [helpOpened, setHelpOpened] = useState(false);
 
   // 로그인 상태 확인 겸 csrftoken 쿠키 발급. 미로그인이면 로그인 페이지로,
   // 백엔드에 연결 자체가 안 되면 헤더에 오류를 표시한다 (조용히 삼키지 않음).
@@ -81,6 +84,15 @@ export default function AppHeader() {
             계정 관리
           </Button>
         )}
+        <Button
+          size="sm"
+          variant="subtle"
+          leftSection={<IconSparkles size={16} />}
+          onClick={() => setHelpOpened(true)}
+        >
+          도우미
+        </Button>
+        <HelpAgentDrawer opened={helpOpened} onClose={() => setHelpOpened(false)} />
         {connError && (
           <Group gap={6} ml="md">
             <Text size="sm" c="red" fw={600}>

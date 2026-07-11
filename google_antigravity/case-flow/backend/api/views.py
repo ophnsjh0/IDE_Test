@@ -1,6 +1,7 @@
 import logging
 from datetime import timedelta
 
+import anthropic
 from django.db.models import Count, Max, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone
@@ -22,6 +23,7 @@ from .services.analyzer import (
     get_translation_model,
     provider_api_key,
 )
+from .services import help_agent
 from .services.gmail_client import GmailAuthError
 from .services.gmail_sync import sync_gmail
 
@@ -216,3 +218,55 @@ class GmailSyncView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
         return Response(summary)
+
+
+class HelpAgentChatView(APIView):
+    """POST /api/help-agent/chat/ — 케이스 DB 검색 헬프 에이전트와 대화.
+
+    읽기 전용 도구만 쓰므로 viewer 이상 누구나 사용 가능 (기본 인증만 요구).
+    본문: {"messages": [{"role": "user"|"assistant", "content": "..."}]}
+    """
+
+    MAX_CONTENT_LENGTH = 4000
+
+    def post(self, request):
+        messages = request.data.get('messages')
+        error = self._validate(messages)
+        if error:
+            return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            result = help_agent.chat(messages)
+        except anthropic.RateLimitError:
+            return Response(
+                {'error': 'AI 사용량 한도에 걸렸습니다. 잠시 후 다시 시도해주세요.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+        except anthropic.APIStatusError as e:
+            logger.exception("help agent API error (%s)", e.status_code)
+            return Response(
+                {'error': 'AI 서비스 오류가 발생했습니다. 잠시 후 다시 시도해주세요.'},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except (anthropic.APIConnectionError, RuntimeError):
+            logger.exception("help agent unavailable")
+            return Response(
+                {'error': 'AI 서비스에 연결할 수 없습니다. 서버 설정을 확인하세요.'},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(result)
+
+    def _validate(self, messages):
+        if not isinstance(messages, list) or not messages:
+            return 'messages 목록이 필요합니다.'
+        for m in messages:
+            if (not isinstance(m, dict)
+                    or m.get('role') not in ('user', 'assistant')
+                    or not isinstance(m.get('content'), str)
+                    or not m['content'].strip()):
+                return '각 메시지는 {role: user|assistant, content: 문자열} 형식이어야 합니다.'
+            if len(m['content']) > self.MAX_CONTENT_LENGTH:
+                return f'메시지는 {self.MAX_CONTENT_LENGTH}자를 넘을 수 없습니다.'
+        if messages[-1]['role'] != 'user':
+            return '마지막 메시지는 사용자 질문이어야 합니다.'
+        return None
