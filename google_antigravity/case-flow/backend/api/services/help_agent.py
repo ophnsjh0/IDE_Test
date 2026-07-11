@@ -2,12 +2,17 @@
 
 구조(2026-07-11 합의):
   사용자 질문 → 트리아지(규칙 우선, 애매하면 haiku 분류)
-      ├→ ① DB 검색 에이전트 (haiku)  — 케이스 조회·유사 사례
-      └→ ③ 리포팅 에이전트 (sonnet) — 최근 근황 정리·현황 보고서
-  (② 기술지원(웹 검색)은 추후 — 검색어 보안 정제 필요)
+      ├→ ① DB 검색 에이전트 (haiku)   — 케이스 조회·유사 사례
+      ├→ ② 기술지원 에이전트 (sonnet) — 웹 검색 기반 기술 조언 + haiku 검수
+      └→ ③ 리포팅 에이전트 (sonnet)  — 최근 근황 정리·현황 보고서
 
-답변 검증은 LLM 평가자 대신 코드 검증 — 응답에 인용된 C-번호가 실제
-DB에 존재하는지 확인하고, 없는 번호는 경고를 덧붙인다.
+검증 전략(합의): ①·③은 코드 검증(C-번호 DB 대조), ②는 틀린 기술 조언의
+비용이 커서 LLM 평가자(haiku)가 주장↔출처 일치를 검수하고 미흡하면
+1회 수정 라운드를 돈다.
+
+보안(합의): ②의 웹 검색어는 프롬프트 지시와 별개로 코드에서도 정제 —
+고객사명(SEARCH_BLOCKED_TERMS)·시리얼 패턴·사설 IP를 제거하고
+제거 사실을 도구 결과에 표기해 에이전트가 인지하게 한다.
 """
 import json
 import logging
@@ -15,6 +20,7 @@ import re
 from datetime import timedelta
 
 import anthropic
+import httpx
 from django.conf import settings
 from django.db.models import Count, Q
 from django.utils import timezone
@@ -55,14 +61,39 @@ REPORT_SYSTEM_PROMPT = """당신은 Case-Flow(벤더 TAC 케이스 관리 시스
   → 주요 케이스(진행 중/최근 해결, 각 1-2줄) → 조치 필요 사항.
 - 기간이 명시되지 않으면 최근 30일 기준으로 작성하고 그 사실을 밝히세요."""
 
+TECH_SYSTEM_PROMPT = """당신은 네트워크 벤더(A10/Arista/HPE Aruba/Juniper) 기술지원 담당입니다.
+사내 엔지니어의 기술 질문(버그, 권고사항, 릴리즈 노트, 설정 방법, 에러 원인)에
+웹 검색으로 근거를 확보해 답합니다.
+
+규칙:
+- 기술적 판단이 필요한 질문에는 반드시 web_search로 공식 문서·릴리즈 노트·
+  보안 권고를 검색해 근거를 확보한 뒤 답하세요.
+- 사내 케이스 맥락이 필요하면 케이스 DB 도구(search_cases 등)를 활용하세요.
+- 모든 기술적 주장에는 출처를 [제목](URL) 형식으로 인용하세요.
+- 검색 결과로 뒷받침되지 않는 내용은 "일반적인 지식으로는"이라고 명시하고,
+  확신이 없으면 벤더 TAC 공식 확인을 권고하세요.
+- 보안: 검색어에 고객사명·장비 시리얼·내부 IP를 절대 넣지 마세요.
+  장비 모델명·소프트웨어 버전·에러 메시지 같은 일반 기술 용어만 사용하세요.
+- 한국어로 답하되 기술 용어는 원문을 유지하세요."""
+
+TECH_EVALUATOR_PROMPT = """기술 지원 답변의 검수자입니다. 질문, 수집된 근거(웹 검색
+결과·케이스 데이터), 답변 초안을 받아 다음을 검사합니다:
+1. 답변의 기술적 주장이 근거 자료에 실제로 존재하는가 (지어낸 내용 없음)
+2. 주장마다 출처 URL이 인용되어 있는가
+3. 근거 자료와 모순되는 서술이 없는가
+근거 없이 "일반적인 지식"임을 명시한 부분은 문제 삼지 않습니다.
+JSON만 출력하세요: {"ok": true} 또는 {"ok": false, "issues": ["문제 설명", ...]}"""
+
 # 트리아지: 명백한 리포트 요청은 규칙으로 즉시 분기 (LLM 호출 절약)
 REPORT_KEYWORDS = ('리포트', '레포트', '보고서', 'report', '주간', '월간',
                    '브리핑', '근황', '현황 정리', '정리해', '보고해')
 
-TRIAGE_SYSTEM_PROMPT = """사용자 질문을 두 담당 중 하나로 분류하는 분류기입니다.
+TRIAGE_SYSTEM_PROMPT = """사용자 질문을 세 담당 중 하나로 분류하는 분류기입니다.
 - report: 여러 케이스의 근황·현황을 정리한 보고서/브리핑 작성 요청
-- search: 특정 케이스 조회, 유사 사례 검색, 단건 질문 등 그 외 전부
-반드시 search 또는 report 한 단어로만 답하세요."""
+- tech: 케이스 DB가 아닌 일반 기술 지식 질문 — 버그/권고사항/릴리즈 노트/
+  설정 방법/에러 원인 등 웹 검색이 필요한 질문
+- search: 특정 케이스 조회, 유사 사례 검색 등 사내 케이스 DB에 대한 질문 (기본값)
+반드시 search / report / tech 중 한 단어로만 답하세요."""
 
 _SEARCH_TOOL_DEFS = {
     'search_cases': {
@@ -125,6 +156,23 @@ _SEARCH_TOOL_DEFS = {
                            'description': '상태 필터 (선택)'},
                 'limit': {'type': 'integer', 'description': '최대 결과 수 (기본 20, 최대 50)'},
             },
+        },
+    },
+    'web_search': {
+        'name': 'web_search',
+        'description': (
+            '구글 웹 검색으로 벤더 공식 문서·릴리즈 노트·보안 권고·기술 자료를 찾는다. '
+            '검색어는 장비 모델·버전·에러 메시지 같은 일반 기술 용어만 사용할 것 — '
+            '고객사명·시리얼·내부 IP는 보안 정책으로 자동 제거된다. '
+            '영어 검색어가 벤더 문서 검색에 더 효과적이다.'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'query': {'type': 'string', 'description': '검색어 (일반 기술 용어만)'},
+                'num_results': {'type': 'integer', 'description': '결과 수 (기본 8, 최대 10)'},
+            },
+            'required': ['query'],
         },
     },
 }
@@ -242,11 +290,79 @@ def _list_recent_cases(days=30, vendor='', status='', limit=20):
                       ensure_ascii=False)
 
 
+# 웹 검색어 보안 정제 패턴 — 프롬프트 지시와 별개로 코드에서 강제.
+# 사설 IP 대역(10./172.16-31./192.168.)과 시리얼로 보이는 토큰(숫자를 포함한
+# 10자 이상 연속 대문자 영숫자, 예: TH10154022070160)을 제거한다.
+# 하이픈은 제외 — ACOS-104904 같은 벤더 버그 ID는 검색에 필요하고,
+# 실제 장비 시리얼은 하이픈 없는 연속 영숫자다 (2026-07-11 실검증서 오탐 수정).
+RE_PRIVATE_IP = re.compile(
+    r'\b(?:10|192\.168|172\.(?:1[6-9]|2\d|3[01]))(?:\.\d{1,3}){2,3}\b')
+RE_SERIAL_LIKE = re.compile(r'\b(?=[A-Z0-9]*\d)[A-Z][A-Z0-9]{9,}\b')
+
+
+def _sanitize_search_query(query):
+    """검색어에서 고객사명·시리얼·사설 IP를 제거. (정제된 검색어, 제거 목록) 반환."""
+    removed = []
+
+    for pattern in (RE_PRIVATE_IP, RE_SERIAL_LIKE):
+        for match in pattern.findall(query):
+            removed.append(match)
+        query = pattern.sub(' ', query)
+
+    lowered = query.lower()
+    for term in settings.SEARCH_BLOCKED_TERMS:
+        if term in lowered:
+            removed.append(term)
+            query = re.sub(re.escape(term), ' ', query, flags=re.IGNORECASE)
+            lowered = query.lower()
+
+    return re.sub(r'\s+', ' ', query).strip(), removed
+
+
+def _web_search(query, num_results=8):
+    if not settings.SERPER_API_KEY:
+        return json.dumps({'error': 'SERPER_API_KEY가 설정되지 않아 웹 검색을 사용할 수 없습니다.'},
+                          ensure_ascii=False)
+
+    clean_query, removed = _sanitize_search_query(str(query))
+    if not clean_query:
+        return json.dumps({
+            'error': '보안 정책으로 검색어가 모두 제거되었습니다. '
+                     '고객사명·시리얼·IP 없이 일반 기술 용어로 다시 검색하세요.',
+            'removed': removed,
+        }, ensure_ascii=False)
+
+    if removed:
+        logger.warning('web search query sanitized: removed=%s', removed)
+
+    response = httpx.post(
+        'https://google.serper.dev/search',
+        json={'q': clean_query, 'num': min(int(num_results or 8), 10)},
+        headers={'X-API-KEY': settings.SERPER_API_KEY},
+        timeout=15,
+    )
+    response.raise_for_status()
+    organic = response.json().get('organic', [])
+
+    payload = {
+        'query_used': clean_query,
+        'results': [
+            {'title': r.get('title', ''), 'url': r.get('link', ''),
+             'snippet': r.get('snippet', '')}
+            for r in organic[:min(int(num_results or 8), 10)]
+        ],
+    }
+    if removed:
+        payload['notice'] = f"보안 정책으로 검색어에서 제거됨: {', '.join(removed)}"
+    return json.dumps(payload, ensure_ascii=False)
+
+
 TOOL_HANDLERS = {
     'search_cases': _search_cases,
     'get_case_detail': _get_case_detail,
     'get_case_stats': _get_case_stats,
     'list_recent_cases': _list_recent_cases,
+    'web_search': _web_search,
 }
 
 
@@ -302,6 +418,12 @@ def _agent_configs():
             # 리포트는 표·문단이 길어 출력 여유 필요
             'max_tokens': 8000,
         },
+        'tech': {
+            'model': settings.TECH_AGENT_MODEL,
+            'system': TECH_SYSTEM_PROMPT,
+            'tools': tools('web_search', 'search_cases', 'get_case_detail'),
+            'max_tokens': 6000,
+        },
     }
 
 
@@ -324,16 +446,54 @@ def _triage(client, messages):
             messages=[{'role': 'user', 'content': question[:1000]}],
         )
         text = ''.join(b.text for b in response.content if b.type == 'text').lower()
-        return 'report' if 'report' in text else 'search'
+        if 'report' in text:
+            return 'report'
+        if 'tech' in text:
+            return 'tech'
+        return 'search'
     except anthropic.APIError:
         logger.warning('help agent triage failed; defaulting to search', exc_info=True)
         return 'search'
 
 
+# 평가자에게 넘기는 근거 자료 길이 상한 (haiku 입력 비용 통제)
+MAX_EVIDENCE_CHARS = 8000
+
+
+def _evaluate_tech_reply(client, question, evidence, reply):
+    """haiku 평가자: 기술 답변의 주장↔출처 일치 검수.
+
+    검수 자체가 실패하면(파싱 불가·API 오류) 답변을 막지 않고 통과시킨다 —
+    평가자는 품질 보조 장치지 게이트가 아니다.
+    """
+    evidence_text = '\n\n'.join(evidence)[:MAX_EVIDENCE_CHARS]
+    try:
+        response = client.messages.create(
+            model=settings.HELP_AGENT_MODEL,
+            max_tokens=500,
+            system=TECH_EVALUATOR_PROMPT,
+            messages=[{
+                'role': 'user',
+                'content': (f'[질문]\n{question}\n\n'
+                            f'[근거 자료]\n{evidence_text or "(수집된 근거 없음)"}\n\n'
+                            f'[답변 초안]\n{reply}'),
+            }],
+        )
+        text = ''.join(b.text for b in response.content if b.type == 'text')
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        verdict = json.loads(match.group(0)) if match else {'ok': True}
+        verdict.setdefault('ok', True)
+        return verdict
+    except (anthropic.APIError, ValueError):
+        logger.warning('tech evaluator failed; skipping review', exc_info=True)
+        return {'ok': True}
+
+
 def chat(messages):
     """user/assistant 텍스트 턴 목록을 받아 트리아지 후 에이전트 루프를 실행.
 
-    반환: {'reply', 'tool_calls': [{'name', 'input'}], 'model', 'agent'}
+    반환: {'reply', 'tool_calls': [{'name', 'input'}], 'model', 'agent',
+           'evaluation'(tech만, {'ok', 'issues'?})}
     API 오류는 anthropic 예외 그대로 전파 — 뷰에서 상태코드로 변환한다.
     """
     if not settings.ANTHROPIC_API_KEY:
@@ -345,6 +505,7 @@ def chat(messages):
 
     convo = list(messages[-MAX_HISTORY_MESSAGES:])
     tool_trace = []
+    evidence = []  # 도구가 수집한 근거 (tech 평가자 입력)
 
     response = None
     for _ in range(MAX_TOOL_ITERATIONS):
@@ -365,6 +526,8 @@ def chat(messages):
                 continue
             output, is_error = _execute_tool(block.name, block.input)
             tool_trace.append({'name': block.name, 'input': block.input})
+            if not is_error:
+                evidence.append(f'[{block.name}] {output}')
             results.append({
                 'type': 'tool_result',
                 'tool_use_id': block.id,
@@ -376,9 +539,39 @@ def chat(messages):
     reply = ''.join(b.text for b in response.content if b.type == 'text').strip()
     if not reply:
         reply = '답변을 생성하지 못했습니다. 질문을 조금 더 구체적으로 해주세요.'
-    return {
+
+    # ② 기술지원만 평가자 검수 — 미흡하면 1회 수정 라운드 (비용 상한 고정)
+    evaluation = None
+    if agent == 'tech':
+        question = messages[-1]['content']
+        evaluation = _evaluate_tech_reply(client, question, evidence, reply)
+        if not evaluation.get('ok'):
+            issues = '\n'.join(f'- {i}' for i in evaluation.get('issues', []))
+            convo.append({'role': 'assistant', 'content': reply})
+            convo.append({
+                'role': 'user',
+                'content': (f'[자동 검수 피드백]\n{issues}\n\n'
+                            '위 문제를 반영해 수정된 최종 답변만 다시 작성하세요. '
+                            '근거 없는 주장은 제거하거나 일반 지식임을 명시하고, '
+                            '기술적 주장에는 출처 URL을 인용하세요.'),
+            })
+            revision = client.messages.create(
+                model=config['model'],
+                max_tokens=config.get('max_tokens', 4096),
+                system=config['system'],
+                messages=convo,
+            )
+            revised = ''.join(b.text for b in revision.content
+                              if b.type == 'text').strip()
+            if revised:
+                reply = revised
+
+    result = {
         'reply': _verify_case_refs(reply),
         'tool_calls': tool_trace,
         'model': config['model'],
         'agent': agent,
     }
+    if evaluation is not None:
+        result['evaluation'] = evaluation
+    return result

@@ -30,18 +30,21 @@ interface ChatMessage {
 const AGENT_LABELS: Record<string, string> = {
   search: '검색',
   report: '리포팅',
+  tech: '기술지원',
 };
 
 const TOOL_LABELS: Record<string, string> = {
   search_cases: '케이스 검색',
   get_case_detail: '상세 조회',
   get_case_stats: '통계 집계',
+  list_recent_cases: '최근 케이스',
+  web_search: '웹 검색',
 };
 
 const SUGGESTIONS = [
   'VRRP failover 유사 사례 찾아줘',
-  'Open 상태인 A10 케이스 보여줘',
   '최근 30일 케이스 리포트 작성해줘',
+  'ACOS 6.0.8 알려진 버그 검색해줘',
 ];
 
 // AI 도우미 런처 + 채팅 Drawer를 묶은 위젯.

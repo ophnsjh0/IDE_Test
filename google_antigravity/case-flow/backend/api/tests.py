@@ -868,3 +868,124 @@ class HelpAgentEndpointTests(TestCase):
                 content_type='application/json')
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json()['reply'], '안녕하세요')
+
+
+@override_settings(SEARCH_BLOCKED_TERMS=['samsung', '삼성', '하나은행'])
+class SearchQuerySanitizerTests(TestCase):
+    """웹 검색어 보안 정제 — 고객사명·시리얼·사설 IP 제거 (코드 가드레일)."""
+
+    def test_customer_names_removed(self):
+        clean, removed = help_agent._sanitize_search_query(
+            '삼성 SCP 환경 A10 파티션 변경 오류')
+        self.assertNotIn('삼성', clean)
+        self.assertIn('A10 파티션 변경 오류', clean)
+        self.assertIn('삼성', removed)
+
+    def test_private_ip_and_serial_removed(self):
+        clean, removed = help_agent._sanitize_search_query(
+            'TH1040-F 10.20.30.40 TH10154022070160 failover 원인')
+        self.assertNotIn('10.20.30.40', clean)
+        self.assertNotIn('TH10154022070160', clean)
+        self.assertIn('TH1040-F', clean)  # 모델명은 유지
+        self.assertIn('failover', clean)
+        self.assertEqual(len(removed), 2)
+
+    def test_clean_technical_query_untouched(self):
+        clean, removed = help_agent._sanitize_search_query(
+            'Arista EOS 4.32.4M PhyEthtool log advisory')
+        self.assertEqual(clean, 'Arista EOS 4.32.4M PhyEthtool log advisory')
+        self.assertEqual(removed, [])
+
+    def test_vendor_bug_id_is_kept(self):
+        # ACOS-104904 같은 버그 ID는 시리얼이 아니다 — 검색에 필요 (오탐 회귀 방지)
+        clean, removed = help_agent._sanitize_search_query(
+            'A10 ACOS-104904 VRRP-A advertisement timer bug')
+        self.assertIn('ACOS-104904', clean)
+        self.assertEqual(removed, [])
+
+
+class WebSearchToolTests(TestCase):
+    """web_search 도구 — Serper 연동(모킹)과 키 미설정 처리."""
+
+    @override_settings(SERPER_API_KEY='')
+    def test_missing_key_returns_error(self):
+        data = json.loads(help_agent._web_search('EOS bug'))
+        self.assertIn('error', data)
+
+    @override_settings(SERPER_API_KEY='k', SEARCH_BLOCKED_TERMS=['삼성'])
+    def test_results_parsed_and_sanitize_notice(self):
+        fake_response = MagicMock()
+        fake_response.json.return_value = {'organic': [
+            {'title': 'ACOS Release Notes', 'link': 'https://a10.com/rn',
+             'snippet': '6.0.9 fixes'},
+        ]}
+        with patch.object(help_agent.httpx, 'post',
+                          return_value=fake_response) as post:
+            data = json.loads(help_agent._web_search('삼성 ACOS 6.0.8 bug'))
+
+        self.assertEqual(data['results'][0]['url'], 'https://a10.com/rn')
+        self.assertIn('제거됨', data['notice'])
+        # 실제 전송된 검색어에 고객사명이 없어야 함
+        sent_query = post.call_args.kwargs['json']['q']
+        self.assertNotIn('삼성', sent_query)
+
+    @override_settings(SERPER_API_KEY='k', SEARCH_BLOCKED_TERMS=['삼성'])
+    def test_fully_blocked_query_returns_error_without_request(self):
+        with patch.object(help_agent.httpx, 'post') as post:
+            data = json.loads(help_agent._web_search('삼성'))
+        self.assertIn('error', data)
+        post.assert_not_called()
+
+
+class TechAgentFlowTests(TestCase):
+    """② 기술지원: 트리아지 → sonnet 답변 → haiku 검수 → (미흡 시) 수정."""
+
+    def _triage_resp(self, label):
+        return SimpleNamespace(stop_reason='end_turn',
+                               content=[_fake_block(type='text', text=label)])
+
+    def _text_resp(self, text, stop_reason='end_turn'):
+        return SimpleNamespace(stop_reason=stop_reason,
+                               content=[_fake_block(type='text', text=text)])
+
+    @override_settings(ANTHROPIC_API_KEY='test-key',
+                       HELP_AGENT_MODEL='claude-haiku-4-5',
+                       TECH_AGENT_MODEL='claude-sonnet-5')
+    def test_evaluator_pass_returns_reply_without_revision(self):
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            self._triage_resp('tech'),
+            self._text_resp('ACOS 6.0.9에서 수정되었습니다. [RN](https://a10.com/rn)'),
+            self._text_resp('{"ok": true}'),  # 평가자
+        ]
+        with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
+            result = help_agent.chat(
+                [{'role': 'user', 'content': 'ACOS 6.0.8 VRRP 버그 수정 버전 알려줘'}])
+
+        self.assertEqual(result['agent'], 'tech')
+        self.assertEqual(result['model'], 'claude-sonnet-5')
+        self.assertTrue(result['evaluation']['ok'])
+        self.assertIn('6.0.9', result['reply'])
+        self.assertEqual(fake_client.messages.create.call_count, 3)  # 수정 라운드 없음
+
+    @override_settings(ANTHROPIC_API_KEY='test-key',
+                       HELP_AGENT_MODEL='claude-haiku-4-5',
+                       TECH_AGENT_MODEL='claude-sonnet-5')
+    def test_evaluator_fail_triggers_one_revision(self):
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            self._triage_resp('tech'),
+            self._text_resp('근거 없는 초안'),
+            self._text_resp('{"ok": false, "issues": ["출처 인용 없음"]}'),  # 평가자
+            self._text_resp('수정된 답변 [출처](https://vendor.com/doc)'),   # 수정 라운드
+        ]
+        with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
+            result = help_agent.chat(
+                [{'role': 'user', 'content': 'EOS 업그레이드 시 주의사항 알려줘'}])
+
+        self.assertFalse(result['evaluation']['ok'])
+        self.assertIn('수정된 답변', result['reply'])
+        self.assertEqual(fake_client.messages.create.call_count, 4)
+        # 수정 요청에 검수 피드백이 전달됐는지 확인
+        revision_messages = fake_client.messages.create.call_args_list[3].kwargs['messages']
+        self.assertIn('자동 검수 피드백', revision_messages[-1]['content'])
