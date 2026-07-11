@@ -749,6 +749,28 @@ class HelpAgentTriageTests(TestCase):
             client, [{'role': 'user', 'content': 'C-1122 상태 알려줘'}])
         self.assertEqual(agent, 'search')
 
+    def test_off_topic_classification(self):
+        client = MagicMock()
+        client.messages.create.return_value = SimpleNamespace(
+            content=[_fake_block(type='text', text='off_topic')])
+        agent = help_agent._triage(
+            client, [{'role': 'user', 'content': '오늘 저녁 뭐 먹을까?'}])
+        self.assertEqual(agent, 'off_topic')
+
+    @override_settings(ANTHROPIC_API_KEY='test-key', HELP_AGENT_MODEL='claude-haiku-4-5')
+    def test_off_topic_short_circuits_without_agent_call(self):
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = SimpleNamespace(
+            content=[_fake_block(type='text', text='off_topic')])
+        with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
+            result = help_agent.chat([{'role': 'user', 'content': '주식 추천해줘'}])
+
+        self.assertEqual(result['agent'], 'off_topic')
+        self.assertEqual(result['tool_calls'], [])
+        self.assertIn('범위 밖', result['reply'])
+        # 트리아지 1회만 호출 — 에이전트 본 호출 없음 (비용 가드)
+        self.assertEqual(fake_client.messages.create.call_count, 1)
+
 
 def _fake_block(**kwargs):
     return SimpleNamespace(**kwargs)

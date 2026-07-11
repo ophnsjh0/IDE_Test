@@ -31,6 +31,7 @@ const AGENT_LABELS: Record<string, string> = {
   search: '검색',
   report: '리포팅',
   tech: '기술지원',
+  off_topic: '안내',
 };
 
 const TOOL_LABELS: Record<string, string> = {
