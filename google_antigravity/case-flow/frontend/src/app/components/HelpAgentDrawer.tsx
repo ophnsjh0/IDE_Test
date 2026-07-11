@@ -24,7 +24,13 @@ interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   toolNote?: string; // 답변 근거로 사용한 도구 호출 표시
+  agent?: string; // 트리아지가 배정한 담당 에이전트 (search | report)
 }
+
+const AGENT_LABELS: Record<string, string> = {
+  search: '검색',
+  report: '리포팅',
+};
 
 const TOOL_LABELS: Record<string, string> = {
   search_cases: '케이스 검색',
@@ -34,8 +40,8 @@ const TOOL_LABELS: Record<string, string> = {
 
 const SUGGESTIONS = [
   'VRRP failover 유사 사례 찾아줘',
-  '최근 30일 벤더별 케이스 현황은?',
   'Open 상태인 A10 케이스 보여줘',
+  '최근 30일 케이스 리포트 작성해줘',
 ];
 
 // AI 도우미 런처 + 채팅 Drawer를 묶은 위젯.
@@ -81,7 +87,7 @@ export default function HelpAgentWidget({
         .join(' → ');
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: data.reply, toolNote },
+        { role: 'assistant', content: data.reply, toolNote, agent: data.agent },
       ]);
     } catch (e) {
       setMessages((prev) => [
@@ -195,7 +201,12 @@ export default function HelpAgentWidget({
                       >
                         <IconRobotFace size={12} />
                       </ThemeIcon>
-                      <Text size="xs" c="dimmed" fw={600}>AI 도우미</Text>
+                      <Text size="xs" c="dimmed" fw={600}>
+                        AI 도우미
+                        {m.agent && AGENT_LABELS[m.agent]
+                          ? ` · ${AGENT_LABELS[m.agent]}`
+                          : ''}
+                      </Text>
                     </Group>
                   )}
                   <div className={m.role === 'user' ? classes.bubbleUser : classes.bubbleAssistant}>

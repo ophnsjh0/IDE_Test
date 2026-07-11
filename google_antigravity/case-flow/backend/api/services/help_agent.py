@@ -1,10 +1,11 @@
-"""헬프 에이전트 ① — DB 검색.
+"""헬프 에이전트 — 트리아지 + 역할별 에이전트.
 
-사용자가 케이스 조회·유사 사례 검색을 자연어로 질문하면, Claude가
-케이스 DB 조회 도구를 호출해 근거를 확보한 뒤 답한다. 외부 지식·웹 검색은
-이 에이전트의 범위가 아니다 (추후 별도 에이전트).
+구조(2026-07-11 합의):
+  사용자 질문 → 트리아지(규칙 우선, 애매하면 haiku 분류)
+      ├→ ① DB 검색 에이전트 (haiku)  — 케이스 조회·유사 사례
+      └→ ③ 리포팅 에이전트 (sonnet) — 최근 근황 정리·현황 보고서
+  (② 기술지원(웹 검색)은 추후 — 검색어 보안 정제 필요)
 
-비용/역할 설계(2026-07-11 합의): DB 검색은 저비용 모델(haiku)로 충분.
 답변 검증은 LLM 평가자 대신 코드 검증 — 응답에 인용된 C-번호가 실제
 DB에 존재하는지 확인하고, 없는 번호는 경고를 덧붙인다.
 """
@@ -27,7 +28,7 @@ MAX_TOOL_ITERATIONS = 6
 # 프론트가 보내는 대화 이력 상한 (오래된 턴은 잘라 토큰 낭비 방지)
 MAX_HISTORY_MESSAGES = 20
 
-SYSTEM_PROMPT = """당신은 Case-Flow(벤더 TAC 케이스 관리 시스템)의 도우미입니다.
+SEARCH_SYSTEM_PROMPT = """당신은 Case-Flow(벤더 TAC 케이스 관리 시스템)의 도우미입니다.
 사용자는 네트워크 엔지니어이며, A10/Arista/HPE Aruba/Juniper 벤더의
 기술지원 케이스 이력에 대해 질문합니다.
 
@@ -41,8 +42,30 @@ SYSTEM_PROMPT = """당신은 Case-Flow(벤더 TAC 케이스 관리 시스템)의
 - 이 시스템의 케이스 데이터 범위를 벗어나는 일반 기술 질문에는
   "케이스 이력 검색 도우미라 일반 기술 지원은 범위 밖"이라고 안내하세요."""
 
-TOOLS = [
-    {
+REPORT_SYSTEM_PROMPT = """당신은 Case-Flow(벤더 TAC 케이스 관리 시스템)의 리포팅 담당입니다.
+사용자가 최근 케이스 근황·현황 정리를 요청하면, 도구로 데이터를 수집한 뒤
+바로 공유할 수 있는 한국어 보고서를 작성합니다.
+
+작성 규칙:
+- 반드시 get_case_stats와 list_recent_cases로 데이터를 먼저 수집하세요.
+  주요 케이스는 필요 시 get_case_detail로 내용을 확인하세요.
+- 모든 숫자는 도구 결과에 있는 값만 사용하세요. 추정하거나 지어내지 마세요.
+- 케이스를 언급할 때는 항상 C-번호를 표기하세요.
+- 구성: ## 제목(기간 명시) → 요약(2-3문장) → 전체 지표 → 벤더별 현황(표)
+  → 주요 케이스(진행 중/최근 해결, 각 1-2줄) → 조치 필요 사항.
+- 기간이 명시되지 않으면 최근 30일 기준으로 작성하고 그 사실을 밝히세요."""
+
+# 트리아지: 명백한 리포트 요청은 규칙으로 즉시 분기 (LLM 호출 절약)
+REPORT_KEYWORDS = ('리포트', '레포트', '보고서', 'report', '주간', '월간',
+                   '브리핑', '근황', '현황 정리', '정리해', '보고해')
+
+TRIAGE_SYSTEM_PROMPT = """사용자 질문을 두 담당 중 하나로 분류하는 분류기입니다.
+- report: 여러 케이스의 근황·현황을 정리한 보고서/브리핑 작성 요청
+- search: 특정 케이스 조회, 유사 사례 검색, 단건 질문 등 그 외 전부
+반드시 search 또는 report 한 단어로만 답하세요."""
+
+_SEARCH_TOOL_DEFS = {
+    'search_cases': {
         'name': 'search_cases',
         'description': (
             '케이스 DB를 검색한다. query는 요약/설명/장비모델/시리얼/벤더케이스번호에 '
@@ -62,7 +85,7 @@ TOOLS = [
             },
         },
     },
-    {
+    'get_case_detail': {
         'name': 'get_case_detail',
         'description': (
             '케이스 하나의 상세 정보(설명, 조치 이력, 해결 내용, 이메일 타임라인, '
@@ -76,7 +99,7 @@ TOOLS = [
             'required': ['case_ref'],
         },
     },
-    {
+    'get_case_stats': {
         'name': 'get_case_stats',
         'description': '벤더별/상태별 케이스 건수와 최근 N일 신규·업데이트 건수를 집계한다.',
         'input_schema': {
@@ -86,7 +109,25 @@ TOOLS = [
             },
         },
     },
-]
+    'list_recent_cases': {
+        'name': 'list_recent_cases',
+        'description': (
+            '최근 N일 안에 생성되거나 업데이트된 케이스 목록을 최신순으로 반환한다. '
+            '리포트 작성 시 주요 케이스 파악용.'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'days': {'type': 'integer', 'description': '최근 며칠 기준 (기본 30)'},
+                'vendor': {'type': 'string', 'enum': ['A10', 'Arista', 'HPE Aruba', 'Juniper'],
+                           'description': '벤더 필터 (선택)'},
+                'status': {'type': 'string', 'enum': ['Open', 'Resolved', 'Pending'],
+                           'description': '상태 필터 (선택)'},
+                'limit': {'type': 'integer', 'description': '최대 결과 수 (기본 20, 최대 50)'},
+            },
+        },
+    },
+}
 
 
 def _resolve_case(case_ref):
@@ -182,10 +223,30 @@ def _get_case_stats(days=30):
     }, ensure_ascii=False)
 
 
+def _list_recent_cases(days=30, vendor='', status='', limit=20):
+    days = int(days or 30)
+    limit = min(int(limit or 20), 50)
+    since = timezone.now() - timedelta(days=days)
+    cases = Case.objects.filter(Q(created_at__gte=since) | Q(updated_at__gte=since))
+    if vendor:
+        cases = cases.filter(vendor=vendor)
+    if status:
+        cases = cases.filter(status=status)
+
+    rows = []
+    for case in cases.order_by('-updated_at')[:limit]:
+        row = _case_summary_row(case)
+        row['is_new'] = case.created_at >= since  # 기간 내 신규 여부
+        rows.append(row)
+    return json.dumps({'days': days, 'results': rows, 'count': len(rows)},
+                      ensure_ascii=False)
+
+
 TOOL_HANDLERS = {
     'search_cases': _search_cases,
     'get_case_detail': _get_case_detail,
     'get_case_stats': _get_case_stats,
+    'list_recent_cases': _list_recent_cases,
 }
 
 
@@ -222,27 +283,76 @@ def _verify_case_refs(reply):
     return reply
 
 
-def chat(messages):
-    """user/assistant 텍스트 턴 목록을 받아 에이전트 루프를 실행.
+def _agent_configs():
+    """역할별 모델·프롬프트·도구 구성. settings는 런타임에 읽는다 (테스트 오버라이드)."""
+    def tools(*names):
+        return [_SEARCH_TOOL_DEFS[n] for n in names]
 
-    반환: {'reply': str, 'tool_calls': [{'name', 'input'}], 'model': str}
+    return {
+        'search': {
+            'model': settings.HELP_AGENT_MODEL,
+            'system': SEARCH_SYSTEM_PROMPT,
+            'tools': tools('search_cases', 'get_case_detail', 'get_case_stats'),
+        },
+        'report': {
+            'model': settings.REPORT_AGENT_MODEL,
+            'system': REPORT_SYSTEM_PROMPT,
+            'tools': tools('get_case_stats', 'list_recent_cases',
+                           'search_cases', 'get_case_detail'),
+            # 리포트는 표·문단이 길어 출력 여유 필요
+            'max_tokens': 8000,
+        },
+    }
+
+
+def _triage(client, messages):
+    """질문을 담당 에이전트로 분류. 명백한 패턴은 규칙, 애매하면 haiku 1회 호출.
+
+    분류 실패 시 search로 폴백 — 잘못 가도 검색 에이전트가 통계 도구를
+    갖고 있어 최소한의 답은 가능하다.
+    """
+    question = messages[-1]['content']
+    lowered = question.lower()
+    if any(keyword in lowered for keyword in REPORT_KEYWORDS):
+        return 'report'
+
+    try:
+        response = client.messages.create(
+            model=settings.HELP_AGENT_MODEL,
+            max_tokens=10,
+            system=TRIAGE_SYSTEM_PROMPT,
+            messages=[{'role': 'user', 'content': question[:1000]}],
+        )
+        text = ''.join(b.text for b in response.content if b.type == 'text').lower()
+        return 'report' if 'report' in text else 'search'
+    except anthropic.APIError:
+        logger.warning('help agent triage failed; defaulting to search', exc_info=True)
+        return 'search'
+
+
+def chat(messages):
+    """user/assistant 텍스트 턴 목록을 받아 트리아지 후 에이전트 루프를 실행.
+
+    반환: {'reply', 'tool_calls': [{'name', 'input'}], 'model', 'agent'}
     API 오류는 anthropic 예외 그대로 전파 — 뷰에서 상태코드로 변환한다.
     """
     if not settings.ANTHROPIC_API_KEY:
         raise RuntimeError('ANTHROPIC_API_KEY가 설정되지 않았습니다.')
 
     client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-    model = settings.HELP_AGENT_MODEL
+    agent = _triage(client, messages)
+    config = _agent_configs()[agent]
+
     convo = list(messages[-MAX_HISTORY_MESSAGES:])
     tool_trace = []
 
     response = None
     for _ in range(MAX_TOOL_ITERATIONS):
         response = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
+            model=config['model'],
+            max_tokens=config.get('max_tokens', 4096),
+            system=config['system'],
+            tools=config['tools'],
             messages=convo,
         )
         if response.stop_reason != 'tool_use':
@@ -266,4 +376,9 @@ def chat(messages):
     reply = ''.join(b.text for b in response.content if b.type == 'text').strip()
     if not reply:
         reply = '답변을 생성하지 못했습니다. 질문을 조금 더 구체적으로 해주세요.'
-    return {'reply': _verify_case_refs(reply), 'tool_calls': tool_trace, 'model': model}
+    return {
+        'reply': _verify_case_refs(reply),
+        'tool_calls': tool_trace,
+        'model': config['model'],
+        'agent': agent,
+    }

@@ -2,6 +2,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import anthropic
+
 from django.contrib.auth.models import User
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -713,6 +715,40 @@ class HelpAgentToolTests(TestCase):
         reply = help_agent._verify_case_refs(f'{self.case.case_id} 참조')
         self.assertNotIn('확인되지', reply)
 
+    def test_list_recent_cases_marks_new_and_filters_vendor(self):
+        data = json.loads(help_agent._list_recent_cases(days=7, vendor='A10'))
+        self.assertEqual(data['count'], 1)
+        self.assertEqual(data['results'][0]['case_id'], self.case.case_id)
+        self.assertTrue(data['results'][0]['is_new'])
+
+
+class HelpAgentTriageTests(TestCase):
+    """트리아지: 규칙 우선, 애매하면 haiku 분류, 실패 시 search 폴백."""
+
+    def test_report_keyword_skips_llm(self):
+        client = MagicMock()
+        agent = help_agent._triage(
+            client, [{'role': 'user', 'content': '이번 주 케이스 리포트 만들어줘'}])
+        self.assertEqual(agent, 'report')
+        client.messages.create.assert_not_called()
+
+    def test_ambiguous_question_uses_llm_classifier(self):
+        client = MagicMock()
+        client.messages.create.return_value = SimpleNamespace(
+            content=[_fake_block(type='text', text='report')])
+        agent = help_agent._triage(
+            client, [{'role': 'user', 'content': '요즘 케이스들 어떻게 돌아가?'}])
+        self.assertEqual(agent, 'report')
+        client.messages.create.assert_called_once()
+
+    def test_classifier_failure_falls_back_to_search(self):
+        client = MagicMock()
+        client.messages.create.side_effect = anthropic.APIConnectionError(
+            request=MagicMock())
+        agent = help_agent._triage(
+            client, [{'role': 'user', 'content': 'C-1122 상태 알려줘'}])
+        self.assertEqual(agent, 'search')
+
 
 def _fake_block(**kwargs):
     return SimpleNamespace(**kwargs)
@@ -726,6 +762,10 @@ class HelpAgentChatLoopTests(TestCase):
 
     @override_settings(ANTHROPIC_API_KEY='test-key', HELP_AGENT_MODEL='claude-haiku-4-5')
     def test_tool_loop_returns_final_reply_and_trace(self):
+        triage_turn = SimpleNamespace(
+            stop_reason='end_turn',
+            content=[_fake_block(type='text', text='search')],
+        )
         tool_turn = SimpleNamespace(
             stop_reason='tool_use',
             content=[_fake_block(type='tool_use', id='tu_1', name='search_cases',
@@ -737,17 +777,41 @@ class HelpAgentChatLoopTests(TestCase):
                                  text=f'{self.case.case_id} 케이스가 있습니다.')],
         )
         fake_client = MagicMock()
-        fake_client.messages.create.side_effect = [tool_turn, final_turn]
+        fake_client.messages.create.side_effect = [triage_turn, tool_turn, final_turn]
 
         with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
             result = help_agent.chat([{'role': 'user', 'content': 'VRRP 장애 사례 찾아줘'}])
 
+        self.assertEqual(result['agent'], 'search')
         self.assertIn(self.case.case_id, result['reply'])
         self.assertEqual(result['tool_calls'], [{'name': 'search_cases',
                                                  'input': {'query': 'VRRP'}}])
-        # 2번째 호출의 messages에 tool_result가 회신됐는지 확인
-        second_call_messages = fake_client.messages.create.call_args_list[1].kwargs['messages']
-        self.assertEqual(second_call_messages[-1]['content'][0]['type'], 'tool_result')
+        # 3번째 호출(도구 회신 후)의 messages에 tool_result가 포함됐는지 확인
+        third_call_messages = fake_client.messages.create.call_args_list[2].kwargs['messages']
+        self.assertEqual(third_call_messages[-1]['content'][0]['type'], 'tool_result')
+
+    @override_settings(ANTHROPIC_API_KEY='test-key',
+                       HELP_AGENT_MODEL='claude-haiku-4-5',
+                       REPORT_AGENT_MODEL='claude-sonnet-5')
+    def test_report_request_routes_to_report_agent(self):
+        final_turn = SimpleNamespace(
+            stop_reason='end_turn',
+            content=[_fake_block(type='text', text='## 주간 리포트\n요약입니다.')],
+        )
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = final_turn
+
+        with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
+            result = help_agent.chat(
+                [{'role': 'user', 'content': '이번 주 케이스 리포트 작성해줘'}])
+
+        self.assertEqual(result['agent'], 'report')
+        self.assertEqual(result['model'], 'claude-sonnet-5')
+        # 리포트 키워드는 규칙 분기 → 트리아지 LLM 호출 없이 본 호출 1회만
+        call = fake_client.messages.create.call_args_list[0]
+        self.assertEqual(call.kwargs['model'], 'claude-sonnet-5')
+        tool_names = [t['name'] for t in call.kwargs['tools']]
+        self.assertIn('list_recent_cases', tool_names)
 
     @override_settings(ANTHROPIC_API_KEY='')
     def test_missing_api_key_raises(self):
