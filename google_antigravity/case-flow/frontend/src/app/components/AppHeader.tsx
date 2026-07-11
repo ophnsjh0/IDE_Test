@@ -82,8 +82,9 @@ export default function AppHeader() {
             계정 관리
           </Button>
         )}
-        {/* 리스트 페이지(/)는 status 필터 줄에 인라인 버튼이 있어 플로팅 생략 */}
-        {pathname !== '/' && <HelpAgentWidget />}
+        {/* 리스트 페이지(/)는 status 필터 줄에 인라인 버튼이 있어 플로팅 생략.
+            AI 비용 때문에 테스트 배포 동안 관리자에게만 노출 (서버도 차단) */}
+        {pathname !== '/' && isAdmin && <HelpAgentWidget />}
         {connError && (
           <Group gap={6} ml="md">
             <Text size="sm" c="red" fw={600}>

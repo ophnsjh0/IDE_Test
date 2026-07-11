@@ -407,7 +407,8 @@ export default function Home() {
                 })}
               </Tabs.List>
             </Tabs>
-            <HelpAgentWidget variant="inline" />
+            {/* AI 비용 때문에 테스트 배포 동안 관리자에게만 노출 (서버도 차단) */}
+            {isAdmin && <HelpAgentWidget variant="inline" />}
             </Group>
 
             <Group mb="md">

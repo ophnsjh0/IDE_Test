@@ -756,14 +756,18 @@ class HelpAgentChatLoopTests(TestCase):
 
 
 class HelpAgentEndpointTests(TestCase):
-    """POST /api/help-agent/chat/ 의 인증·검증·응답."""
+    """POST /api/help-agent/chat/ 의 인증·검증·응답.
+
+    AI 호출 비용 때문에 테스트 배포 동안 관리자 전용 (2026-07-11 결정).
+    """
 
     def setUp(self):
         User.objects.create_user('viewer1', password='pw123456')
+        User.objects.create_user('admin1', password='pw123456', is_staff=True)
 
-    def login(self):
+    def login(self, username):
         self.client.post('/api/auth/login/',
-                         {'username': 'viewer1', 'password': 'pw123456'},
+                         {'username': username, 'password': 'pw123456'},
                          content_type='application/json')
 
     def test_requires_login(self):
@@ -772,8 +776,15 @@ class HelpAgentEndpointTests(TestCase):
                                content_type='application/json')
         self.assertIn(res.status_code, (401, 403))
 
+    def test_non_admin_is_blocked(self):
+        self.login('viewer1')
+        res = self.client.post('/api/help-agent/chat/',
+                               {'messages': [{'role': 'user', 'content': '안녕'}]},
+                               content_type='application/json')
+        self.assertEqual(res.status_code, 403)
+
     def test_invalid_payload_rejected(self):
-        self.login()
+        self.login('admin1')
         res = self.client.post('/api/help-agent/chat/', {'messages': []},
                                content_type='application/json')
         self.assertEqual(res.status_code, 400)
@@ -783,8 +794,8 @@ class HelpAgentEndpointTests(TestCase):
             content_type='application/json')
         self.assertEqual(res.status_code, 400)
 
-    def test_viewer_can_chat(self):
-        self.login()
+    def test_admin_can_chat(self):
+        self.login('admin1')
         with patch('api.views.help_agent.chat',
                    return_value={'reply': '안녕하세요', 'tool_calls': [], 'model': 'm'}):
             res = self.client.post(

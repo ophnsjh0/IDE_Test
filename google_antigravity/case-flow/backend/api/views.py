@@ -223,9 +223,12 @@ class GmailSyncView(APIView):
 class HelpAgentChatView(APIView):
     """POST /api/help-agent/chat/ — 케이스 DB 검색 헬프 에이전트와 대화.
 
-    읽기 전용 도구만 쓰므로 viewer 이상 누구나 사용 가능 (기본 인증만 요구).
+    호출마다 AI API 비용이 발생하므로 테스트 배포 동안은 관리자 전용
+    (2026-07-11 결정). 전체 공개 시 permission만 되돌리면 됨.
     본문: {"messages": [{"role": "user"|"assistant", "content": "..."}]}
     """
+
+    permission_classes = [IsAdminRole]
 
     MAX_CONTENT_LENGTH = 4000
 
