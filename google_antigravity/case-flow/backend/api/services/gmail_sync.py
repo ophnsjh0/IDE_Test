@@ -3,6 +3,7 @@ import difflib
 import logging
 from datetime import timedelta
 
+from django.conf import settings
 from django.db.models import Q
 from django.utils import timezone
 
@@ -204,8 +205,9 @@ def _create_case_email(case, message_id, thread_id, direction, sender, recipient
 
 
 def _find_case(case_number, thread_id, vendor=None, subject='', body=''):
-    """4단계 케이스 매칭: 벤더 케이스 번호 -> Gmail 스레드 ->
-    확인 메일에 포함된 원본 제목 -> 본문 유사도."""
+    """5단계 케이스 매칭: 벤더 케이스 번호 -> Gmail 스레드 ->
+    케이스 오픈 키워드 제목 완전 일치 -> 확인 메일에 포함된 원본 제목 ->
+    본문 유사도."""
     if case_number:
         case = Case.objects.filter(vendor_case_number=case_number).first()
         if case:
@@ -220,6 +222,9 @@ def _find_case(case_number, thread_id, vendor=None, subject='', body=''):
         if email:
             return email.case
     if vendor:
+        case = _find_case_by_exact_subject(vendor, subject)
+        if case:
+            return case
         case = _find_case_by_embedded_subject(vendor, subject, case_number)
         if case:
             return case
@@ -230,6 +235,36 @@ def _find_case(case_number, thread_id, vendor=None, subject='', body=''):
 # 제목 폴백 매칭 파라미터: 짧은 제목 오탐 방지 최소 길이, 후보 케이스 탐색 기간
 SUBJECT_MATCH_MIN_LENGTH = 10
 SUBJECT_MATCH_WINDOW_DAYS = 60
+
+
+def _find_case_by_exact_subject(vendor, subject):
+    """고객사↔당사 케이스 스레드([Caseopen] 등)가 스레드 절단으로 갈릴 때의 폴백.
+
+    삼성 등 일부 메일러는 회신할 때마다 새 Gmail 스레드를 만들고 제목에
+    'RE:(2) (2)' 카운터를 붙여 번호/스레드 매칭이 모두 실패한다. 케이스 오픈
+    키워드(GMAIL_SYNC_INCLUDE_SUBJECTS)가 제목에 있는 메일에 한해, 정리된
+    제목이 정확히 같은 케이스와 병합한다 — 오픈 키워드 제목은 케이스당 한 번
+    작성되므로 제목이 반복되는 공지성 메일과 달리 동일 제목 = 동일 케이스다.
+    """
+    subject_lower = (subject or '').lower()
+    if not any(keyword.lower() in subject_lower
+               for keyword in settings.GMAIL_SYNC_INCLUDE_SUBJECTS):
+        return None
+    cleaned = email_parser.clean_subject(subject).lower()
+    if len(cleaned) < SUBJECT_MATCH_MIN_LENGTH:
+        return None
+
+    candidates = Case.objects.filter(
+        vendor=vendor,
+        created_at__gte=timezone.now() - timedelta(days=SUBJECT_MATCH_WINDOW_DAYS),
+    )
+    for case in candidates.order_by('-created_at'):
+        first_email = case.emails.order_by('received_at').first()
+        if first_email is None:
+            continue
+        if email_parser.clean_subject(first_email.subject).lower() == cleaned:
+            return case
+    return None
 
 
 def _find_case_by_embedded_subject(vendor, subject, case_number):

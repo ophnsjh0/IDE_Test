@@ -2,7 +2,8 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from .models import Case, CaseEmail
-from .services.email_parser import (build_gmail_query, detect_vendor_and_direction,
+from .services.email_parser import (build_gmail_query, clean_subject,
+                                    detect_vendor_and_direction,
                                     extract_device_info, normalize_body)
 from .services.gmail_sync import _find_case, apply_device_info
 
@@ -630,3 +631,32 @@ class CustomerThreadVendorTests(TestCase):
         self.assertIn('subject:Caseopen', query)
         # OR 그룹({}) 안에 들어가야 벤더 도메인 조건과 합집합이 된다
         self.assertIn('subject:Caseopen', query.split('}')[0])
+
+
+@override_settings(GMAIL_SYNC_INCLUDE_SUBJECTS=['Caseopen'])
+class ExactSubjectMatchTests(TestCase):
+    """스레드를 끊는 메일러(삼성 RE:(2) 카운터)의 케이스 오픈 스레드 병합."""
+
+    SUBJECT = '[Caseopen] 수원 SCPv2 Multi-AZ 개발계 DATALB 파티션 변경 오류(API)'
+
+    def test_clean_subject_strips_reply_counters(self):
+        self.assertEqual(clean_subject(f'RE:(2) (2) {self.SUBJECT}'), self.SUBJECT)
+        self.assertEqual(clean_subject(f'Re: (2) {self.SUBJECT}'), self.SUBJECT)
+
+    def test_broken_thread_reply_matches_original_case(self):
+        case = make_case(vendor='A10')
+        make_email(case, self.SUBJECT, thread_id='thread-1')
+        found = _find_case(None, 'thread-2', 'A10', f'RE:(2) (2) {self.SUBJECT}')
+        self.assertEqual(found, case)
+
+    def test_subject_without_open_keyword_is_not_merged(self):
+        case = make_case(vendor='A10')
+        make_email(case, '수원 SCPv2 개발계 정기 점검 안내', thread_id='thread-1')
+        found = _find_case(None, 'thread-2', 'A10', '수원 SCPv2 개발계 정기 점검 안내')
+        self.assertIsNone(found)
+
+    def test_other_vendor_same_subject_is_not_merged(self):
+        case = make_case(vendor='Arista')
+        make_email(case, self.SUBJECT, thread_id='thread-1')
+        found = _find_case(None, 'thread-2', 'A10', f'Re: {self.SUBJECT}')
+        self.assertIsNone(found)
