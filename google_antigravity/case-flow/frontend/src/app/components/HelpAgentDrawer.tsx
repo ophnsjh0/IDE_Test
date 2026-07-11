@@ -16,7 +16,7 @@ import {
   ThemeIcon,
   Tooltip,
 } from '@mantine/core';
-import { IconRobot, IconSend, IconDatabase } from '@tabler/icons-react';
+import { IconRobotFace, IconSend, IconDatabase } from '@tabler/icons-react';
 import { apiFetch } from '../lib/api';
 import classes from './HelpAgentWidget.module.css';
 
@@ -104,7 +104,7 @@ export default function HelpAgentWidget({
           className={classes.launcherInline}
           onClick={() => setOpened(true)}
         >
-          <IconRobot size={18} />
+          <IconRobotFace size={18} />
           AI 도우미
         </button>
       ) : (
@@ -117,7 +117,7 @@ export default function HelpAgentWidget({
                 aria-label="AI 도우미"
                 onClick={() => setOpened(true)}
               >
-                <IconRobot size={26} />
+                <IconRobotFace size={26} />
                 <span className={classes.launcherLabel}>AI</span>
               </button>
             </Tooltip>
@@ -138,7 +138,7 @@ export default function HelpAgentWidget({
               variant="gradient"
               gradient={{ from: 'blue', to: 'violet', deg: 135 }}
             >
-              <IconRobot size={20} />
+              <IconRobotFace size={20} />
             </ThemeIcon>
             <div>
               <Text fw={700} size="sm" lh={1.2}>AI 도우미</Text>
@@ -193,7 +193,7 @@ export default function HelpAgentWidget({
                         variant="gradient"
                         gradient={{ from: 'blue', to: 'violet', deg: 135 }}
                       >
-                        <IconRobot size={12} />
+                        <IconRobotFace size={12} />
                       </ThemeIcon>
                       <Text size="xs" c="dimmed" fw={600}>AI 도우미</Text>
                     </Group>
@@ -220,7 +220,7 @@ export default function HelpAgentWidget({
                     variant="gradient"
                     gradient={{ from: 'blue', to: 'violet', deg: 135 }}
                   >
-                    <IconRobot size={12} />
+                    <IconRobotFace size={12} />
                   </ThemeIcon>
                   <Loader size="xs" type="dots" />
                   <Text size="xs" c="dimmed">케이스 DB를 확인하는 중...</Text>
