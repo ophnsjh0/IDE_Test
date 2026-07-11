@@ -1,0 +1,87 @@
+/* AI 도우미 런처 — 그라데이션 + 글로우 펄스로 시선 유도 */
+.launcher {
+  width: 60px;
+  height: 60px;
+  border-radius: 16px;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  color: white;
+  background: linear-gradient(135deg, #339af0 0%, #7048e8 100%);
+  box-shadow: 0 4px 14px rgba(112, 72, 232, 0.45);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  animation: launcherPulse 2.4s ease-in-out infinite;
+}
+
+.launcher:hover {
+  transform: translateY(-3px) scale(1.06);
+  box-shadow: 0 8px 22px rgba(112, 72, 232, 0.55);
+  animation: none;
+}
+
+.launcherLabel {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  line-height: 1;
+}
+
+@keyframes launcherPulse {
+  0%, 100% {
+    box-shadow: 0 4px 14px rgba(112, 72, 232, 0.45);
+  }
+  50% {
+    box-shadow: 0 4px 22px rgba(112, 72, 232, 0.75);
+  }
+}
+
+/* 채팅 말풍선 */
+.bubbleUser {
+  background: linear-gradient(135deg, #339af0 0%, #5f3dc4 100%);
+  color: white;
+  border-radius: 14px 14px 4px 14px;
+  padding: 10px 14px;
+}
+
+.bubbleAssistant {
+  background: white;
+  border: 1px solid var(--mantine-color-gray-2);
+  border-radius: 14px 14px 14px 4px;
+  padding: 10px 14px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
+}
+
+/* 입력 영역 — 카드형으로 감싸 포커스 시 강조 */
+.inputWrap {
+  border: 1.5px solid var(--mantine-color-gray-3);
+  border-radius: 14px;
+  padding: 6px 6px 6px 14px;
+  background: white;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.inputWrap:focus-within {
+  border-color: var(--mantine-color-blue-5);
+  box-shadow: 0 2px 12px rgba(51, 154, 240, 0.25);
+}
+
+/* 예시 질문 칩 */
+.suggestion {
+  border: 1px solid var(--mantine-color-blue-2);
+  background: white;
+  color: var(--mantine-color-blue-7);
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.suggestion:hover {
+  background: var(--mantine-color-blue-0);
+}
