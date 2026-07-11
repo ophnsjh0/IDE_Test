@@ -757,6 +757,22 @@ class HelpAgentTriageTests(TestCase):
             client, [{'role': 'user', 'content': '오늘 저녁 뭐 먹을까?'}])
         self.assertEqual(agent, 'off_topic')
 
+    def test_followup_question_includes_conversation_context(self):
+        # "인터넷에서 더 찾아줘" 같은 후속 질문은 직전 맥락과 함께 분류돼야 함
+        client = MagicMock()
+        client.messages.create.return_value = SimpleNamespace(
+            content=[_fake_block(type='text', text='tech')])
+        agent = help_agent._triage(client, [
+            {'role': 'user', 'content': 'C-1122 VRRP 버그 상태 알려줘'},
+            {'role': 'assistant', 'content': 'C-1122는 Resolved 상태입니다.'},
+            {'role': 'user', 'content': '인터넷에서 상세 검색해줘'},
+        ])
+        self.assertEqual(agent, 'tech')
+        sent = client.messages.create.call_args.kwargs['messages'][0]['content']
+        self.assertIn('이전 대화 맥락', sent)
+        self.assertIn('VRRP 버그', sent)
+        self.assertIn('인터넷에서 상세 검색해줘', sent)
+
     @override_settings(ANTHROPIC_API_KEY='test-key', HELP_AGENT_MODEL='claude-haiku-4-5')
     def test_off_topic_short_circuits_without_agent_call(self):
         fake_client = MagicMock()
@@ -1011,3 +1027,44 @@ class TechAgentFlowTests(TestCase):
         # 수정 요청에 검수 피드백이 전달됐는지 확인
         revision_messages = fake_client.messages.create.call_args_list[3].kwargs['messages']
         self.assertIn('자동 검수 피드백', revision_messages[-1]['content'])
+
+    @override_settings(ANTHROPIC_API_KEY='test-key',
+                       HELP_AGENT_MODEL='claude-haiku-4-5',
+                       TECH_AGENT_MODEL='claude-sonnet-5')
+    def test_handoff_reroutes_to_target_agent_once(self):
+        # 검색 에이전트에게 웹 검색 요청이 잘못 배정 → [HANDOFF:tech] → 재배정
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            self._triage_resp('search'),                 # 트리아지 오분류
+            self._text_resp('[HANDOFF:tech]'),           # 검색 에이전트가 핸드오프
+            self._text_resp('EOS 4.32 관련 자료입니다. [출처](https://arista.com)'),
+            self._text_resp('{"ok": true}'),             # 평가자
+        ]
+        with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
+            result = help_agent.chat(
+                [{'role': 'user', 'content': '인터넷에서 상세 검색해줘'}])
+
+        self.assertEqual(result['agent'], 'tech')
+        self.assertEqual(result['model'], 'claude-sonnet-5')
+        self.assertIn('EOS 4.32', result['reply'])
+        self.assertNotIn('HANDOFF', result['reply'])
+        # 재배정된 tech 호출이 tech 프롬프트로 나갔는지 확인
+        tech_call = fake_client.messages.create.call_args_list[2]
+        self.assertEqual(tech_call.kwargs['model'], 'claude-sonnet-5')
+
+    @override_settings(ANTHROPIC_API_KEY='test-key',
+                       HELP_AGENT_MODEL='claude-haiku-4-5',
+                       TECH_AGENT_MODEL='claude-sonnet-5')
+    def test_handoff_to_same_agent_is_ignored(self):
+        # 자기 자신으로의 핸드오프는 재배정하지 않고 마커만 제거 (루프 방지)
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            self._triage_resp('search'),
+            self._text_resp('[HANDOFF:search]'),
+        ]
+        with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
+            result = help_agent.chat([{'role': 'user', 'content': '케이스 찾아줘'}])
+
+        self.assertEqual(result['agent'], 'search')
+        self.assertNotIn('HANDOFF', result['reply'])
+        self.assertEqual(fake_client.messages.create.call_count, 2)
