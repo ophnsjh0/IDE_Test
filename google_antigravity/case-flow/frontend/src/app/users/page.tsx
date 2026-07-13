@@ -21,10 +21,10 @@ import {
   Title,
 } from '@mantine/core';
 import { useForm } from '@mantine/form';
-import { IconKey, IconPlus, IconUserCheck, IconUserOff } from '@tabler/icons-react';
+import { IconKey, IconPlus, IconTrash, IconUserCheck, IconUserOff } from '@tabler/icons-react';
 import AppHeader from '../components/AppHeader';
 import { apiFetch } from '../lib/api';
-import { ROLE_LABELS, Role } from '../lib/useMe';
+import { ROLE_LABELS, Role, useMe } from '../lib/useMe';
 
 interface Account {
   id: number;
@@ -43,11 +43,13 @@ const ROLE_SELECT_DATA = (Object.keys(ROLE_LABELS) as Role[]).map((r) => ({
 
 export default function UsersPage() {
   const router = useRouter();
+  const { me } = useMe();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState('');
   const [createOpened, setCreateOpened] = useState(false);
   const [resetTarget, setResetTarget] = useState<Account | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Account | null>(null);
   const [saving, setSaving] = useState(false);
 
   const fetchAccounts = useCallback(async () => {
@@ -166,6 +168,24 @@ export default function UsersPage() {
     }
   };
 
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    setSaving(true);
+    try {
+      const response = await apiFetch(`/api/auth/users/${deleteTarget.id}/`, { method: 'DELETE' });
+      if (response.ok) {
+        setMessage(`${deleteTarget.username} 계정을 삭제했습니다.`);
+        fetchAccounts();
+      } else {
+        const data = await response.json();
+        setMessage(data.error || '삭제에 실패했습니다.');
+      }
+      setDeleteTarget(null);
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const rows = accounts.map((account) => (
     <Table.Tr key={account.id} opacity={account.is_active ? 1 : 0.5}>
       <Table.Td>
@@ -212,6 +232,18 @@ export default function UsersPage() {
           >
             {account.is_active ? '비활성화' : '활성화'}
           </Button>
+          {/* 자기 자신은 삭제 버튼 숨김 (서버도 차단) */}
+          {account.username !== me?.username && (
+            <Button
+              size="xs"
+              variant="subtle"
+              color="red"
+              leftSection={<IconTrash size={14} />}
+              onClick={() => setDeleteTarget(account)}
+            >
+              삭제
+            </Button>
+          )}
         </Group>
       </Table.Td>
     </Table.Tr>
@@ -255,7 +287,7 @@ export default function UsersPage() {
                     <Table.Th style={{ width: 90 }}>상태</Table.Th>
                     <Table.Th style={{ width: 150 }}>마지막 로그인</Table.Th>
                     <Table.Th style={{ width: 110 }}>생성일</Table.Th>
-                    <Table.Th style={{ width: 240 }} />
+                    <Table.Th style={{ width: 310 }} />
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>{rows}</Table.Tbody>
@@ -302,6 +334,32 @@ export default function UsersPage() {
             </Button>
           </Stack>
         </form>
+      </Modal>
+
+      <Modal
+        opened={deleteTarget !== null}
+        onClose={() => setDeleteTarget(null)}
+        title={`계정 삭제 — ${deleteTarget?.username ?? ''}`}
+        centered
+      >
+        <Stack>
+          <Text size="sm">
+            <Text span fw={600}>{deleteTarget?.username}</Text>
+            {deleteTarget?.name ? ` (${deleteTarget.name})` : ''} 계정을 완전히 삭제합니다.
+            이 작업은 되돌릴 수 없습니다.
+          </Text>
+          <Text size="xs" c="dimmed">
+            나중에 다시 사용할 가능성이 있다면 삭제 대신 비활성화를 권장합니다.
+          </Text>
+          <Group justify="flex-end">
+            <Button variant="default" onClick={() => setDeleteTarget(null)}>
+              취소
+            </Button>
+            <Button color="red" loading={saving} onClick={handleDelete}>
+              삭제
+            </Button>
+          </Group>
+        </Stack>
       </Modal>
 
       <Modal

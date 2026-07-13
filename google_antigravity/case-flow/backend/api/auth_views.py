@@ -138,8 +138,22 @@ class UserListCreateView(APIView):
 
 
 class UserDetailView(APIView):
-    """PATCH /api/auth/users/<id>/ — 역할 변경, 활성/비활성 전환, 비밀번호 재설정 (관리자 전용)."""
+    """PATCH/DELETE /api/auth/users/<id>/ — 역할 변경, 활성/비활성 전환,
+    비밀번호 재설정, 계정 삭제 (관리자 전용)."""
     permission_classes = [IsAdminRole]
+
+    def delete(self, request, user_id):
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response({'error': '존재하지 않는 계정입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        if user == request.user:
+            return Response({'error': '자기 자신의 계정은 삭제할 수 없습니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        username = user.username
+        user.delete()
+        return Response({'deleted': username})
 
     def patch(self, request, user_id):
         try:

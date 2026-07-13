@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -48,10 +49,21 @@ CORS_ALLOW_CREDENTIALS = True
 # 프론트 origin(포트가 달라 cross-origin)에서 오는 쓰기 요청의 CSRF 검증 허용 목록.
 # 사내망 서버 IP가 바뀌면 .env의 CASEFLOW_FRONTEND_ORIGINS에 추가할 것.
 # 항목은 'http://IP:포트' 전체 형태 또는 IP만 써도 된다 (http://…:3000으로 보정).
-def _normalize_origin(value):
+# DHCP 환경은 '192.168.0.*'처럼 마지막 옥텟 와일드카드로 대역 전체를 허용할 수 있다
+# (Django의 CSRF_TRUSTED_ORIGINS 와일드카드는 서브도메인 접두사만 지원해서
+#  IP 대역은 여기서 1~254로 직접 펼친다).
+def _expand_origin_entry(value):
     value = value.strip()
     if not value:
-        return None
+        return []
+    m = re.fullmatch(r'(\d+\.\d+\.\d+)\.\*(:\d+)?', value)
+    if m:
+        prefix, port = m.group(1), m.group(2) or ''
+        return [f'{prefix}.{i}{port}' for i in range(1, 255)]
+    return [value]
+
+
+def _normalize_origin(value):
     if '://' not in value:
         host = value
         if ':' not in host:
@@ -61,15 +73,12 @@ def _normalize_origin(value):
 
 
 CSRF_TRUSTED_ORIGINS = [
-    origin
-    for origin in (
-        _normalize_origin(entry)
-        for entry in os.environ.get(
-            'CASEFLOW_FRONTEND_ORIGINS',
-            'localhost,127.0.0.1,192.168.54.37',
-        ).split(',')
-    )
-    if origin
+    _normalize_origin(host)
+    for entry in os.environ.get(
+        'CASEFLOW_FRONTEND_ORIGINS',
+        'localhost,127.0.0.1,192.168.54.37',
+    ).split(',')
+    for host in _expand_origin_entry(entry)
 ]
 
 REST_FRAMEWORK = {
