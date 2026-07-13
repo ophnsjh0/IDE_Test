@@ -1,4 +1,6 @@
 import json
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -8,7 +10,7 @@ from django.contrib.auth.models import User
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from .models import Case, CaseEmail
+from .models import AppSetting, Case, CaseEmail
 from .services import help_agent
 from .services.email_parser import (build_gmail_query, clean_subject,
                                     detect_vendor_and_direction,
@@ -393,6 +395,33 @@ class UserManagementTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.client.post('/api/auth/logout/')
         self.assertEqual(self.login('normal1', 'new-pass-88!').status_code, 200)
+
+    def test_delete_account(self):
+        from django.contrib.auth.models import User
+        self.login('staff1', 'admin-pass-123!')
+        normal = User.objects.get(username='normal1')
+        response = self.client.delete(f'/api/auth/users/{normal.id}/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['deleted'], 'normal1')
+        self.assertFalse(User.objects.filter(username='normal1').exists())
+        # 삭제된 계정은 로그인 불가
+        self.client.post('/api/auth/logout/')
+        self.assertEqual(self.login('normal1', 'normal-pass-123!').status_code, 401)
+
+    def test_self_deletion_denied(self):
+        from django.contrib.auth.models import User
+        self.login('staff1', 'admin-pass-123!')
+        staff = User.objects.get(username='staff1')
+        response = self.client.delete(f'/api/auth/users/{staff.id}/')
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(User.objects.filter(username='staff1').exists())
+
+    def test_normal_user_cannot_delete(self):
+        from django.contrib.auth.models import User
+        self.login('normal1', 'normal-pass-123!')
+        staff = User.objects.get(username='staff1')
+        response = self.client.delete(f'/api/auth/users/{staff.id}/')
+        self.assertEqual(response.status_code, 403)
 
 
 class RolePermissionTests(TestCase):
@@ -837,7 +866,8 @@ class HelpAgentChatLoopTests(TestCase):
             content=[_fake_block(type='text', text='## 주간 리포트\n요약입니다.')],
         )
         fake_client = MagicMock()
-        fake_client.messages.create.return_value = final_turn
+        # 리포팅은 문서 스킬 때문에 beta 엔드포인트를 사용한다
+        fake_client.beta.messages.create.return_value = final_turn
 
         with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
             result = help_agent.chat(
@@ -845,16 +875,174 @@ class HelpAgentChatLoopTests(TestCase):
 
         self.assertEqual(result['agent'], 'report')
         self.assertEqual(result['model'], 'claude-sonnet-5')
+        self.assertNotIn('files', result)  # 문서를 안 만들면 files 없음
         # 리포트 키워드는 규칙 분기 → 트리아지 LLM 호출 없이 본 호출 1회만
-        call = fake_client.messages.create.call_args_list[0]
+        fake_client.messages.create.assert_not_called()
+        call = fake_client.beta.messages.create.call_args_list[0]
         self.assertEqual(call.kwargs['model'], 'claude-sonnet-5')
         tool_names = [t['name'] for t in call.kwargs['tools']]
         self.assertIn('list_recent_cases', tool_names)
+        # 문서 스킬 구성: code_execution 도구 + 스킬 컨테이너 + beta 헤더
+        self.assertIn('code_execution', tool_names)
+        skill_ids = [s['skill_id'] for s in call.kwargs['container']['skills']]
+        self.assertEqual(skill_ids, ['docx', 'xlsx', 'pptx'])
+        self.assertEqual(call.kwargs['betas'],
+                         ['code-execution-2025-08-25', 'skills-2025-10-02'])
+
+    @override_settings(ANTHROPIC_API_KEY='test-key',
+                       HELP_AGENT_MODEL='claude-haiku-4-5',
+                       REPORT_AGENT_MODEL='claude-sonnet-5')
+    def test_report_collects_generated_files(self):
+        # 코드 실행 결과 블록 안에 중첩된 file_id를 수집하는지
+        file_ref = _fake_block(type='bash_code_execution_output',
+                               file_id='file_abc123')
+        exec_result = _fake_block(
+            type='bash_code_execution_tool_result',
+            content=_fake_block(type='bash_code_execution_result',
+                                content=[file_ref]),
+        )
+        final_turn = SimpleNamespace(
+            stop_reason='end_turn',
+            content=[exec_result,
+                     _fake_block(type='text', text='엑셀 리포트를 만들었습니다.')],
+        )
+        fake_client = MagicMock()
+        fake_client.beta.messages.create.return_value = final_turn
+        fake_client.beta.files.retrieve_metadata.return_value = SimpleNamespace(
+            filename='caseflow_report.xlsx', size_bytes=2048)
+
+        with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
+            result = help_agent.chat(
+                [{'role': 'user', 'content': '이번 주 리포트를 엑셀로 작성해줘'}])
+
+        self.assertEqual(result['files'], [{
+            'file_id': 'file_abc123',
+            'filename': 'caseflow_report.xlsx',
+            'size_bytes': 2048,
+        }])
+
+    def test_describe_files_filters_non_documents_and_dedupes(self):
+        fake_client = MagicMock()
+        fake_client.beta.files.retrieve_metadata.side_effect = [
+            SimpleNamespace(filename='report.docx', size_bytes=100),
+            SimpleNamespace(filename='build_report.py', size_bytes=50),
+        ]
+        files = help_agent._describe_files(
+            fake_client, ['file_doc', 'file_doc', 'file_script'])
+        self.assertEqual([f['filename'] for f in files], ['report.docx'])
+        # 중복 file_id는 메타데이터 조회도 1회만
+        self.assertEqual(fake_client.beta.files.retrieve_metadata.call_count, 2)
 
     @override_settings(ANTHROPIC_API_KEY='')
     def test_missing_api_key_raises(self):
         with self.assertRaises(RuntimeError):
             help_agent.chat([{'role': 'user', 'content': '안녕'}])
+
+
+class HelpAgentTemplateTests(TestCase):
+    """사내 템플릿 모드 — 워딩 트리거, 파일 첨부, 해시 캐싱 (Anthropic 모킹)."""
+
+    def setUp(self):
+        # 실제 템플릿 파일은 gitignore 대상이라 테스트는 임시 파일로 대체한다
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        docx = Path(self.tmpdir.name) / 'demo.docx'
+        docx.write_bytes(b'docx-template-v1')
+        self.docx_patch = patch.dict(
+            help_agent.REPORT_TEMPLATES['docx'], {'path': docx})
+        self.docx_patch.start()
+        self.addCleanup(self.docx_patch.stop)
+
+    def test_match_template_requires_both_keywords(self):
+        # '템플릿' + 형식 단어가 함께 있을 때만 반응 (일반 파일 생성과 구분)
+        self.assertEqual(
+            help_agent._match_template('사내보고서 워드 템플릿으로 작성해줘'), 'docx')
+        self.assertEqual(
+            help_agent._match_template('C-1122 PPT 템플릿으로 정리해줘'), 'pptx')
+        self.assertIsNone(help_agent._match_template('이번 주 리포트를 워드로 작성해줘'))
+        self.assertIsNone(help_agent._match_template('템플릿이 뭐야?'))
+
+    def test_template_wording_routes_to_report_without_llm_triage(self):
+        # "…템플릿으로 만들어줘"는 보고서 단어가 없어도 규칙 분기로 report에 가야 함
+        self.assertIn('템플릿', help_agent.REPORT_KEYWORDS)
+
+    @override_settings(ANTHROPIC_API_KEY='test-key',
+                       HELP_AGENT_MODEL='claude-haiku-4-5',
+                       REPORT_AGENT_MODEL='claude-sonnet-5')
+    def test_template_request_attaches_file_and_addendum(self):
+        final_turn = SimpleNamespace(
+            stop_reason='end_turn',
+            content=[_fake_block(type='text', text='템플릿 보고서를 만들었습니다.')])
+        fake_client = MagicMock()
+        fake_client.beta.messages.create.return_value = final_turn
+        fake_client.beta.files.upload.return_value = SimpleNamespace(id='file_tpl_1')
+
+        with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
+            help_agent.chat(
+                [{'role': 'user', 'content': 'C-1122 사내보고서 워드 템플릿으로 작성해줘'}])
+
+        call = fake_client.beta.messages.create.call_args_list[0]
+        last_content = call.kwargs['messages'][-1]['content']
+        self.assertEqual(last_content[0],
+                         {'type': 'container_upload', 'file_id': 'file_tpl_1'})
+        self.assertIn('워드 템플릿으로 작성해줘', last_content[1]['text'])
+        self.assertIn('사내 템플릿 모드', call.kwargs['system'])
+        # 해시:file_id 캐시 저장 확인
+        self.assertTrue(AppSetting.get('report_template_docx').endswith(':file_tpl_1'))
+
+    @override_settings(ANTHROPIC_API_KEY='test-key',
+                       HELP_AGENT_MODEL='claude-haiku-4-5',
+                       REPORT_AGENT_MODEL='claude-sonnet-5')
+    def test_plain_report_request_does_not_attach_template(self):
+        final_turn = SimpleNamespace(
+            stop_reason='end_turn',
+            content=[_fake_block(type='text', text='## 주간 리포트')])
+        fake_client = MagicMock()
+        fake_client.beta.messages.create.return_value = final_turn
+
+        with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
+            help_agent.chat([{'role': 'user', 'content': '이번 주 리포트 작성해줘'}])
+
+        fake_client.beta.files.upload.assert_not_called()
+        call = fake_client.beta.messages.create.call_args_list[0]
+        self.assertIsInstance(call.kwargs['messages'][-1]['content'], str)
+        self.assertNotIn('사내 템플릿 모드', call.kwargs['system'])
+
+    def test_file_id_cached_until_template_file_changes(self):
+        fake_client = MagicMock()
+        fake_client.beta.files.upload.side_effect = [
+            SimpleNamespace(id='file_v1'), SimpleNamespace(id='file_v2')]
+
+        self.assertEqual(help_agent._template_file_id(fake_client, 'docx'), 'file_v1')
+        # 같은 파일이면 재업로드 없이 캐시 사용
+        self.assertEqual(help_agent._template_file_id(fake_client, 'docx'), 'file_v1')
+        self.assertEqual(fake_client.beta.files.upload.call_count, 1)
+
+        # 파일 교체(해시 변경) → 재업로드 + 옛 파일 삭제
+        help_agent.REPORT_TEMPLATES['docx']['path'].write_bytes(b'docx-template-v2')
+        self.assertEqual(help_agent._template_file_id(fake_client, 'docx'), 'file_v2')
+        fake_client.beta.files.delete.assert_called_once_with('file_v1')
+
+    @override_settings(ANTHROPIC_API_KEY='test-key',
+                       HELP_AGENT_MODEL='claude-haiku-4-5',
+                       REPORT_AGENT_MODEL='claude-sonnet-5')
+    def test_upload_failure_falls_back_to_plain_report(self):
+        # 템플릿 첨부 실패는 500 대신 일반 리포트로 진행 (시연 중단 방지)
+        final_turn = SimpleNamespace(
+            stop_reason='end_turn',
+            content=[_fake_block(type='text', text='일반 보고서입니다.')])
+        fake_client = MagicMock()
+        fake_client.beta.messages.create.return_value = final_turn
+        fake_client.beta.files.upload.side_effect = anthropic.APIConnectionError(
+            request=MagicMock())
+
+        with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
+            result = help_agent.chat(
+                [{'role': 'user', 'content': '워드 템플릿으로 보고서 작성해줘'}])
+
+        self.assertEqual(result['reply'], '일반 보고서입니다.')
+        call = fake_client.beta.messages.create.call_args_list[0]
+        self.assertNotIn('사내 템플릿 모드', call.kwargs['system'])
 
 
 class HelpAgentEndpointTests(TestCase):
@@ -906,6 +1094,29 @@ class HelpAgentEndpointTests(TestCase):
                 content_type='application/json')
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json()['reply'], '안녕하세요')
+
+    def test_file_download_requires_admin(self):
+        self.login('viewer1')
+        res = self.client.get('/api/help-agent/files/file_abc123/')
+        self.assertEqual(res.status_code, 403)
+
+    def test_file_download_rejects_invalid_id(self):
+        self.login('admin1')
+        res = self.client.get('/api/help-agent/files/not-a-file-id/')
+        self.assertEqual(res.status_code, 400)
+
+    def test_file_download_relays_content(self):
+        self.login('admin1')
+        with patch('api.views.help_agent.download_file',
+                   return_value=(
+                       '리포트.xlsx',
+                       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                       b'excel-bytes')):
+            res = self.client.get('/api/help-agent/files/file_abc123/')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.content, b'excel-bytes')
+        self.assertIn("filename*=UTF-8''%EB%A6%AC%ED%8F%AC%ED%8A%B8.xlsx",
+                      res['Content-Disposition'])
 
 
 @override_settings(SEARCH_BLOCKED_TERMS=['samsung', '삼성', '하나은행'])
@@ -1068,3 +1279,61 @@ class TechAgentFlowTests(TestCase):
         self.assertEqual(result['agent'], 'search')
         self.assertNotIn('HANDOFF', result['reply'])
         self.assertEqual(fake_client.messages.create.call_count, 2)
+
+
+class GmailSyncConcurrencyTests(TestCase):
+    """동기화 동시 실행 잠금과 저장 직전 중복(경쟁 상태) 방어."""
+
+    def test_concurrent_sync_rejected_by_lock(self):
+        import fcntl
+        from .services import gmail_sync
+
+        # 다른 동기화가 실행 중인 상태를 재현: 잠금을 직접 잡아둔다
+        holder = open(gmail_sync._LOCK_FILE, 'w')
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with self.assertRaises(gmail_sync.SyncInProgress):
+                gmail_sync.sync_gmail()
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+
+        # 잠금 해제 후에는 정상 진입 (Gmail 호출은 mock)
+        with patch.object(gmail_sync, '_sync_gmail', return_value={'fetched': 0}):
+            self.assertEqual(gmail_sync.sync_gmail(), {'fetched': 0})
+
+    def test_duplicate_at_save_time_rolls_back_new_case(self):
+        """중복 체크 통과 후 다른 동기화가 먼저 저장한 경우:
+        skipped 처리되고, 이 실행이 만들던 새 케이스도 롤백되어야 한다."""
+        from .services import gmail_sync
+
+        other_case = make_case(vendor='Arista')
+
+        message = {
+            'id': 'race-msg-1',
+            'threadId': 'race-thread-1',
+            'internalDate': '0',
+            'payload': {'headers': [
+                {'name': 'From', 'value': 'Arista Support <support@arista.com>'},
+                {'name': 'To', 'value': 'adc@ubersys.co.kr'},
+                {'name': 'Subject', 'value': 'New Case: SR 77001 something broken'},
+                {'name': 'Date', 'value': 'Mon, 13 Jul 2026 10:00:00 +0900'},
+            ]},
+        }
+
+        # AI 분석이 도는 사이에 다른 동기화가 같은 메일을 먼저 저장하는 상황
+        def analyze_and_race(**kwargs):
+            make_email(other_case, 'raced', message_id='race-msg-1',
+                       thread_id='race-thread-1')
+            return None
+
+        cases_before = Case.objects.count()
+        with patch.object(gmail_sync, 'analyze_email', side_effect=analyze_and_race):
+            result = gmail_sync._process_message(message)
+
+        self.assertEqual(result, 'skipped')
+        # 이메일은 먼저 저장된 1건만 존재
+        self.assertEqual(
+            CaseEmail.objects.filter(gmail_message_id='race-msg-1').count(), 1)
+        # 이 실행이 만들던 새 케이스는 롤백되어 빈 케이스가 남지 않는다
+        self.assertEqual(Case.objects.count(), cases_before)

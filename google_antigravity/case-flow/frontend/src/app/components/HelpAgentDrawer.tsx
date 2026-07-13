@@ -5,6 +5,7 @@ import {
   ActionIcon,
   Affix,
   Box,
+  Button,
   Drawer,
   Group,
   Loader,
@@ -16,15 +17,22 @@ import {
   ThemeIcon,
   Tooltip,
 } from '@mantine/core';
-import { IconRobotFace, IconSend, IconDatabase } from '@tabler/icons-react';
+import { IconRobotFace, IconSend, IconDatabase, IconFileDownload } from '@tabler/icons-react';
 import { apiFetch } from '../lib/api';
 import classes from './HelpAgentWidget.module.css';
+
+interface GeneratedFile {
+  file_id: string;
+  filename: string;
+  size_bytes: number;
+}
 
 interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   toolNote?: string; // 답변 근거로 사용한 도구 호출 표시
   agent?: string; // 트리아지가 배정한 담당 에이전트 (search | report)
+  files?: GeneratedFile[]; // 리포팅 에이전트가 생성한 문서 (워드/엑셀/PPT)
 }
 
 const AGENT_LABELS: Record<string, string> = {
@@ -91,7 +99,13 @@ export default function HelpAgentWidget({
         .join(' → ');
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: data.reply, toolNote, agent: data.agent },
+        {
+          role: 'assistant',
+          content: data.reply,
+          toolNote,
+          agent: data.agent,
+          files: data.files,
+        },
       ]);
     } catch (e) {
       setMessages((prev) => [
@@ -103,6 +117,32 @@ export default function HelpAgentWidget({
       ]);
     } finally {
       setLoading(false);
+    }
+  };
+
+  // 생성 문서 다운로드 — 세션 쿠키 인증이 필요해 apiFetch(blob)로 받는다
+  const downloadFile = async (file: GeneratedFile) => {
+    try {
+      const res = await apiFetch(`/api/help-agent/files/${file.file_id}/`);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = file.filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: `파일 다운로드에 실패했습니다: ${e instanceof Error ? e.message : e}`,
+        },
+      ]);
     }
   };
 
@@ -218,6 +258,22 @@ export default function HelpAgentWidget({
                       {m.content}
                     </Text>
                   </div>
+                  {m.files && m.files.length > 0 && (
+                    <Stack gap={6} mt={8}>
+                      {m.files.map((f) => (
+                        <Button
+                          key={f.file_id}
+                          size="xs"
+                          variant="light"
+                          leftSection={<IconFileDownload size={14} />}
+                          onClick={() => downloadFile(f)}
+                          styles={{ inner: { justifyContent: 'flex-start' } }}
+                        >
+                          {f.filename} ({Math.max(1, Math.round(f.size_bytes / 1024))} KB)
+                        </Button>
+                      ))}
+                    </Stack>
+                  )}
                   {m.toolNote && (
                     <Group gap={4} mt={4} ml={4}>
                       <IconDatabase size={12} color="var(--mantine-color-gray-5)" />
@@ -238,7 +294,9 @@ export default function HelpAgentWidget({
                     <IconRobotFace size={12} />
                   </ThemeIcon>
                   <Loader size="xs" type="dots" />
-                  <Text size="xs" c="dimmed">케이스 DB를 확인하는 중...</Text>
+                  <Text size="xs" c="dimmed">
+                    답변을 준비하는 중... (리포트 문서 생성은 1~2분 걸릴 수 있어요)
+                  </Text>
                 </Group>
               )}
             </Stack>

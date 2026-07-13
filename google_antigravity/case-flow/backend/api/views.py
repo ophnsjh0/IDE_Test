@@ -1,8 +1,11 @@
 import logging
+import re
 from datetime import timedelta
+from urllib.parse import quote
 
 import anthropic
 from django.db.models import Count, Max, Q
+from django.http import HttpResponse
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import generics, status
@@ -25,7 +28,7 @@ from .services.analyzer import (
 )
 from .services import help_agent
 from .services.gmail_client import GmailAuthError
-from .services.gmail_sync import sync_gmail
+from .services.gmail_sync import SyncInProgress, sync_gmail
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +212,8 @@ class GmailSyncView(APIView):
     def post(self, request):
         try:
             summary = sync_gmail()
+        except SyncInProgress as e:
+            return Response({'error': str(e)}, status=status.HTTP_409_CONFLICT)
         except GmailAuthError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception:
@@ -273,3 +278,36 @@ class HelpAgentChatView(APIView):
         if messages[-1]['role'] != 'user':
             return '마지막 메시지는 사용자 질문이어야 합니다.'
         return None
+
+
+RE_ANTHROPIC_FILE_ID = re.compile(r'^file_[A-Za-z0-9_-]+$')
+
+
+class HelpAgentFileView(APIView):
+    """GET /api/help-agent/files/<file_id>/ — 리포팅 에이전트가 생성한
+    문서(워드/엑셀/PPT)를 Anthropic Files API에서 받아 다운로드로 중계.
+    채팅과 동일하게 테스트 배포 동안 관리자 전용.
+    """
+
+    permission_classes = [IsAdminRole]
+
+    def get(self, request, file_id):
+        if not RE_ANTHROPIC_FILE_ID.match(file_id):
+            return Response({'error': '잘못된 파일 ID입니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            filename, mime_type, data = help_agent.download_file(file_id)
+        except anthropic.NotFoundError:
+            return Response({'error': '파일을 찾을 수 없습니다. 생성 후 시간이 지나 만료되었을 수 있습니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        except (anthropic.APIError, RuntimeError):
+            logger.exception("help agent file download failed (%s)", file_id)
+            return Response({'error': '파일 다운로드 중 오류가 발생했습니다.'},
+                            status=status.HTTP_502_BAD_GATEWAY,)
+
+        response = HttpResponse(
+            data, content_type=mime_type or 'application/octet-stream')
+        # 파일명에 한글 등 비ASCII가 올 수 있어 RFC 5987 형식으로 지정
+        response['Content-Disposition'] = (
+            f"attachment; filename*=UTF-8''{quote(filename)}")
+        return response
