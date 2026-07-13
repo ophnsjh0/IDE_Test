@@ -1,9 +1,12 @@
 """Orchestrates a Gmail sync run: fetch -> parse -> AI analyze -> save."""
 import difflib
+import fcntl
 import logging
+import os
 from datetime import timedelta
 
 from django.conf import settings
+from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -14,11 +17,37 @@ from .analyzer import analyze_email, get_translation_model
 logger = logging.getLogger(__name__)
 
 
+class SyncInProgress(Exception):
+    """다른 동기화가 이미 실행 중 — 웹 버튼 중복 클릭, 여러 PC 동시 실행, cron 겹침."""
+
+
+class _DuplicateEmail(Exception):
+    """저장 직전에 다른 동기화가 같은 메일을 먼저 넣은 경우 (경쟁 상태의 마지막 방어선)."""
+
+
+_LOCK_FILE = os.path.join(settings.BASE_DIR, '.gmail_sync.lock')
+
+
 def sync_gmail(max_results=50):
     """Fetch unprocessed vendor case mail and register it as Cases/CaseEmails.
 
     Returns a summary dict: counts of processed/created/updated/skipped.
+    동시 실행은 파일 잠금으로 차단한다 (프로세스가 달라도 — 웹 + cron 겹침 대비).
     """
+    lock_file = open(_LOCK_FILE, 'w')
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        raise SyncInProgress('Gmail 동기화가 이미 진행 중입니다. 잠시 후 다시 시도하세요.')
+    try:
+        return _sync_gmail(max_results)
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def _sync_gmail(max_results):
     service = gmail_client.get_gmail_service()
     processed_label_id = gmail_client.get_or_create_label(service)
     ignored_label_id = gmail_client.get_or_create_label(service, gmail_client.IGNORED_LABEL)
@@ -111,15 +140,22 @@ def _process_message(message):
         case_context=build_case_context(case) if case else '',
     )
 
-    if is_new:
-        case = _create_case(vendor, subject, body, analysis, case_number, thread_id)
-    else:
-        _backfill_identifiers(case, case_number, thread_id)
+    # 메일 1건의 DB 반영을 원자적으로 묶는다 — 중간 실패 시 이메일 없는
+    # 빈 케이스 같은 반쪽 상태가 남지 않도록.
+    try:
+        with transaction.atomic():
+            if is_new:
+                case = _create_case(vendor, subject, body, analysis, case_number, thread_id)
+            else:
+                _backfill_identifiers(case, case_number, thread_id)
 
-    _create_case_email(case, message_id, thread_id, direction, sender, recipient,
-                       subject, body, received_at, analysis)
-    apply_device_info(case, subject, body, analysis)
-    apply_analysis_to_case(case, analysis, direction, received_at)
+            _create_case_email(case, message_id, thread_id, direction, sender, recipient,
+                               subject, body, received_at, analysis)
+            apply_device_info(case, subject, body, analysis)
+            apply_analysis_to_case(case, analysis, direction, received_at)
+    except _DuplicateEmail:
+        logger.info("Message %s was saved by a concurrent sync; skipping", message_id)
+        return 'skipped'
     return 'created' if is_new else 'added'
 
 
@@ -189,19 +225,25 @@ def _create_case_email(case, message_id, thread_id, direction, sender, recipient
                        subject, body, received_at, analysis):
     subject_ko = (analysis or {}).get('subject_ko', '') or ''
     body_ko = (analysis or {}).get('body_ko', '') or ''
-    CaseEmail.objects.create(
-        case=case,
+    _, created = CaseEmail.objects.get_or_create(
         gmail_message_id=message_id,
-        gmail_thread_id=thread_id,
-        direction=direction,
-        sender=sender,
-        recipient=recipient,
-        subject=subject[:500],
-        subject_ko=subject_ko[:500],
-        body_original=body,
-        body_ko=body_ko,
-        received_at=received_at,
+        defaults=dict(
+            case=case,
+            gmail_thread_id=thread_id,
+            direction=direction,
+            sender=sender,
+            recipient=recipient,
+            subject=subject[:500],
+            subject_ko=subject_ko[:500],
+            body_original=body,
+            body_ko=body_ko,
+            received_at=received_at,
+        ),
     )
+    if not created:
+        # _process_message 초입의 중복 체크 이후에 다른 동기화가 먼저 저장한 것.
+        # 예외로 트랜잭션 전체를 되돌려 이 실행이 만든 케이스/변경도 함께 취소한다.
+        raise _DuplicateEmail(message_id)
 
 
 def _find_case(case_number, thread_id, vendor=None, subject='', body=''):
