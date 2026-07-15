@@ -34,15 +34,19 @@ SECRET_KEY = os.environ.get(
     'django-insecure-nf+jom4-at!bh3m)_a6a#_!jzpekr!7t#d%(vtv7kin$^)xcn_')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# 로컬 개발은 기본 True, VM 운영은 .env에 DJANGO_DEBUG=0.
+DEBUG = os.environ.get('DJANGO_DEBUG', '1') == '1'
 
-# 사내망의 다른 PC에서 IP로 접근할 수 있도록 허용 (개발용 — 운영 전환 시 도메인으로 제한할 것)
-ALLOWED_HOSTS = ['*']
+# 로컬 개발은 전체 허용, VM 운영은 .env에 DJANGO_ALLOWED_HOSTS=<VM_IP> 로 제한.
+ALLOWED_HOSTS = [
+    h.strip()
+    for h in os.environ.get('DJANGO_ALLOWED_HOSTS', '*').split(',')
+    if h.strip()
+]
 
-# CORS_ALLOWED_ORIGINS = [
-#     "http://localhost:3000",
-# ]
-CORS_ALLOW_ALL_ORIGINS = True
+# 로컬 개발은 전체 허용, VM 운영은 CASEFLOW_CORS_ALLOW_ALL=0 으로 끄면
+# CASEFLOW_FRONTEND_ORIGINS 기반 목록(CSRF_TRUSTED_ORIGINS와 동일)만 허용된다.
+CORS_ALLOW_ALL_ORIGINS = os.environ.get('CASEFLOW_CORS_ALLOW_ALL', '1') == '1'
 # 세션 쿠키 인증: 프론트(:3000)에서 쿠키를 주고받으려면 credentials 허용 필요
 CORS_ALLOW_CREDENTIALS = True
 
@@ -81,6 +85,9 @@ CSRF_TRUSTED_ORIGINS = [
     for host in _expand_origin_entry(entry)
 ]
 
+if not CORS_ALLOW_ALL_ORIGINS:
+    CORS_ALLOWED_ORIGINS = CSRF_TRUSTED_ORIGINS
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework.authentication.SessionAuthentication',
@@ -118,6 +125,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -149,12 +157,25 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+# POSTGRES_HOST가 설정되면 PostgreSQL(도커 배포), 없으면 로컬 SQLite로 동작한다.
+if os.environ.get('POSTGRES_HOST'):
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.environ.get('POSTGRES_DB', 'caseflow'),
+            'USER': os.environ.get('POSTGRES_USER', 'caseflow'),
+            'PASSWORD': os.environ['POSTGRES_PASSWORD'],
+            'HOST': os.environ['POSTGRES_HOST'],
+            'PORT': os.environ.get('POSTGRES_PORT', '5432'),
+        }
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
 
 
 # Password validation
@@ -192,6 +213,8 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+# collectstatic 결과물 위치 — DEBUG=0일 때 whitenoise가 여기서 admin 정적 파일을 서빙한다.
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 
 # Gmail integration

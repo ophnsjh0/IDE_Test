@@ -1,0 +1,25 @@
+# 비밀 파일 — 이미지 레이어에 절대 포함 금지 (런타임에 볼륨으로 마운트)
+.env
+backend/credentials.json
+backend/token.json
+credentials.json
+token.json
+backend/report_templates/
+
+# 로컬 데이터·상태
+backend/db.sqlite3
+frontend/db.sqlite3
+backend/.gmail_sync.lock
+backend/staticfiles/
+
+# 빌드 산출물·의존성 (컨테이너 안에서 새로 설치)
+.venv/
+frontend/node_modules/
+frontend/.next/
+frontend/tsconfig.tsbuildinfo
+__pycache__/
+*.pyc
+
+# 기타
+.git/
+*.md

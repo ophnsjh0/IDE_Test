@@ -1,0 +1,60 @@
+# CaseFlow VM 배포 구성 — db(PostgreSQL) + backend(Django) + frontend(Next.js)
+#
+# 기동 전 준비 (git에 없는 파일들을 이 디렉터리에 배치):
+#   .env                          — API 키 + DJANGO_/POSTGRES_ 운영 변수 (.env.example 참고)
+#   backend/credentials.json      — Gmail OAuth 클라이언트
+#   backend/token.json            — Gmail OAuth 토큰 (PC에서 발급한 것)
+#   backend/report_templates/     — 사내 실물 템플릿
+#
+# 기동: docker compose up -d --build
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-caseflow}
+      POSTGRES_USER: ${POSTGRES_USER:-caseflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-caseflow}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    # ports 미공개 — 컨테이너 내부 네트워크 전용
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend.Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: db
+    volumes:
+      - ./backend/credentials.json:/app/backend/credentials.json:ro
+      # token.json은 갱신 시 라이브러리가 다시 쓰므로 읽기 전용 불가
+      - ./backend/token.json:/app/backend/token.json
+      - ./backend/report_templates:/app/backend/report_templates:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend.Dockerfile
+      # 특정 주소로 고정하려면 주석 해제 (빌드 시점에 번들에 박힘):
+      # args:
+      #   NEXT_PUBLIC_API_BASE: http://<VM_IP>:8000
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
