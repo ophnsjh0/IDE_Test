@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { useRouter } from 'next/navigation';
+import { Suspense, useEffect, useRef, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import {
   AppShell,
   Group,
@@ -19,7 +19,16 @@ import {
   Select,
   Pagination
 } from '@mantine/core';
-import { IconSearch, IconPlus, IconRefresh, IconMail, IconSparkles } from '@tabler/icons-react';
+import {
+  IconSearch,
+  IconPlus,
+  IconRefresh,
+  IconMail,
+  IconSparkles,
+  IconChevronUp,
+  IconChevronDown,
+  IconSelector,
+} from '@tabler/icons-react';
 import NewCaseModal from './components/NewCaseModal';
 import AppHeader from './components/AppHeader';
 import HelpAgentWidget from './components/HelpAgentDrawer';
@@ -53,16 +62,78 @@ const PROVIDER_LABELS: Record<string, string> = {
   google: 'Google Gemini',
 };
 
+type SortKey = 'case_id' | 'vendor' | 'status' | 'device' | 'date';
+
+// Status는 알파벳순 대신 업무 진행 순서로 정렬
+const STATUS_ORDER: Record<string, number> = { Open: 0, Pending: 1, Resolved: 2 };
+
+function sortValue(c: Case, key: SortKey): string | number {
+  switch (key) {
+    case 'case_id': return c.id;
+    case 'vendor': return c.vendor;
+    case 'status': return STATUS_ORDER[c.status] ?? 99;
+    case 'device': return c.device_model || '';
+    case 'date': return c.date;
+  }
+}
+
+// 클릭 정렬 가능한 헤더 셀 — 현재 정렬 컬럼에 방향 화살표 표시
+function SortableTh({
+  label, width, sorted, asc, onSort,
+}: {
+  label: string;
+  width?: number;
+  sorted: boolean;
+  asc: boolean;
+  onSort: () => void;
+}) {
+  const Icon = sorted ? (asc ? IconChevronUp : IconChevronDown) : IconSelector;
+  return (
+    <Table.Th
+      style={{ whiteSpace: 'nowrap', width, cursor: 'pointer', userSelect: 'none' }}
+      onClick={onSort}
+      aria-sort={sorted ? (asc ? 'ascending' : 'descending') : 'none'}
+    >
+      <Group gap={4} wrap="nowrap">
+        {label}
+        <Icon
+          size={14}
+          color={sorted ? 'var(--mantine-color-blue-6)' : 'var(--mantine-color-gray-5)'}
+        />
+      </Group>
+    </Table.Th>
+  );
+}
+
+const SORT_KEYS: SortKey[] = ['case_id', 'vendor', 'status', 'device', 'date'];
+
+// useSearchParams는 Suspense 경계가 필요해 실제 화면을 내부 컴포넌트로 분리
 export default function Home() {
-  const [activeTab, setActiveTab] = useState<string | null>('all');
-  const [statusTab, setStatusTab] = useState<string | null>('all');
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState('15');
-  const [searchQuery, setSearchQuery] = useState('');
+  return (
+    <Suspense>
+      <CaseListPage />
+    </Suspense>
+  );
+}
+
+function CaseListPage() {
+  // 목록 상태는 URL 쿼리로 초기화 — 상세보기 후 back으로 돌아왔을 때
+  // 직전에 보던 탭·필터·검색어·정렬·페이지가 그대로 복원된다
+  const searchParams = useSearchParams();
+  const initialSort = searchParams.get('sort');
+  const [activeTab, setActiveTab] = useState<string | null>(searchParams.get('vendor') || 'all');
+  const [statusTab, setStatusTab] = useState<string | null>(searchParams.get('status') || 'all');
+  const [page, setPage] = useState(Math.max(1, Number(searchParams.get('page')) || 1));
+  const [pageSize, setPageSize] = useState(searchParams.get('size') || '15');
+  const [searchQuery, setSearchQuery] = useState(searchParams.get('q') || '');
   const [modalOpened, setModalOpened] = useState(false);
   const [cases, setCases] = useState<Case[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
+  const [sortKey, setSortKey] = useState<SortKey | null>(
+    SORT_KEYS.includes(initialSort as SortKey) ? (initialSort as SortKey) : null
+  );
+  const [sortAsc, setSortAsc] = useState(searchParams.get('dir') !== 'desc');
   const [syncing, setSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState('');
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -195,14 +266,78 @@ export default function Home() {
   const statusCount = (s: string) =>
     s === 'all' ? vendorFiltered.length : vendorFiltered.filter(c => c.status === s).length;
 
-  // 필터/페이지 크기가 바뀌면 1페이지로 복귀
+  // 헤더 클릭: 같은 컬럼이면 방향 토글, 다른 컬럼이면 그 컬럼 오름차순으로 시작
+  const toggleSort = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortAsc((v) => !v);
+    } else {
+      setSortKey(key);
+      setSortAsc(true);
+    }
+  };
+
+  const sortedCases = sortKey
+    ? [...filteredCases].sort((a, b) => {
+        const va = sortValue(a, sortKey);
+        const vb = sortValue(b, sortKey);
+        const cmp = typeof va === 'number'
+          ? va - (vb as number)
+          : String(va).localeCompare(String(vb));
+        return sortAsc ? cmp : -cmp;
+      })
+    : filteredCases;
+
+  // 필터/페이지 크기/정렬이 바뀌면 1페이지로 복귀.
+  // 마운트 직후 1회는 건너뛴다 — URL에서 복원한 page를 지우면 안 되므로
+  const isFirstRender = useRef(true);
   useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
     setPage(1);
-  }, [activeTab, statusTab, searchQuery, pageSize]);
+  }, [activeTab, statusTab, searchQuery, pageSize, sortKey, sortAsc]);
+
+  // 목록 상태를 URL 쿼리에 반영 — 상세보기 후 back으로 돌아와도 보던 화면 유지.
+  // history.replaceState는 Next 라우팅을 타지 않아 리렌더·히스토리 오염이 없다
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (activeTab && activeTab !== 'all') params.set('vendor', activeTab);
+    if (statusTab && statusTab !== 'all') params.set('status', statusTab);
+    if (searchQuery) params.set('q', searchQuery);
+    if (pageSize !== '15') params.set('size', pageSize);
+    if (sortKey) {
+      params.set('sort', sortKey);
+      if (!sortAsc) params.set('dir', 'desc');
+    }
+    if (page > 1) params.set('page', String(page));
+    const qs = params.toString();
+    window.history.replaceState(null, '', qs ? `?${qs}` : window.location.pathname);
+  }, [activeTab, statusTab, searchQuery, pageSize, sortKey, sortAsc, page]);
+
+  // 검색은 클라이언트에서 필터링되어 서버가 볼 수 없으므로, 파일럿 사용
+  // 측정을 위해 타이핑이 멈춘 뒤 한 번만 기록한다 (실패는 조용히 무시)
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (!q) return;
+    const timer = setTimeout(() => {
+      apiFetch('/api/usage/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: 'search', detail: q }),
+      }).catch(() => {});
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
 
   const size = Number(pageSize);
-  const totalPages = Math.max(1, Math.ceil(filteredCases.length / size));
-  const pagedCases = filteredCases.slice((page - 1) * size, page * size);
+  const totalPages = Math.max(1, Math.ceil(sortedCases.length / size));
+  const pagedCases = sortedCases.slice((page - 1) * size, page * size);
+
+  // URL에서 복원한 page가 실제 페이지 수를 넘으면(필터 변경 등) 마지막 페이지로 보정
+  useEffect(() => {
+    if (!loading && page > totalPages) setPage(totalPages);
+  }, [loading, page, totalPages]);
 
   const rows = pagedCases.map((element) => (
     <Table.Tr 
@@ -435,12 +570,12 @@ export default function Home() {
                 <Table highlightOnHover verticalSpacing="sm">
                 <Table.Thead>
                     <Table.Tr>
-                    <Table.Th style={{ whiteSpace: 'nowrap', width: 90 }}>Case ID</Table.Th>
-                    <Table.Th style={{ whiteSpace: 'nowrap', width: 110 }}>Vendor</Table.Th>
-                    <Table.Th style={{ whiteSpace: 'nowrap', width: 110 }}>Status</Table.Th>
+                    <SortableTh label="Case ID" width={90} sorted={sortKey === 'case_id'} asc={sortAsc} onSort={() => toggleSort('case_id')} />
+                    <SortableTh label="Vendor" width={110} sorted={sortKey === 'vendor'} asc={sortAsc} onSort={() => toggleSort('vendor')} />
+                    <SortableTh label="Status" width={110} sorted={sortKey === 'status'} asc={sortAsc} onSort={() => toggleSort('status')} />
                     <Table.Th>Summary</Table.Th>
-                    <Table.Th style={{ whiteSpace: 'nowrap', width: 150 }}>Device</Table.Th>
-                    <Table.Th style={{ whiteSpace: 'nowrap', width: 110 }}>Date</Table.Th>
+                    <SortableTh label="Device" width={150} sorted={sortKey === 'device'} asc={sortAsc} onSort={() => toggleSort('device')} />
+                    <SortableTh label="Date" width={110} sorted={sortKey === 'date'} asc={sortAsc} onSort={() => toggleSort('date')} />
                     </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>{rows}</Table.Tbody>

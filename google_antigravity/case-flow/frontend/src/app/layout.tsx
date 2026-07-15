@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "@mantine/core/styles.css";
-import { ColorSchemeScript, MantineProvider } from "@mantine/core";
+import { ColorSchemeScript, MantineProvider, mantineHtmlProps } from "@mantine/core";
 import AuthGate from "./components/AuthGate";
 
 const geistSans = Geist({
@@ -24,8 +24,10 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  // mantineHtmlProps: 서버 HTML에도 data-mantine-color-scheme을 붙여
+  // 클라이언트 MantineProvider와의 하이드레이션 불일치를 막는다
   return (
-    <html lang="en">
+    <html lang="en" {...mantineHtmlProps}>
       <head>
         <ColorSchemeScript />
       </head>

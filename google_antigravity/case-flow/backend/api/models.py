@@ -60,6 +60,35 @@ class AppSetting(models.Model):
         cls.objects.update_or_create(key=key, defaults={'value': value})
 
 
+class UsageEvent(models.Model):
+    """파일럿 기간 사용 측정 이벤트 — 도입 확대 여부를 판단할 지표의 원본.
+
+    기록은 부가 기능이므로 services.usage.log_event()는 어떤 예외도
+    호출자에게 전파하지 않는다 (기록 실패가 기능을 깨면 안 됨).
+    """
+    EVENT_CHOICES = [
+        ('login', 'Login'),
+        ('case_list', 'Case List View'),
+        ('case_view', 'Case Detail View'),
+        ('search', 'Search'),
+        ('agent_chat', 'AI Agent Chat'),
+        ('report_download', 'Report Download'),
+        ('gmail_sync', 'Gmail Sync'),
+    ]
+
+    user = models.ForeignKey(django_settings.AUTH_USER_MODEL, null=True, blank=True,
+                             on_delete=models.SET_NULL, related_name='usage_events')
+    event = models.CharField(max_length=20, choices=EVENT_CHOICES)
+    detail = models.CharField(max_length=300, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['event', 'created_at'])]
+
+    def __str__(self):
+        return f"{self.user} {self.event} @ {self.created_at:%Y-%m-%d %H:%M}"
+
+
 class Case(models.Model):
     VENDOR_CHOICES = [
         ('A10', 'A10'),

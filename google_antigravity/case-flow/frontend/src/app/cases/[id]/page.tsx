@@ -33,6 +33,10 @@ import AppHeader from '../../components/AppHeader';
 import { apiFetch } from '../../lib/api';
 import { useMe } from '../../lib/useMe';
 
+// 본문 텍스트 공통 스타일 — AI 분석 결과와 메일 본문에 동일하게 적용.
+// overflowWrap: 긴 URL·시리얼 등 공백 없는 문자열이 카드 밖으로 넘치지 않게 강제 줄바꿈
+const bodyTextStyle = { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } as const;
+
 interface CaseEmail {
   id: number;
   direction: string;
@@ -212,10 +216,12 @@ export default function CaseDetailPage() {
       <AppShell.Main>
         <Container size="md">
           <Group justify="space-between" mb="md">
-             <Button 
-                variant="subtle" 
-                leftSection={<IconArrowLeft size={16} />} 
-                onClick={() => router.push('/')}
+             <Button
+                variant="subtle"
+                leftSection={<IconArrowLeft size={16} />}
+                // 히스토리 back으로 돌아가야 목록의 필터·페이지 상태(URL 쿼리)가 복원된다.
+                // 상세 URL로 직접 진입해 히스토리가 없으면 목록 첫 화면으로.
+                onClick={() => (window.history.length > 1 ? router.back() : router.push('/'))}
             >
                 Back to Cases
             </Button>
@@ -313,7 +319,7 @@ export default function CaseDetailPage() {
                     <Textarea minRows={3} {...form.getInputProps('description')} />
                 ) : (
                     <Paper withBorder p="md" bg="gray.0">
-                        <Text style={{ whiteSpace: 'pre-wrap' }}>
+                        <Text size="sm" style={bodyTextStyle}>
                             {caseDetail.description || <Text c="dimmed" fs="italic">No description provided</Text>}
                         </Text>
                     </Paper>
@@ -326,7 +332,7 @@ export default function CaseDetailPage() {
                     <Textarea minRows={3} {...form.getInputProps('action_steps')} />
                 ) : (
                     <Paper withBorder p="md" bg="gray.0">
-                        <Text style={{ whiteSpace: 'pre-wrap' }}>
+                        <Text size="sm" style={bodyTextStyle}>
                             {caseDetail.action_steps || <Text c="dimmed" fs="italic">No actions recorded</Text>}
                         </Text>
                     </Paper>
@@ -339,7 +345,7 @@ export default function CaseDetailPage() {
                     <Textarea minRows={3} {...form.getInputProps('resolution')} />
                 ) : (
                     <Paper withBorder p="md" bg="green.0">
-                        <Text style={{ whiteSpace: 'pre-wrap' }}>
+                        <Text size="sm" style={bodyTextStyle}>
                             {caseDetail.resolution || <Text c="dimmed" fs="italic">No resolution recorded</Text>}
                         </Text>
                     </Paper>
@@ -418,12 +424,20 @@ export default function CaseDetailPage() {
   );
 }
 
+// HTML 메일을 텍스트로 변환하며 생긴 과도한 빈 줄(3개 이상 연속)을 문단 구분
+// 1개로 줄인다 — 이미 저장된 메일 본문도 화면에서는 정리해 보여주기 위함
+function normalizeEmailBody(text: string) {
+  return text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 function EmailCard({ email }: { email: CaseEmail }) {
   const [showOriginal, setShowOriginal] = useState(false);
   const inbound = email.direction === 'inbound';
   const hasTranslation = !!email.body_ko;
   // 번역이 없으면 원문만 표시
-  const body = showOriginal || !hasTranslation ? email.body_original : email.body_ko;
+  const body = normalizeEmailBody(
+    showOriginal || !hasTranslation ? email.body_original : email.body_ko
+  );
   const subject = showOriginal || !email.subject_ko ? email.subject : email.subject_ko;
 
   return (
@@ -454,7 +468,7 @@ function EmailCard({ email }: { email: CaseEmail }) {
         </Group>
       </Group>
       <Text fw={600} mb="xs">{subject}</Text>
-      <Text size="sm" style={{ whiteSpace: 'pre-wrap' }}>{body}</Text>
+      <Text size="sm" style={bodyTextStyle}>{body}</Text>
       {!hasTranslation && (
         <Text size="xs" c="dimmed" fs="italic" mt="xs">
           번역본이 없습니다 (원문 표시 중)

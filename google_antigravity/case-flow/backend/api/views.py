@@ -4,9 +4,9 @@ from datetime import timedelta
 from urllib.parse import quote
 
 import anthropic
-from django.db.models import Count, Max, Q
+from django.db.models import Count, F, Max, Q
 from django.http import HttpResponse
-from django.db.models.functions import Coalesce
+from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.decorators import api_view, permission_classes
@@ -16,9 +16,10 @@ from rest_framework.views import APIView
 
 from django.conf import settings
 
-from .models import AppSetting, Case
+from .models import AppSetting, Case, UsageEvent
 from .permissions import IsAdminRole, IsEngineerOrAbove
 from .serializers import CaseSerializer, CaseDetailSerializer
+from .services.usage import log_event
 from .services.analyzer import (
     AVAILABLE_MODELS,
     TRANSLATION_MODEL_SETTING_KEY,
@@ -58,6 +59,10 @@ class CaseListCreateView(generics.ListCreateAPIView):
             return [IsEngineerOrAbove()]
         return super().get_permissions()
 
+    def get(self, request, *args, **kwargs):
+        log_event(request.user, 'case_list')
+        return super().get(request, *args, **kwargs)
+
 
 class CaseDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = CASES_WITH_LAST_EMAIL
@@ -71,6 +76,10 @@ class CaseDetailView(generics.RetrieveUpdateDestroyAPIView):
         if self.request.method in ('PUT', 'PATCH'):
             return [IsEngineerOrAbove()]
         return super().get_permissions()
+
+    def get(self, request, *args, **kwargs):
+        log_event(request.user, 'case_view', detail=f"C-{1000 + kwargs['id']}")
+        return super().get(request, *args, **kwargs)
 
 
 def _resolve_case_ref(ref):
@@ -222,6 +231,8 @@ class GmailSyncView(APIView):
                 {'error': 'Gmail 동기화 중 오류가 발생했습니다. 서버 로그를 확인하세요.'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+        log_event(request.user, 'gmail_sync',
+                  detail=f"fetched={summary.get('fetched')} created={summary.get('cases_created')}")
         return Response(summary)
 
 
@@ -262,6 +273,9 @@ class HelpAgentChatView(APIView):
                 {'error': 'AI 서비스에 연결할 수 없습니다. 서버 설정을 확인하세요.'},
                 status=status.HTTP_502_BAD_GATEWAY,
             )
+        # 어떤 에이전트가 어떤 질문을 받았는지 파일럿 지표로 남긴다 (질문은 앞 80자만)
+        log_event(request.user, 'agent_chat',
+                  detail=f"[{result.get('agent', '?')}] {messages[-1]['content'][:80]}")
         return Response(result)
 
     def _validate(self, messages):
@@ -305,9 +319,77 @@ class HelpAgentFileView(APIView):
             return Response({'error': '파일 다운로드 중 오류가 발생했습니다.'},
                             status=status.HTTP_502_BAD_GATEWAY,)
 
+        log_event(request.user, 'report_download', detail=filename)
         response = HttpResponse(
             data, content_type=mime_type or 'application/octet-stream')
         # 파일명에 한글 등 비ASCII가 올 수 있어 RFC 5987 형식으로 지정
         response['Content-Disposition'] = (
             f"attachment; filename*=UTF-8''{quote(filename)}")
         return response
+
+
+class UsageEventView(APIView):
+    """POST /api/usage/ — 서버가 볼 수 없는 프론트 이벤트(클라이언트 검색 등) 기록.
+
+    허용 목록에 있는 이벤트만 받는다 — 임의 이벤트로 지표가 오염되는 것 방지.
+    """
+
+    CLIENT_EVENTS = {'search'}
+
+    def post(self, request):
+        event = request.data.get('event')
+        if event not in self.CLIENT_EVENTS:
+            return Response({'error': '허용되지 않은 이벤트입니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        log_event(request.user, event, detail=str(request.data.get('detail') or ''))
+        return Response({'ok': True}, status=status.HTTP_201_CREATED)
+
+
+class UsageStatsView(APIView):
+    """GET /api/usage/stats/?days=28 — 파일럿 지표 요약 (admin 전용).
+
+    반환: 기간 내 활성 사용자 수, 이벤트 유형별 건수, 일별 활성 사용자,
+    사용자별 요약(마지막 활동·검색/채팅/케이스 조회 횟수).
+    """
+
+    permission_classes = [IsAdminRole]
+
+    def get(self, request):
+        try:
+            days = min(max(int(request.query_params.get('days', 28)), 1), 90)
+        except ValueError:
+            days = 28
+        since = timezone.now() - timedelta(days=days)
+        qs = UsageEvent.objects.filter(created_at__gte=since)
+
+        by_event = {
+            row['event']: row['n']
+            for row in qs.values('event').annotate(n=Count('id'))
+        }
+        daily = list(
+            qs.exclude(user=None)
+            .annotate(day=TruncDate('created_at'))
+            .values('day')
+            .annotate(users=Count('user', distinct=True), events=Count('id'))
+            .order_by('day')
+        )
+        users = list(
+            qs.exclude(user=None)
+            .values(username=F('user__username'))
+            .annotate(
+                events=Count('id'),
+                logins=Count('id', filter=Q(event='login')),
+                case_views=Count('id', filter=Q(event='case_view')),
+                searches=Count('id', filter=Q(event='search')),
+                agent_chats=Count('id', filter=Q(event='agent_chat')),
+                last_active=Max('created_at'),
+            )
+            .order_by('-events')
+        )
+        return Response({
+            'days': days,
+            'active_users': qs.exclude(user=None).values('user').distinct().count(),
+            'by_event': by_event,
+            'daily': daily,
+            'users': users,
+        })

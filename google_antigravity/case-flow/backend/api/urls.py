@@ -24,6 +24,8 @@ urlpatterns = [
     path('help-agent/files/<str:file_id>/', views.HelpAgentFileView.as_view(),
          name='help-agent-file'),
     path('dashboard/stats/', views.DashboardStatsView.as_view(), name='dashboard-stats'),
+    path('usage/', views.UsageEventView.as_view(), name='usage-event'),
+    path('usage/stats/', views.UsageStatsView.as_view(), name='usage-stats'),
     path('settings/translation-model/', views.TranslationModelView.as_view(),
          name='translation-model'),
 ]

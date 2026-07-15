@@ -2,6 +2,7 @@
 import json
 import logging
 import time
+from contextlib import contextmanager
 
 import anthropic
 from django.conf import settings
@@ -69,9 +70,27 @@ AVAILABLE_MODELS = [
 
 TRANSLATION_MODEL_SETTING_KEY = 'translation_model'
 
+# translation_model_override()로 지정하는 일회성 모델 (백필 등 관리 작업용)
+_model_override = None
+
+
+@contextmanager
+def translation_model_override(model):
+    """블록 안에서만 사용할 모델을 강제한다 — 앱 설정(AppSetting)은 건드리지 않아
+    동시 실행 중인 동기화가 영향받지 않는다."""
+    global _model_override
+    _model_override = model
+    try:
+        yield
+    finally:
+        _model_override = None
+
 
 def get_translation_model():
-    """사용할 모델 결정: DB 저장값(프론트에서 선택) → settings.TRANSLATION_MODEL 순."""
+    """사용할 모델 결정: 일회성 오버라이드 → DB 저장값(프론트에서 선택) →
+    settings.TRANSLATION_MODEL 순."""
+    if _model_override:
+        return _model_override
     try:
         from api.models import AppSetting
         return AppSetting.get(TRANSLATION_MODEL_SETTING_KEY) or settings.TRANSLATION_MODEL

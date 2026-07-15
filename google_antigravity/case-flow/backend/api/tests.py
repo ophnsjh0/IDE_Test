@@ -1337,3 +1337,113 @@ class GmailSyncConcurrencyTests(TestCase):
             CaseEmail.objects.filter(gmail_message_id='race-msg-1').count(), 1)
         # 이 실행이 만들던 새 케이스는 롤백되어 빈 케이스가 남지 않는다
         self.assertEqual(Case.objects.count(), cases_before)
+
+
+class UsageEventTests(TestCase):
+    """파일럿 사용 로그 — 기록 훅과 통계 API."""
+
+    def setUp(self):
+        from .permissions import set_user_role
+        for username, role in (('uv1', 'viewer'), ('ua1', 'admin')):
+            user = User.objects.create_user(username, password='usage-pass-123!')
+            set_user_role(user, role)
+        self.case = make_case(vendor='A10', summary='사용 로그 테스트 케이스')
+
+    def login(self, username):
+        self.client.post('/api/auth/login/',
+                         {'username': username, 'password': 'usage-pass-123!'},
+                         content_type='application/json')
+
+    def test_login_and_case_views_are_logged(self):
+        from .models import UsageEvent
+        self.login('uv1')
+        self.client.get('/api/cases/')
+        self.client.get(f'/api/cases/{self.case.id}/')
+        events = list(UsageEvent.objects.order_by('id').values_list('event', flat=True))
+        self.assertEqual(events, ['login', 'case_list', 'case_view'])
+        detail_event = UsageEvent.objects.get(event='case_view')
+        self.assertEqual(detail_event.detail, self.case.case_id)
+        self.assertEqual(detail_event.user.username, 'uv1')
+
+    def test_client_search_event_whitelist(self):
+        from .models import UsageEvent
+        self.login('uv1')
+        ok = self.client.post('/api/usage/', {'event': 'search', 'detail': 'VRRP'},
+                              content_type='application/json')
+        self.assertEqual(ok.status_code, 201)
+        self.assertTrue(UsageEvent.objects.filter(event='search', detail='VRRP').exists())
+        # 허용 목록 밖 이벤트는 거부 — 지표 오염 방지
+        bad = self.client.post('/api/usage/', {'event': 'agent_chat', 'detail': 'x'},
+                               content_type='application/json')
+        self.assertEqual(bad.status_code, 400)
+
+    def test_stats_admin_only_and_aggregates(self):
+        self.login('uv1')
+        self.client.get('/api/cases/')
+        self.client.post('/api/usage/', {'event': 'search', 'detail': 'failover'},
+                         content_type='application/json')
+        self.assertEqual(self.client.get('/api/usage/stats/').status_code, 403)
+
+        self.login('ua1')
+        res = self.client.get('/api/usage/stats/')
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data['active_users'], 2)  # uv1 + ua1(로그인 이벤트)
+        self.assertEqual(data['by_event']['search'], 1)
+        self.assertEqual(data['by_event']['case_list'], 1)
+        usernames = {u['username'] for u in data['users']}
+        self.assertEqual(usernames, {'uv1', 'ua1'})
+        uv1 = next(u for u in data['users'] if u['username'] == 'uv1')
+        self.assertEqual(uv1['searches'], 1)
+        self.assertEqual(uv1['logins'], 1)
+
+
+class BackfillTranslationTests(TestCase):
+    """backfill_translations — 번역 누락 메일만 채우고 케이스 필드는 불변."""
+
+    def setUp(self):
+        self.case = make_case(vendor='A10', summary='번역 백필 케이스',
+                              status='Pending', action_steps='수동 편집 보존 확인')
+        self.missing = make_email(self.case, 'Untranslated mail', message_id='bt-miss')
+        self.missing.body_original = 'Hello, please check the device.'
+        self.missing.save()
+        self.translated = make_email(self.case, 'Translated mail', message_id='bt-done')
+        self.translated.body_original = 'Already translated.'
+        self.translated.subject_ko = '이미 번역된 메일'
+        self.translated.body_ko = '이미 번역되어 있습니다.'
+        self.translated.save()
+
+    def run_command(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        # 재시도 백오프(15초)로 테스트가 느려지지 않게 sleep 무력화
+        with patch('api.management.commands.backfill_translations.time.sleep'):
+            call_command('backfill_translations', '--sleep', '0', *args,
+                         stdout=out, stderr=StringIO())
+        return out.getvalue()
+
+    def test_fills_only_missing_and_keeps_case_fields(self):
+        with patch('api.management.commands.backfill_translations.analyze_email',
+                   return_value={'subject_ko': '미번역 메일', 'body_ko': '장비를 확인해 주세요.'}) as mocked:
+            self.run_command()
+        self.missing.refresh_from_db()
+        self.translated.refresh_from_db()
+        self.case.refresh_from_db()
+        self.assertEqual(self.missing.subject_ko, '미번역 메일')
+        self.assertEqual(self.missing.body_ko, '장비를 확인해 주세요.')
+        # 이미 번역된 메일은 호출조차 하지 않는다
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(self.translated.body_ko, '이미 번역되어 있습니다.')
+        # 케이스 필드는 재분석하지 않으므로 그대로
+        self.assertEqual(self.case.status, 'Pending')
+        self.assertEqual(self.case.action_steps, '수동 편집 보존 확인')
+
+    def test_failure_leaves_email_untouched_and_reports(self):
+        with patch('api.management.commands.backfill_translations.analyze_email',
+                   return_value=None) as mocked:
+            out = self.run_command('--retries', '1')
+        self.missing.refresh_from_db()
+        self.assertEqual(self.missing.body_ko, '')
+        self.assertEqual(mocked.call_count, 2)  # 원 시도 + 재시도 1회
+        self.assertIn('실패 1건', out)

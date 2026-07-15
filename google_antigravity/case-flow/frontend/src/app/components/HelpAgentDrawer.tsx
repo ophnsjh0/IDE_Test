@@ -56,6 +56,9 @@ const SUGGESTIONS = [
   'ACOS 6.0.8 알려진 버그 검색해줘',
 ];
 
+// Drawer 기본 너비(px) — Mantine size="md"와 동일. 드래그 시 이 값 미만으로는 줄지 않는다.
+const DRAWER_DEFAULT_WIDTH = 440;
+
 // AI 도우미 런처 + 채팅 Drawer를 묶은 위젯.
 // variant='inline'  : 페이지 레이아웃 안에 일반 버튼으로 배치 (리스트 페이지)
 // variant='floating': 화면 우측 하단 고정 네모 버튼 (그 외 페이지)
@@ -68,7 +71,30 @@ export default function HelpAgentWidget({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [drawerWidth, setDrawerWidth] = useState(DRAWER_DEFAULT_WIDTH);
   const viewportRef = useRef<HTMLDivElement>(null);
+
+  // 좌측 가장자리 드래그로 너비 조절 — 표 등 긴 내용을 볼 때 넓혀 쓴다
+  const startResize = (e: React.PointerEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = drawerWidth;
+    const maxWidth = Math.round(window.innerWidth * 0.9);
+    const onMove = (ev: PointerEvent) => {
+      const next = startWidth + (startX - ev.clientX);
+      setDrawerWidth(Math.min(Math.max(next, DRAWER_DEFAULT_WIDTH), maxWidth));
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  };
 
   useEffect(() => {
     viewportRef.current?.scrollTo({
@@ -179,7 +205,8 @@ export default function HelpAgentWidget({
         opened={opened}
         onClose={() => setOpened(false)}
         position="right"
-        size="md"
+        size={drawerWidth}
+        styles={{ content: { position: 'relative' } }}
         title={
           <Group gap={10}>
             <ThemeIcon
@@ -197,6 +224,14 @@ export default function HelpAgentWidget({
           </Group>
         }
       >
+        {/* 좌측 가장자리를 드래그하면 창이 넓어진다 (더블클릭: 기본 크기로 복원) */}
+        <div
+          className={classes.resizeHandle}
+          onPointerDown={startResize}
+          onDoubleClick={() => setDrawerWidth(DRAWER_DEFAULT_WIDTH)}
+          title="드래그로 창 너비 조절 · 더블클릭으로 기본 크기"
+        />
+
         {/* 입력란이 화면 맨 아래에 붙지 않도록 높이를 줄여 위쪽에 배치 */}
         <Stack h="calc(100vh - 180px)" gap="sm">
           <ScrollArea style={{ flex: 1 }} viewportRef={viewportRef}>
@@ -254,7 +289,10 @@ export default function HelpAgentWidget({
                     </Group>
                   )}
                   <div className={m.role === 'user' ? classes.bubbleUser : classes.bubbleAssistant}>
-                    <Text size="sm" style={{ whiteSpace: 'pre-wrap', color: 'inherit' }}>
+                    <Text
+                      size="sm"
+                      style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', color: 'inherit' }}
+                    >
                       {m.content}
                     </Text>
                   </div>

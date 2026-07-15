@@ -1,6 +1,7 @@
 """Gmail API client: OAuth handling, message fetch/send, label management."""
 import base64
 import os
+import re
 from email.mime.text import MIMEText
 
 from django.conf import settings
@@ -113,14 +114,58 @@ def extract_body(payload):
     """
     plain, html = _walk_parts(payload)
     if plain:
-        return plain.strip()
+        return _normalize_text(plain)
     if html:
         try:
-            from bs4 import BeautifulSoup
-            return BeautifulSoup(html, 'html.parser').get_text(separator='\n').strip()
+            return html_to_text(html)
         except ImportError:
             return html.strip()
     return ''
+
+
+# 줄바꿈으로 취급할 블록 요소. 인라인 태그(span/a/b 등)는 줄을 나누지 않아야
+# 서명(명함)처럼 서식이 많은 부분이 "T / 070-… / M / …"으로 갈라지지 않는다.
+_PARA_TAGS = ['p', 'blockquote', 'pre', 'table', 'ul', 'ol',
+              'h1', 'h2', 'h3', 'h4', 'h5', 'h6']
+_LINE_TAGS = ['div', 'tr', 'li', 'section', 'article', 'header', 'footer', 'hr']
+# HTML 원본 텍스트에는 등장할 수 없는 제어문자를 개행 표식으로 쓴다
+_LINE_MARK, _PARA_MARK = '\x00', '\x01'
+
+
+def html_to_text(html):
+    """HTML 메일 본문을 블록 구조를 살린 일반 텍스트로 변환한다.
+
+    p 등 문단 요소는 빈 줄로, div/tr/li·<br>은 한 줄 개행으로 바꾸고
+    HTML 소스의 들여쓰기·개행은 브라우저처럼 공백 1개로 접는다.
+    """
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, 'html.parser')
+    for tag in soup(['script', 'style', 'head', 'title']):
+        tag.decompose()
+    for br in soup.find_all('br'):
+        br.replace_with(_LINE_MARK)
+    for cell in soup.find_all(['td', 'th']):  # 같은 행의 셀은 공백으로 구분
+        cell.append(' ')
+    for tag in soup.find_all(_PARA_TAGS):
+        tag.insert_before(_PARA_MARK)
+        tag.append(_PARA_MARK)
+    for tag in soup.find_all(_LINE_TAGS):
+        tag.insert_before(_LINE_MARK)
+        tag.append(_LINE_MARK)
+    text = soup.get_text()
+    text = re.sub(r'\s+', ' ', text)  # 소스 개행/들여쓰기 → 공백 1개
+    # 인접한 div/tr(닫힘+열림)이 만드는 연속 줄 표식은 개행 1개로 충분하다
+    text = re.sub(f'(?:{_LINE_MARK} ?){{2,}}', _LINE_MARK, text)
+    text = text.replace(_PARA_MARK, '\n\n').replace(_LINE_MARK, '\n')
+    text = '\n'.join(line.strip() for line in text.split('\n'))
+    return _normalize_text(text)
+
+
+def _normalize_text(text):
+    # 줄 끝 공백을 지우고 연속 빈 줄은 문단 구분 1개로 줄인다.
+    # (앞쪽 들여쓰기는 CLI 출력·설정 덤프에 의미가 있을 수 있어 유지)
+    text = re.sub(r'[ \t]+\n', '\n', text)
+    return re.sub(r'\n{3,}', '\n\n', text).strip()
 
 
 def _walk_parts(payload):

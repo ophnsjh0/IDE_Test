@@ -25,6 +25,7 @@ from rest_framework.views import APIView
 from .models import SignupRequest, UserProfile
 from .permissions import IsAdminRole, get_user_role, set_user_role
 from .services import gmail_client
+from .services.usage import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ class LoginView(APIView):
             return Response({'error': '아이디 또는 비밀번호가 올바르지 않습니다.'},
                             status=status.HTTP_401_UNAUTHORIZED)
         login(request, user)
+        log_event(user, 'login')
         return Response(_user_payload(user))
 
 
