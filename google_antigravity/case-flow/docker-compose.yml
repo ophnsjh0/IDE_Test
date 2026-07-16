@@ -1,12 +1,12 @@
 # CaseFlow VM 배포 구성 — db(PostgreSQL) + backend(Django) + frontend(Next.js)
 #
-# 기동 전 준비 (git에 없는 파일들을 이 디렉터리에 배치):
-#   .env                          — API 키 + DJANGO_/POSTGRES_ 운영 변수 (.env.example 참고)
-#   backend/credentials.json      — Gmail OAuth 클라이언트
-#   backend/token.json            — Gmail OAuth 토큰 (PC에서 발급한 것)
-#   backend/report_templates/     — 사내 실물 템플릿
+# 기동 전 준비 (git에 없는 파일들):
+#   .env                       — API 키 + DJANGO_/POSTGRES_ 운영 변수 (.env.example 참고)
+#                                운영 VM에서는 .env.age로 암호화 보관, caseflow-up.sh로 기동
+#   gmail_secrets 볼륨         — credentials.json/token.json을 compose cp로 최초 1회 주입
+#   backend/report_templates/  — 사내 실물 템플릿
 #
-# 기동: docker compose up -d --build
+# 기동: docker compose up -d --build  (운영 VM은 ~/bin/caseflow-up.sh 사용)
 services:
   db:
     image: postgres:16-alpine
@@ -32,10 +32,12 @@ services:
     env_file: .env
     environment:
       POSTGRES_HOST: db
+      # Gmail OAuth 파일은 호스트 평문 대신 명명 볼륨(root 전용 영역)에 보관.
+      # 최초 1회 주입: docker compose cp credentials.json backend:/app/secrets/
+      GMAIL_CREDENTIALS_FILE: /app/secrets/credentials.json
+      GMAIL_TOKEN_FILE: /app/secrets/token.json
     volumes:
-      - ./backend/credentials.json:/app/backend/credentials.json:ro
-      # token.json은 갱신 시 라이브러리가 다시 쓰므로 읽기 전용 불가
-      - ./backend/token.json:/app/backend/token.json
+      - gmail_secrets:/app/secrets
       - ./backend/report_templates:/app/backend/report_templates:ro
     ports:
       - "8000:8000"
@@ -58,3 +60,5 @@ services:
 
 volumes:
   pgdata:
+  # Gmail OAuth 비밀 파일 저장소 — 호스트에서는 root만 접근 가능
+  gmail_secrets:
