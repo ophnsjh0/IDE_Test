@@ -29,7 +29,12 @@ services:
       context: .
       dockerfile: backend.Dockerfile
     restart: unless-stopped
-    env_file: .env
+    # .env는 caseflow-up.sh가 기동 순간에만 복호화해 두므로 평시에는 없음 —
+    # required: false로 cp/exec 등 다른 compose 명령이 막히지 않게 한다.
+    # 단, up/recreate는 반드시 caseflow-up.sh로 (없이 돌리면 API 키가 빈 값으로 들어감)
+    env_file:
+      - path: .env
+        required: false
     environment:
       POSTGRES_HOST: db
       # Gmail OAuth 파일은 호스트 평문 대신 명명 볼륨(root 전용 영역)에 보관.
