@@ -11,9 +11,9 @@ class CaseAdmin(admin.ModelAdmin):
 
 @admin.register(ReferenceDocument)
 class ReferenceDocumentAdmin(admin.ModelAdmin):
-    list_display = ('filename', 'vendor', 'title', 'page_count', 'chunk_count',
-                    'embedding_model', 'updated_at')
-    list_filter = ('vendor',)
+    list_display = ('filename', 'vendor', 'doc_type', 'title', 'page_count',
+                    'chunk_count', 'embedding_model', 'updated_at')
+    list_filter = ('vendor', 'doc_type')
     readonly_fields = [f.name for f in ReferenceDocument._meta.fields]
 
 

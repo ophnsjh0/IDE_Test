@@ -43,11 +43,30 @@ backend/reference_docs/<벤더>/*.pdf
 - 한국어 질문 → 영어 문서 교차 매칭 검증됨
 - 기술지원 에이전트가 `search_references` 도구로 사용, 출처는 `(문서명 p.페이지)` 표기
 
+## 폴더 구조 (벤더/유형 2단계)
+
+```
+backend/reference_docs/
+  A10/
+    config/    ACOS_6.0.8_ADC_Guide.pdf ...        # 설정 가이드 (PDF, 페이지 청킹)
+    release/   ACOS_6.0.8_Release_Notes.pdf ...    # 릴리즈 노트 (PDF)
+    issues/    ACOS_6.0.8_Issues.xlsx ...          # 이슈 목록 (XLSX, 행 단위 청킹)
+  Arista/
+    config/    EOS_4.36.1F_User_Guide.pdf
+```
+
+- **유형 폴더명(config/release/issues)이 그대로 `doc_type` 메타데이터**가 되어
+  검색 필터로 쓰인다 (`--type issues`, 에이전트 도구의 `doc_type` 파라미터).
+  폴더명은 자유 형식이지만 위 세 가지를 권장.
+- **XLSX는 행 단위 청킹**: 첫 행을 헤더로 보고 이후 각 행을 "컬럼명: 값" 텍스트로
+  변환 — 이슈 1건 = 청크 1개, 출처는 "시트명 N행"으로 표기된다.
+  PDF로 변환하지 말고 엑셀 그대로 넣을 것 (표 구조 보존).
+
 ## 구성 요소
 
 | 무엇 | 위치 |
 |---|---|
-| 원본 PDF | `backend/reference_docs/<벤더>/` — **git 제외** (용량·라이선스). 파일명 규칙 `<OS>_<버전>_<문서유형>.pdf` |
+| 원본 문서 | `backend/reference_docs/<벤더>/<유형>/` — **git 제외** (용량·라이선스). 파일명 규칙 `<OS>_<버전>_<문서유형>.{pdf,xlsx}` |
 | 모델 | `api/models.py` — `ReferenceDocument`(파일 단위, sha256 해시), `ReferenceChunk`(청크+벡터) |
 | 파이프라인/검색 | `api/services/references.py` |
 | 에이전트 도구 | `api/services/help_agent.py` — `search_references` (tech 에이전트) |

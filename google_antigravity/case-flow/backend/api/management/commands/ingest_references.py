@@ -32,12 +32,12 @@ class Command(BaseCommand):
 
         counts = {'created': 0, 'updated': 0, 'skipped': 0, 'failed': 0}
         seen = set()
-        for vendor, relative_path, path in files:
+        for vendor, doc_type, relative_path, path in files:
             seen.add(relative_path)
-            self.stdout.write(f'[{vendor}] {relative_path}')
+            self.stdout.write(f'[{vendor}{"/" + doc_type if doc_type else ""}] {relative_path}')
             try:
                 outcome = references.ingest_file(
-                    vendor, relative_path, path, force=options['force'],
+                    vendor, doc_type, relative_path, path, force=options['force'],
                     log=lambda msg: self.stdout.write(msg))
             except references.EmbeddingUnavailable as e:
                 raise SystemExit(f'중단: {e}')

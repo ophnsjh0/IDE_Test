@@ -182,7 +182,10 @@ class ReferenceDocument(models.Model):
     바뀌면 청크를 지우고 다시 만든다 (ingest_references 커맨드).
     """
     vendor = models.CharField(max_length=50, choices=Case.VENDOR_CHOICES)
-    filename = models.CharField(max_length=255, unique=True)  # "A10/ACOS_6.0.8_ADC_Guide.pdf"
+    filename = models.CharField(max_length=255, unique=True)  # "A10/config/ACOS_6.0.8_ADC_Guide.pdf"
+    # 벤더 하위 폴더명 = 문서 유형 (config/release/issues 권장, 자유 형식).
+    # 벤더 폴더 바로 아래 파일은 빈 값.
+    doc_type = models.CharField(max_length=30, blank=True, default='')
     title = models.CharField(max_length=300, blank=True, default='')  # 첫 페이지에서 추출
     sha256 = models.CharField(max_length=64)
     page_count = models.IntegerField(default=0)

@@ -52,18 +52,26 @@ def embed_texts(texts, model=None):
 # ---------------------------------------------------------------- 인제스트
 
 def scan_files():
-    """reference_docs/<벤더>/*.pdf 목록을 (벤더, 상대경로, 절대경로)로 반환."""
+    """reference_docs/<벤더>/[<유형>/]*.{pdf,xlsx} 목록을 스캔한다.
+
+    반환: [(벤더, 문서유형, 상대경로, 절대경로)]. 문서유형은 벤더 하위 폴더명
+    (config/release/issues 권장, 자유 형식) — 벤더 폴더 바로 아래 파일은 ''.
+    """
     root = settings.REFERENCE_DOCS_DIR
     vendors = {v for v, _ in Case.VENDOR_CHOICES}
     files = []
     if not root.exists():
         return files
-    for pdf in sorted(root.rglob('*.pdf')):
-        vendor = pdf.parent.name
-        if vendor not in vendors:
-            logger.warning('reference_docs: 알 수 없는 벤더 폴더 무시: %s', pdf)
+    for path in sorted(list(root.rglob('*.pdf')) + list(root.rglob('*.xlsx'))):
+        if path.name.startswith('~$'):  # 엑셀 임시 파일
             continue
-        files.append((vendor, str(pdf.relative_to(root)), pdf))
+        relative = path.relative_to(root)
+        vendor = relative.parts[0]
+        if vendor not in vendors:
+            logger.warning('reference_docs: 알 수 없는 벤더 폴더 무시: %s', path)
+            continue
+        doc_type = relative.parts[1] if len(relative.parts) > 2 else ''
+        files.append((vendor, doc_type, str(relative), path))
     return files
 
 
@@ -123,9 +131,40 @@ def chunk_pages(pages):
     return chunks
 
 
-def ingest_file(vendor, relative_path, path, force=False, log=lambda msg: None):
-    """PDF 1개를 인제스트. 해시가 같으면 건너뜀 (force=True로 강제 재처리).
+def extract_xlsx_rows(path):
+    """엑셀에서 데이터 행을 추출해 행 단위 청크로 만든다.
 
+    각 시트의 첫 비어있지 않은 행을 헤더로 보고, 이후 행을
+    "컬럼명: 값" 목록 텍스트로 변환 — 이슈 1행 = 청크 1개가 되어
+    PDF 청킹보다 검색 단위가 정확하다.
+    반환: (제목, [{'page_start': 행번호, 'page_end': 행번호, 'text'}])
+    """
+    from openpyxl import load_workbook
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    chunks = []
+    for sheet in workbook.worksheets:
+        header = None
+        for row_number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+            values = ['' if v is None else str(v).strip() for v in row]
+            if not any(values):
+                continue
+            if header is None:
+                header = values
+                continue
+            pairs = [f'{h}: {v}' for h, v in zip(header, values) if h and v]
+            if not pairs:
+                continue
+            text = f'[{sheet.title} 시트 {row_number}행]\n' + '\n'.join(pairs)
+            chunks.append({'page_start': row_number, 'page_end': row_number,
+                           'text': text[:CHUNK_CHARS]})
+    workbook.close()
+    return path.stem, chunks
+
+
+def ingest_file(vendor, doc_type, relative_path, path, force=False, log=lambda msg: None):
+    """문서 1개를 인제스트 (PDF=페이지 청킹, XLSX=행 단위 청킹).
+
+    해시가 같으면 건너뜀 (force=True로 강제 재처리).
     반환: 'skipped' | 'created' | 'updated'
     """
     sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -135,18 +174,26 @@ def ingest_file(vendor, relative_path, path, force=False, log=lambda msg: None):
         return 'skipped'
 
     log('  텍스트 추출 중...')
-    pages = extract_pages(path)
-    chunks = chunk_pages(pages)
-    log(f'  {len(pages)}쪽 → 청크 {len(chunks)}개, 임베딩 호출 중...')
+    if path.suffix.lower() == '.xlsx':
+        title, chunks = extract_xlsx_rows(path)
+        page_count = chunks[-1]['page_end'] if chunks else 0
+        log(f'  데이터 {len(chunks)}행 → 청크 {len(chunks)}개, 임베딩 호출 중...')
+    else:
+        pages = extract_pages(path)
+        title = extract_title(pages)
+        page_count = pages[-1][0] if pages else 0
+        chunks = chunk_pages(pages)
+        log(f'  {len(pages)}쪽 → 청크 {len(chunks)}개, 임베딩 호출 중...')
     vectors = embed_texts([c['text'] for c in chunks], model=model)
 
     outcome = 'updated' if doc else 'created'
     if doc is None:
         doc = ReferenceDocument(filename=relative_path)
     doc.vendor = vendor
-    doc.title = extract_title(pages)
+    doc.doc_type = doc_type
+    doc.title = title
     doc.sha256 = sha256
-    doc.page_count = pages[-1][0] if pages else 0
+    doc.page_count = page_count
     doc.chunk_count = len(chunks)
     doc.embedding_model = model
     doc.save()
@@ -164,8 +211,10 @@ def ingest_file(vendor, relative_path, path, force=False, log=lambda msg: None):
 
 # ---------------------------------------------------------------- 검색
 
-# 프로세스 내 벡터 캐시: (모델, 청크 수, 최신 문서 updated_at)이 같으면 재사용
-_cache = {'key': None, 'matrix': None, 'chunk_ids': None}
+# 프로세스 내 벡터 캐시: (모델, 청크 수, 최신 문서 updated_at)이 같으면 재사용.
+# vendors/doc_types는 청크별 메타데이터 배열 — 필터를 랭킹 전에 적용하기 위함.
+_cache = {'key': None, 'matrix': None, 'chunk_ids': None,
+          'vendors': None, 'doc_types': None}
 
 
 def _invalidate_cache():
@@ -178,36 +227,54 @@ def _load_matrix(model):
         n=Max('id'), latest=Max('document__updated_at'))
     key = (model, stats['n'], stats['latest'])
     if _cache['key'] == key and _cache['matrix'] is not None:
-        return _cache['matrix'], _cache['chunk_ids']
+        return _cache
 
     rows = list(ReferenceChunk.objects.filter(embedding_model=model)
-                .values_list('id', 'embedding'))
+                .values_list('id', 'embedding', 'document__vendor',
+                             'document__doc_type'))
     if not rows:
-        return None, None
-    matrix = np.vstack([np.frombuffer(e, dtype=np.float32) for _, e in rows])
+        return None
+    matrix = np.vstack([np.frombuffer(r[1], dtype=np.float32) for r in rows])
     # 코사인용 정규화 (OpenAI 임베딩은 이미 단위 벡터지만 방어적으로)
     matrix /= np.linalg.norm(matrix, axis=1, keepdims=True)
-    _cache.update(key=key, matrix=matrix, chunk_ids=[i for i, _ in rows])
-    return matrix, _cache['chunk_ids']
+    _cache.update(
+        key=key, matrix=matrix,
+        chunk_ids=[r[0] for r in rows],
+        vendors=np.array([r[2] for r in rows]),
+        doc_types=np.array([r[3] for r in rows]),
+    )
+    return _cache
 
 
-def search(query, vendor='', top_k=5):
+def search(query, vendor='', doc_type='', top_k=5):
     """질문과 가장 유사한 문서 청크를 반환.
 
-    반환: [{'document', 'title', 'vendor', 'pages', 'score', 'text'}]
+    doc_type: 'config'/'release'/'issues' 등 폴더명 필터 (빈 값=전체).
+    필터는 랭킹 전에 적용 — 필터 대상이 전역 상위권 밖이어도 결과가 나온다.
+    반환: [{'document', 'title', 'vendor', 'doc_type', 'pages', 'score', 'text'}]
     임베딩된 문서가 없으면 빈 목록.
     """
     model = settings.EMBEDDING_MODEL
-    matrix, chunk_ids = _load_matrix(model)
-    if matrix is None:
+    cache = _load_matrix(model)
+    if cache is None:
+        return []
+    matrix, chunk_ids = cache['matrix'], cache['chunk_ids']
+
+    mask = np.ones(len(chunk_ids), dtype=bool)
+    if vendor:
+        mask &= cache['vendors'] == vendor
+    if doc_type:
+        mask &= cache['doc_types'] == doc_type
+    candidates = np.flatnonzero(mask)
+    if candidates.size == 0:
         return []
 
     vector = embed_texts([query], model=model)[0]
     vector /= np.linalg.norm(vector)
-    scores = matrix @ vector
+    scores = matrix[candidates] @ vector
+    order = candidates[np.argsort(-scores)[:top_k]]
+    score_by_index = dict(zip(candidates.tolist(), scores.tolist()))
 
-    # 벤더 필터는 상위 후보를 넉넉히 뽑은 뒤 적용 (행렬은 전 벤더 공용)
-    order = np.argsort(-scores)[:top_k * 8]
     picked = (ReferenceChunk.objects.filter(id__in=[chunk_ids[i] for i in order])
               .select_related('document'))
     by_id = {c.id: c for c in picked}
@@ -217,16 +284,15 @@ def search(query, vendor='', top_k=5):
         chunk = by_id.get(chunk_ids[i])
         if chunk is None:
             continue
-        if vendor and chunk.document.vendor != vendor:
-            continue
+        is_sheet = chunk.document.filename.lower().endswith('.xlsx')
         results.append({
             'document': chunk.document.filename,
             'title': chunk.document.title,
             'vendor': chunk.document.vendor,
-            'pages': f'p.{chunk.page_start}-{chunk.page_end}',
-            'score': round(float(scores[i]), 4),
+            'doc_type': chunk.document.doc_type,
+            'pages': (f'{chunk.page_start}행' if is_sheet
+                      else f'p.{chunk.page_start}-{chunk.page_end}'),
+            'score': round(float(score_by_index[int(i)]), 4),
             'text': chunk.text,
         })
-        if len(results) >= top_k:
-            break
     return results

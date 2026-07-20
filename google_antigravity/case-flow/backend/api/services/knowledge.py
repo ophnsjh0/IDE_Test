@@ -149,12 +149,21 @@ def enrich_with_references(item, top_k=5):
     """
     from . import references as refdocs
 
+    from api.models import ReferenceDocument
+
     query = ' '.join(filter(None, [
         item.title, item.device_model, item.software_version,
         item.resolution[:300],
     ]))
+    # 문서 유형별로 후보를 따로 뽑는다 — 이슈 행처럼 청크 수가 많은 유형이
+    # 후보를 독식해 가이드 섹션이 밀려나는 것 방지
+    doc_types = list(ReferenceDocument.objects.filter(vendor=item.vendor)
+                     .values_list('doc_type', flat=True).distinct())
     try:
-        candidates = refdocs.search(query, vendor=item.vendor, top_k=top_k)
+        candidates = []
+        for doc_type in (doc_types or ['']):
+            candidates.extend(refdocs.search(query, vendor=item.vendor,
+                                             doc_type=doc_type, top_k=top_k))
     except refdocs.EmbeddingUnavailable:
         return 'unavailable'
     if not candidates:

@@ -283,6 +283,9 @@ _SEARCH_TOOL_DEFS = {
                 'query': {'type': 'string', 'description': '검색 질문 (영어 기술 용어 권장)'},
                 'vendor': {'type': 'string', 'enum': ['A10', 'Arista', 'HPE Aruba', 'Juniper'],
                            'description': '벤더 필터 (선택 — 장비가 특정되면 지정)'},
+                'doc_type': {'type': 'string',
+                             'description': ('문서 유형 필터 (선택): config=설정 가이드, '
+                                             'release=릴리즈 노트(버그·패치), issues=사내 이슈 이력')},
                 'top_k': {'type': 'integer', 'description': '결과 수 (기본 5, 최대 8)'},
             },
             'required': ['query'],
@@ -360,11 +363,12 @@ def _search_cases(query='', vendor='', status='', limit=10):
     return json.dumps({'results': rows, 'count': len(rows)}, ensure_ascii=False)
 
 
-def _search_references(query='', vendor='', top_k=5):
+def _search_references(query='', vendor='', doc_type='', top_k=5):
     from . import references
     top_k = min(int(top_k or 5), 8)
     try:
-        results = references.search(query, vendor=vendor, top_k=top_k)
+        results = references.search(query, vendor=vendor, doc_type=doc_type,
+                                    top_k=top_k)
     except references.EmbeddingUnavailable as e:
         return json.dumps({'error': str(e)}, ensure_ascii=False)
     if not results:

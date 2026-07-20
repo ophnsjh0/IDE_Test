@@ -1588,19 +1588,49 @@ class ReferenceSearchTests(TestCase):
                  patch.object(references, 'embed_texts',
                               return_value=np.ones((1, 4), dtype=np.float32)) as embed:
                 self.assertEqual(
-                    references.ingest_file('A10', 'A10/guide.pdf', pdf), 'created')
-                doc = ReferenceDocument.objects.get(filename='A10/guide.pdf')
+                    references.ingest_file('A10', 'config', 'A10/config/guide.pdf', pdf),
+                    'created')
+                doc = ReferenceDocument.objects.get(filename='A10/config/guide.pdf')
                 self.assertEqual(doc.title, 'ACOS 6.0.8 Test Guide')
+                self.assertEqual(doc.doc_type, 'config')
                 self.assertEqual(doc.chunk_count, 1)
                 # 같은 파일 재실행 → 임베딩 호출 없이 건너뜀
                 embed.reset_mock()
                 self.assertEqual(
-                    references.ingest_file('A10', 'A10/guide.pdf', pdf), 'skipped')
+                    references.ingest_file('A10', 'config', 'A10/config/guide.pdf', pdf),
+                    'skipped')
                 embed.assert_not_called()
                 # --force → 재처리
                 self.assertEqual(
-                    references.ingest_file('A10', 'A10/guide.pdf', pdf, force=True),
+                    references.ingest_file('A10', 'config', 'A10/config/guide.pdf', pdf,
+                                           force=True),
                     'updated')
+
+    def test_xlsx_rows_become_chunks(self):
+        import tempfile
+        from pathlib import Path
+        from openpyxl import Workbook
+        from .services import references
+
+        with tempfile.TemporaryDirectory() as tmp:
+            xlsx = Path(tmp) / 'issues.xlsx'
+            wb = Workbook()
+            ws = wb.active
+            ws.title = '이슈'
+            ws.append(['이슈번호', '장비', '증상', '조치'])
+            ws.append(['I-001', 'TH3350', 'RST 발생', 'P14 업그레이드'])
+            ws.append([None, None, None, None])  # 빈 행은 무시
+            ws.append(['I-002', 'AP730', None, 'RMA 진행'])  # 빈 셀은 생략
+            wb.save(xlsx)
+
+            title, chunks = references.extract_xlsx_rows(xlsx)
+            self.assertEqual(title, 'issues')
+            self.assertEqual(len(chunks), 2)
+            self.assertIn('이슈번호: I-001', chunks[0]['text'])
+            self.assertIn('[이슈 시트 2행]', chunks[0]['text'])
+            self.assertIn('조치: RMA 진행', chunks[1]['text'])
+            self.assertNotIn('증상:', chunks[1]['text'])  # 빈 셀 생략
+            self.assertEqual(chunks[1]['page_start'], 4)  # 실제 행 번호 유지
 
 
 class BackfillTranslationTests(TestCase):
