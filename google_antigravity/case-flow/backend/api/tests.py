@@ -1398,6 +1398,95 @@ class UsageEventTests(TestCase):
         self.assertEqual(uv1['logins'], 1)
 
 
+class KnowledgeBaseTests(TestCase):
+    """지식 베이스 — 추출 서비스 필터링, API 권한, 에이전트 검색 도구."""
+
+    def setUp(self):
+        from .permissions import set_user_role
+        for username, role in (('kv1', 'viewer'), ('ke1', 'engineer'), ('ka1', 'admin')):
+            user = User.objects.create_user(username, password='knowledge-pass-1!')
+            set_user_role(user, role)
+        self.case = make_case(vendor='A10', status='Resolved',
+                              summary='SSL RST 케이스', resolution='P14 업그레이드')
+        make_email(self.case, 'Re: Case # 1 SSL RST')
+
+    def login(self, username):
+        self.client.post('/api/auth/login/',
+                         {'username': username, 'password': 'knowledge-pass-1!'},
+                         content_type='application/json')
+
+    def make_item(self, **kwargs):
+        from .models import KnowledgeItem
+        defaults = dict(case=self.case, vendor='A10', title='SSL RST 해결',
+                        problem='RST 발생', resolution='ACOS 5.2.1-P14 업그레이드')
+        defaults.update(kwargs)
+        return KnowledgeItem.objects.create(**defaults)
+
+    def test_extract_saves_draft_with_case_fallback_fields(self):
+        from .services import knowledge
+        self.case.device_model = 'TH5440S'
+        self.case.save()
+        result = {'has_knowledge': True, 'title': '제목', 'problem': '문제',
+                  'root_cause': '원인', 'resolution': 'CLI 조치',
+                  'device_model': '', 'software_version': '5.2.1-P7'}
+        with patch.object(knowledge, 'generate_structured', return_value=result):
+            outcome, item = knowledge.extract_knowledge(self.case)
+        self.assertEqual(outcome, 'created')
+        self.assertEqual(item.status, 'draft')
+        # AI가 빈 값을 준 필드는 케이스 값으로 폴백
+        self.assertEqual(item.device_model, 'TH5440S')
+        self.assertEqual(item.software_version, '5.2.1-P7')
+
+    def test_extract_skips_no_knowledge_and_existing(self):
+        from .services import knowledge
+        no_knowledge = {'has_knowledge': False, 'title': '', 'problem': '',
+                        'root_cause': '', 'resolution': '',
+                        'device_model': '', 'software_version': ''}
+        with patch.object(knowledge, 'generate_structured', return_value=no_knowledge):
+            outcome, item = knowledge.extract_knowledge(self.case)
+        self.assertEqual((outcome, item), ('no_knowledge', None))
+
+        existing = self.make_item()
+        with patch.object(knowledge, 'generate_structured') as mocked:
+            outcome, item = knowledge.extract_knowledge(self.case)
+        mocked.assert_not_called()  # 기존 항목이 있으면 AI 호출 자체를 안 함
+        self.assertEqual((outcome, item), ('exists', existing))
+
+    def test_api_roles_and_confirm_flow(self):
+        item = self.make_item()
+        url = f'/api/knowledge/{item.id}/'
+
+        self.login('kv1')  # viewer: 조회만
+        self.assertEqual(self.client.get('/api/knowledge/').status_code, 200)
+        self.assertEqual(self.client.patch(url, {'status': 'confirmed'},
+                                           content_type='application/json').status_code, 403)
+        self.assertEqual(self.client.delete(url).status_code, 403)
+
+        self.login('ke1')  # engineer: 수정·확정 가능, 삭제 불가
+        res = self.client.patch(url, {'status': 'confirmed', 'title': '수정된 제목'},
+                                content_type='application/json')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()['status'], 'confirmed')
+        self.assertEqual(res.json()['title'], '수정된 제목')
+        self.assertEqual(res.json()['source_case']['case_id'], self.case.case_id)
+        self.assertEqual(self.client.delete(url).status_code, 403)
+
+        self.login('ka1')  # admin: 삭제 가능
+        self.assertEqual(self.client.delete(url).status_code, 204)
+
+    def test_search_knowledge_tool_filters_and_prefers_confirmed(self):
+        self.make_item(title='VRRP 페일오버 반복', resolution='preempt 설정 수정',
+                       status='confirmed')
+        self.make_item(title='VRRP 로그 문의', resolution='로그 레벨 조정')
+        result = json.loads(help_agent._search_knowledge('VRRP'))
+        self.assertEqual(result['count'], 2)
+        self.assertEqual(result['results'][0]['status'], 'confirmed')  # 확정 우선
+        self.assertEqual(result['results'][0]['source_case'], self.case.case_id)
+        # 본문(해결 조치) 키워드로도 검색된다
+        self.assertEqual(json.loads(help_agent._search_knowledge('preempt'))['count'], 1)
+        self.assertEqual(json.loads(help_agent._search_knowledge('없는키워드'))['count'], 0)
+
+
 class BackfillTranslationTests(TestCase):
     """backfill_translations — 번역 누락 메일만 채우고 케이스 필드는 불변."""
 

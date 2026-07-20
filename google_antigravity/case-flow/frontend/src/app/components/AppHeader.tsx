@@ -5,6 +5,7 @@ import { useEffect, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { Group, Title, Button, Text } from '@mantine/core';
 import {
+  IconBook2,
   IconLayoutDashboard,
   IconList,
   IconLogout,
@@ -70,6 +71,15 @@ export default function AppHeader() {
           leftSection={<IconLayoutDashboard size={16} />}
         >
           대시보드
+        </Button>
+        <Button
+          component={Link}
+          href="/knowledge"
+          size="sm"
+          variant={pathname.startsWith('/knowledge') ? 'light' : 'subtle'}
+          leftSection={<IconBook2 size={16} />}
+        >
+          지식 베이스
         </Button>
         {isAdmin && (
           <Button

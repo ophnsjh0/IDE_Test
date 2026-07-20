@@ -26,7 +26,7 @@ from django.conf import settings
 from django.db.models import Count, Q
 from django.utils import timezone
 
-from ..models import AppSetting, Case
+from ..models import AppSetting, Case, KnowledgeItem
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,10 @@ SEARCH_SYSTEM_PROMPT = """당신은 Case-Flow(벤더 TAC 케이스 관리 시스
 - 케이스에 대한 질문에는 반드시 도구로 DB를 조회한 뒤, 조회 결과에 근거해 답하세요.
 - 도구 결과에 없는 케이스 번호나 내용을 지어내지 마세요. 결과가 없으면 없다고 답하세요.
 - 케이스를 언급할 때는 항상 C-번호(예: C-1122)를 함께 표기하세요.
+- "예전에 어떻게 해결했나", "해결 방법·조치·커맨드"를 묻는 질문에는 먼저
+  search_knowledge(지식 베이스: 과거 케이스에서 정리한 문제-원인-해결)를 조회하고,
+  결과가 없으면 search_cases로 케이스를 직접 검색하세요. 지식 항목을 인용할 때는
+  K-번호와 출처 케이스 C-번호를 함께 표기하세요.
 - 유사 사례를 찾을 때는 증상 키워드(예: failover, VRRP, 파티션)로 검색하고,
   장비 모델이 주어지면 device 필터를 활용하세요.
 - 한국어로 간결하게 답하세요. 표가 유용하면 마크다운 표를 사용하세요.
@@ -244,6 +248,23 @@ _SEARCH_TOOL_DEFS = {
             },
         },
     },
+    'search_knowledge': {
+        'name': 'search_knowledge',
+        'description': (
+            '지식 베이스(과거 케이스에서 추출·검증한 문제-원인-해결 정리)를 검색한다. '
+            '해결 방법·원인·조치 커맨드를 묻는 질문에 케이스 검색보다 먼저 사용할 것. '
+            'query는 제목/문제/원인/해결 본문에 대한 키워드 부분일치(공백 AND).'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'query': {'type': 'string', 'description': '검색 키워드 (증상, 에러, 장비명, 커맨드 등)'},
+                'vendor': {'type': 'string', 'enum': ['A10', 'Arista', 'HPE Aruba', 'Juniper'],
+                           'description': '벤더 필터 (선택)'},
+                'limit': {'type': 'integer', 'description': '최대 결과 수 (기본 5, 최대 10)'},
+            },
+        },
+    },
     'web_search': {
         'name': 'web_search',
         'description': (
@@ -313,6 +334,35 @@ def _search_cases(query='', vendor='', status='', limit=10):
             | Q(software_version__icontains=keyword)
         )
     rows = [_case_summary_row(c) for c in cases.order_by('-updated_at')[:limit]]
+    return json.dumps({'results': rows, 'count': len(rows)}, ensure_ascii=False)
+
+
+def _search_knowledge(query='', vendor='', limit=5):
+    limit = min(int(limit or 5), 10)
+    items = KnowledgeItem.objects.select_related('case')
+    if vendor:
+        items = items.filter(vendor=vendor)
+    for keyword in (query or '').split():
+        items = items.filter(
+            Q(title__icontains=keyword)
+            | Q(problem__icontains=keyword)
+            | Q(root_cause__icontains=keyword)
+            | Q(resolution__icontains=keyword)
+            | Q(device_model__icontains=keyword)
+            | Q(software_version__icontains=keyword)
+        )
+    rows = [{
+        'knowledge_id': item.knowledge_id,
+        'vendor': item.vendor,
+        'title': item.title,
+        'problem': item.problem,
+        'root_cause': item.root_cause,
+        'resolution': item.resolution,
+        'device_model': item.device_model,
+        'software_version': item.software_version,
+        'status': item.status,  # draft=AI 초안(미검증), confirmed=엔지니어 확인됨
+        'source_case': item.case.case_id if item.case else None,
+    } for item in items.order_by('status', '-created_at')[:limit]]  # confirmed 우선
     return json.dumps({'results': rows, 'count': len(rows)}, ensure_ascii=False)
 
 
@@ -445,6 +495,7 @@ def _web_search(query, num_results=8):
 
 TOOL_HANDLERS = {
     'search_cases': _search_cases,
+    'search_knowledge': _search_knowledge,
     'get_case_detail': _get_case_detail,
     'get_case_stats': _get_case_stats,
     'list_recent_cases': _list_recent_cases,
@@ -494,7 +545,8 @@ def _agent_configs():
         'search': {
             'model': settings.HELP_AGENT_MODEL,
             'system': SEARCH_SYSTEM_PROMPT + SCOPE_GUARD,
-            'tools': tools('search_cases', 'get_case_detail', 'get_case_stats'),
+            'tools': tools('search_knowledge', 'search_cases',
+                           'get_case_detail', 'get_case_stats'),
         },
         'report': {
             'model': settings.REPORT_AGENT_MODEL,
@@ -512,7 +564,8 @@ def _agent_configs():
         'tech': {
             'model': settings.TECH_AGENT_MODEL,
             'system': TECH_SYSTEM_PROMPT + SCOPE_GUARD,
-            'tools': tools('web_search', 'search_cases', 'get_case_detail'),
+            'tools': tools('web_search', 'search_knowledge',
+                           'search_cases', 'get_case_detail'),
             'max_tokens': 6000,
         },
     }

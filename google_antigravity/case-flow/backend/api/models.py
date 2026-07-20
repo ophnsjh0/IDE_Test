@@ -74,6 +74,7 @@ class UsageEvent(models.Model):
         ('agent_chat', 'AI Agent Chat'),
         ('report_download', 'Report Download'),
         ('gmail_sync', 'Gmail Sync'),
+        ('knowledge_view', 'Knowledge View'),
     ]
 
     user = models.ForeignKey(django_settings.AUTH_USER_MODEL, null=True, blank=True,
@@ -133,6 +134,42 @@ class Case(models.Model):
     @property
     def case_id(self):
         return f"C-{1000 + self.id}"
+
+
+class KnowledgeItem(models.Model):
+    """해결된 케이스에서 추출한 재사용 가능한 기술 지식 (문제-원인-해결).
+
+    AI가 초안(draft)으로 만들고 엔지니어가 확인 후 확정(confirmed)한다.
+    출처 케이스가 삭제돼도 지식은 남도록 SET_NULL.
+    """
+    STATUS_CHOICES = [
+        ('draft', 'AI Draft'),
+        ('confirmed', 'Confirmed'),
+    ]
+
+    case = models.ForeignKey(Case, null=True, blank=True, on_delete=models.SET_NULL,
+                             related_name='knowledge_items')
+    vendor = models.CharField(max_length=50, choices=Case.VENDOR_CHOICES)
+    title = models.CharField(max_length=200)          # 문제 한 줄 요약 (목록 표시용)
+    problem = models.TextField()                      # 증상/문제 상황
+    root_cause = models.TextField(blank=True, default='')
+    resolution = models.TextField()                   # 해결 조치 (CLI 커맨드 포함)
+    device_model = models.CharField(max_length=100, blank=True, default='')
+    software_version = models.CharField(max_length=50, blank=True, default='')
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='draft')
+    analyzed_by = models.CharField(max_length=100, blank=True, default='')  # 추출 모델 id
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.knowledge_id} [{self.vendor}] {self.title}"
+
+    @property
+    def knowledge_id(self):
+        return f"K-{100 + self.id}"
 
 
 class CaseEmail(models.Model):

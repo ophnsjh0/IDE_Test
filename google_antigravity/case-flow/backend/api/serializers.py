@@ -1,7 +1,7 @@
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import Case, CaseEmail
+from .models import Case, CaseEmail, KnowledgeItem
 
 
 class CaseEmailSerializer(serializers.ModelSerializer):
@@ -28,6 +28,25 @@ class CaseSerializer(serializers.ModelSerializer):
                   'device_model', 'device_serial', 'software_version',
                   'analyzed_by', 'date', 'created_at']
         read_only_fields = ['analyzed_by']
+
+
+class KnowledgeItemSerializer(serializers.ModelSerializer):
+    knowledge_id = serializers.ReadOnlyField()
+    source_case = serializers.SerializerMethodField()
+
+    def get_source_case(self, obj):
+        if obj.case is None:
+            return None
+        return {'id': obj.case.id, 'case_id': obj.case.case_id,
+                'status': obj.case.status,
+                'vendor_case_number': obj.case.vendor_case_number}
+
+    class Meta:
+        model = KnowledgeItem
+        fields = ['id', 'knowledge_id', 'vendor', 'title', 'problem', 'root_cause',
+                  'resolution', 'device_model', 'software_version', 'status',
+                  'analyzed_by', 'source_case', 'created_at', 'updated_at']
+        read_only_fields = ['vendor', 'analyzed_by']
 
 
 class CaseDetailSerializer(CaseSerializer):

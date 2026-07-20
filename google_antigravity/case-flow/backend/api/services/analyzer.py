@@ -222,6 +222,61 @@ _PROVIDER_ANALYZERS = {
 }
 
 
+def generate_structured(system, user_content, schema, max_tokens=16000):
+    """임의 프롬프트+JSON 스키마로 구조화 응답을 생성하는 범용 헬퍼.
+
+    analyze_email과 동일하게 현재 번역 모델 설정을 따라 제공자를 라우팅하며,
+    실패/키 미설정 시 None을 반환한다. 지식 추출 등 분석 외 작업용.
+    """
+    model = get_translation_model()
+    provider = detect_provider(model)
+    if not provider_api_key(provider):
+        logger.warning("API key for %s not set; skipping structured generation.", provider)
+        return None
+
+    try:
+        if provider == 'anthropic':
+            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+            response = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                output_config={"format": {"type": "json_schema", "schema": schema}},
+                messages=[{"role": "user", "content": user_content}],
+            )
+            return _parse_response(response)
+        if provider == 'openai':
+            from openai import OpenAI
+            client = OpenAI(api_key=settings.OPENAI_API_KEY)
+            response = client.chat.completions.create(
+                model=model,
+                max_completion_tokens=max_tokens,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": user_content}],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": "extraction", "schema": schema, "strict": True},
+                },
+            )
+            return json.loads(response.choices[0].message.content)
+        from google import genai
+        client = genai.Client(api_key=settings.GOOGLE_API_KEY)
+        response = client.models.generate_content(
+            model=model,
+            contents=user_content,
+            config={
+                "system_instruction": system,
+                "response_mime_type": "application/json",
+                "response_schema": _gemini_schema(schema),
+                "max_output_tokens": max_tokens,
+            },
+        )
+        return json.loads(response.text)
+    except Exception:
+        logger.exception("Structured generation failed (%s/%s)", provider, model)
+        return None
+
+
 def analyze_email(subject, body, direction, is_new_case, case_context=''):
     """메일 1건을 번역+분석. 실패 또는 API 키 미설정 시 None을 반환하고,
     호출 측은 원문 그대로 저장하는 폴백으로 처리한다.

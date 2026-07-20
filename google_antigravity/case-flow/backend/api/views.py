@@ -16,9 +16,10 @@ from rest_framework.views import APIView
 
 from django.conf import settings
 
-from .models import AppSetting, Case, UsageEvent
+from .models import AppSetting, Case, KnowledgeItem, UsageEvent
 from .permissions import IsAdminRole, IsEngineerOrAbove
-from .serializers import CaseSerializer, CaseDetailSerializer
+from .serializers import (CaseSerializer, CaseDetailSerializer,
+                          KnowledgeItemSerializer)
 from .services.usage import log_event
 from .services.analyzer import (
     AVAILABLE_MODELS,
@@ -128,6 +129,37 @@ class CaseRelationView(APIView):
                             status=status.HTTP_404_NOT_FOUND)
         case.related_cases.remove(other)
         return Response({'message': f'{other.case_id} 참조가 해제되었습니다.'})
+
+
+class KnowledgeListView(generics.ListAPIView):
+    """GET /api/knowledge/ — 지식 베이스 목록 (전 역할 조회).
+
+    항목 생성은 extract_knowledge 커맨드(AI 추출)로만 이루어진다.
+    """
+    queryset = KnowledgeItem.objects.select_related('case')
+    serializer_class = KnowledgeItemSerializer
+
+    def get(self, request, *args, **kwargs):
+        log_event(request.user, 'knowledge_view', detail='list')
+        return super().get(request, *args, **kwargs)
+
+
+class KnowledgeDetailView(generics.RetrieveUpdateDestroyAPIView):
+    queryset = KnowledgeItem.objects.select_related('case')
+    serializer_class = KnowledgeItemSerializer
+    lookup_field = 'id'
+
+    def get_permissions(self):
+        # 케이스와 동일한 규칙: 조회 전 역할, 수정(확정 포함) 엔지니어 이상, 삭제 관리자
+        if self.request.method == 'DELETE':
+            return [IsAdminRole()]
+        if self.request.method in ('PUT', 'PATCH'):
+            return [IsEngineerOrAbove()]
+        return super().get_permissions()
+
+    def get(self, request, *args, **kwargs):
+        log_event(request.user, 'knowledge_view', detail=f"K-{100 + kwargs['id']}")
+        return super().get(request, *args, **kwargs)
 
 
 class TranslationModelView(APIView):
