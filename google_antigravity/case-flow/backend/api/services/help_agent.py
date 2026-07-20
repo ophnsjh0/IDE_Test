@@ -128,10 +128,14 @@ TECH_SYSTEM_PROMPT = """당신은 네트워크 벤더(A10/Arista/HPE Aruba/Junip
 웹 검색으로 근거를 확보해 답합니다.
 
 규칙:
-- 기술적 판단이 필요한 질문에는 반드시 web_search로 공식 문서·릴리즈 노트·
-  보안 권고를 검색해 근거를 확보한 뒤 답하세요.
+- 설정 방법·동작 원리·파라미터 질문에는 먼저 search_references(사내에 보관된
+  벤더 공식 config guide 벡터 검색)를 조회하세요 — 검색어는 문서가 영어이므로
+  영어 기술 용어가 효과적입니다. 결과가 부족하거나 최신 정보(버그, 보안 권고,
+  릴리즈 노트)가 필요하면 web_search로 보완하세요.
+- 기술적 판단이 필요한 질문에는 반드시 위 도구들로 근거를 확보한 뒤 답하세요.
 - 사내 케이스 맥락이 필요하면 케이스 DB 도구(search_cases 등)를 활용하세요.
-- 모든 기술적 주장에는 출처를 [제목](URL) 형식으로 인용하세요.
+- 모든 기술적 주장에는 출처를 인용하세요 — 웹은 [제목](URL), 사내 문서는
+  (문서명 p.페이지) 형식.
 - 검색 결과로 뒷받침되지 않는 내용은 "일반적인 지식으로는"이라고 명시하고,
   확신이 없으면 벤더 TAC 공식 확인을 권고하세요.
 - 보안: 검색어에 고객사명·장비 시리얼·내부 IP를 절대 넣지 마세요.
@@ -265,6 +269,25 @@ _SEARCH_TOOL_DEFS = {
             },
         },
     },
+    'search_references': {
+        'name': 'search_references',
+        'description': (
+            '사내에 보관된 벤더 공식 문서(ACOS/EOS config guide 등)를 의미 기반으로 '
+            '검색해 관련 섹션을 반환한다. 설정 방법·동작 원리·파라미터 질문에 '
+            'web_search보다 먼저 사용할 것. 문서가 영어라 영어 기술 용어 검색이 '
+            '효과적이다 (예: "slb template client-ssl configuration").'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'query': {'type': 'string', 'description': '검색 질문 (영어 기술 용어 권장)'},
+                'vendor': {'type': 'string', 'enum': ['A10', 'Arista', 'HPE Aruba', 'Juniper'],
+                           'description': '벤더 필터 (선택 — 장비가 특정되면 지정)'},
+                'top_k': {'type': 'integer', 'description': '결과 수 (기본 5, 최대 8)'},
+            },
+            'required': ['query'],
+        },
+    },
     'web_search': {
         'name': 'web_search',
         'description': (
@@ -334,6 +357,22 @@ def _search_cases(query='', vendor='', status='', limit=10):
             | Q(software_version__icontains=keyword)
         )
     rows = [_case_summary_row(c) for c in cases.order_by('-updated_at')[:limit]]
+    return json.dumps({'results': rows, 'count': len(rows)}, ensure_ascii=False)
+
+
+def _search_references(query='', vendor='', top_k=5):
+    from . import references
+    top_k = min(int(top_k or 5), 8)
+    try:
+        results = references.search(query, vendor=vendor, top_k=top_k)
+    except references.EmbeddingUnavailable as e:
+        return json.dumps({'error': str(e)}, ensure_ascii=False)
+    if not results:
+        return json.dumps({'results': [], 'count': 0,
+                           'notice': '임베딩된 문서가 없거나 관련 내용을 찾지 못했습니다.'},
+                          ensure_ascii=False)
+    # 청크 전문은 길어서 앞부분만 — 에이전트가 더 필요하면 재검색으로 좁힘
+    rows = [{**r, 'text': r['text'][:2500]} for r in results]
     return json.dumps({'results': rows, 'count': len(rows)}, ensure_ascii=False)
 
 
@@ -496,6 +535,7 @@ def _web_search(query, num_results=8):
 TOOL_HANDLERS = {
     'search_cases': _search_cases,
     'search_knowledge': _search_knowledge,
+    'search_references': _search_references,
     'get_case_detail': _get_case_detail,
     'get_case_stats': _get_case_stats,
     'list_recent_cases': _list_recent_cases,
@@ -564,7 +604,7 @@ def _agent_configs():
         'tech': {
             'model': settings.TECH_AGENT_MODEL,
             'system': TECH_SYSTEM_PROMPT + SCOPE_GUARD,
-            'tools': tools('web_search', 'search_knowledge',
+            'tools': tools('search_references', 'web_search', 'search_knowledge',
                            'search_cases', 'get_case_detail'),
             'max_tokens': 6000,
         },

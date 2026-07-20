@@ -19,4 +19,6 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "gunicorn>=26.0.0",
     "whitenoise>=6.12.0",
+    "pypdf>=6.14.2",
+    "numpy>=2.5.1",
 ]

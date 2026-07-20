@@ -172,6 +172,49 @@ class KnowledgeItem(models.Model):
         return f"K-{100 + self.id}"
 
 
+class ReferenceDocument(models.Model):
+    """벤더 공식 문서(config guide 등) 원본 1개. reference_docs/<벤더>/ 파일과 1:1.
+
+    파일 sha256으로 변경 감지 — 같은 해시면 인제스트를 건너뛰고,
+    바뀌면 청크를 지우고 다시 만든다 (ingest_references 커맨드).
+    """
+    vendor = models.CharField(max_length=50, choices=Case.VENDOR_CHOICES)
+    filename = models.CharField(max_length=255, unique=True)  # "A10/ACOS_6.0.8_ADC_Guide.pdf"
+    title = models.CharField(max_length=300, blank=True, default='')  # 첫 페이지에서 추출
+    sha256 = models.CharField(max_length=64)
+    page_count = models.IntegerField(default=0)
+    chunk_count = models.IntegerField(default=0)
+    embedding_model = models.CharField(max_length=100, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"[{self.vendor}] {self.filename} ({self.chunk_count} chunks)"
+
+
+class ReferenceChunk(models.Model):
+    """문서를 검색 단위로 자른 청크 + 임베딩 벡터.
+
+    embedding은 float32 배열의 raw bytes — 모델 교체 시 원문(text)은 그대로 두고
+    임베딩만 다시 만든다. 검색은 embedding_model이 현재 설정과 같은 청크만 대상.
+    """
+    document = models.ForeignKey(ReferenceDocument, related_name='chunks',
+                                 on_delete=models.CASCADE)
+    seq = models.IntegerField()                     # 문서 내 순번
+    page_start = models.IntegerField()
+    page_end = models.IntegerField()
+    text = models.TextField()
+    embedding = models.BinaryField()                # float32[dim] raw bytes
+    embedding_model = models.CharField(max_length=100)
+
+    class Meta:
+        ordering = ['document_id', 'seq']
+        indexes = [models.Index(fields=['embedding_model'])]
+
+    def __str__(self):
+        return f"{self.document.filename}#{self.seq} (p.{self.page_start}-{self.page_end})"
+
+
 class CaseEmail(models.Model):
     DIRECTION_CHOICES = [
         ('inbound', 'Inbound'),   # received from vendor

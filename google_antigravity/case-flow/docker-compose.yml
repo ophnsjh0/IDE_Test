@@ -44,6 +44,8 @@ services:
     volumes:
       - gmail_secrets:/app/secrets
       - ./backend/report_templates:/app/backend/report_templates:ro
+      # 벤더 문서 PDF — scp로 이관 후 ingest_references 실행 (docs/EMBEDDING.md)
+      - ./backend/reference_docs:/app/backend/reference_docs:ro
     ports:
       - "8000:8000"
     depends_on:

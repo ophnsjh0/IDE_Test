@@ -29,3 +29,4 @@ backend/staticfiles/
 
 # 사내 보고서 템플릿 — 실물 템플릿에 내부 정보(로고·결재선)가 들어가므로 커밋 금지
 backend/report_templates/
+backend/reference_docs/

@@ -1,5 +1,8 @@
 # Case Flow
 
+python manage.py search_references "VRRP preempt 동작 조건" --vendor A10
+python manage.py search_references "MLAG peer failure" --vendor Arista --full
+
 ## Project Structure
 
 - `frontend/`: Next.js frontend application.

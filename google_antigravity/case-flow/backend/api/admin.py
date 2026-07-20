@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Case, UsageEvent
+from .models import Case, ReferenceChunk, ReferenceDocument, UsageEvent
 
 @admin.register(Case)
 class CaseAdmin(admin.ModelAdmin):
@@ -7,6 +7,28 @@ class CaseAdmin(admin.ModelAdmin):
     list_filter = ('vendor', 'status')
     search_fields = ('summary', 'description')
     readonly_fields = ('created_at',)
+
+
+@admin.register(ReferenceDocument)
+class ReferenceDocumentAdmin(admin.ModelAdmin):
+    list_display = ('filename', 'vendor', 'title', 'page_count', 'chunk_count',
+                    'embedding_model', 'updated_at')
+    list_filter = ('vendor',)
+    readonly_fields = [f.name for f in ReferenceDocument._meta.fields]
+
+
+@admin.register(ReferenceChunk)
+class ReferenceChunkAdmin(admin.ModelAdmin):
+    list_display = ('document', 'seq', 'page_start', 'page_end', 'preview')
+    list_filter = ('document',)
+    search_fields = ('text',)
+    readonly_fields = ('document', 'seq', 'page_start', 'page_end', 'text',
+                       'embedding_model')
+    exclude = ('embedding',)  # 바이너리 벡터는 admin에 표시 불가
+
+    @admin.display(description='내용 미리보기')
+    def preview(self, obj):
+        return obj.text[:80]
 
 
 @admin.register(UsageEvent)

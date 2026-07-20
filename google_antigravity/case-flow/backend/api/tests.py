@@ -1487,6 +1487,94 @@ class KnowledgeBaseTests(TestCase):
         self.assertEqual(json.loads(help_agent._search_knowledge('없는키워드'))['count'], 0)
 
 
+class ReferenceSearchTests(TestCase):
+    """레퍼런스 문서 — 청킹, 해시 캐싱 인제스트, 벡터 검색 (임베딩 API는 모킹)."""
+
+    def setUp(self):
+        from .services import references
+        references._invalidate_cache()
+
+    def make_doc_with_chunks(self, vendor, filename, vectors_and_texts):
+        import numpy as np
+        from django.conf import settings
+        from .models import ReferenceChunk, ReferenceDocument
+        doc = ReferenceDocument.objects.create(
+            vendor=vendor, filename=filename, sha256='x' * 64,
+            embedding_model=settings.EMBEDDING_MODEL, chunk_count=len(vectors_and_texts))
+        for seq, (vec, text) in enumerate(vectors_and_texts):
+            ReferenceChunk.objects.create(
+                document=doc, seq=seq, page_start=seq + 1, page_end=seq + 1,
+                text=text, embedding=np.asarray(vec, dtype=np.float32).tobytes(),
+                embedding_model=settings.EMBEDDING_MODEL)
+        return doc
+
+    def test_chunk_pages_tracks_page_ranges_and_overlap(self):
+        from .services import references
+        pages = [(1, 'a' * 3000), (2, 'b' * 3000), (3, 'c' * 500)]
+        chunks = references.chunk_pages(pages)
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertEqual(chunks[0]['page_start'], 1)
+        # 첫 청크는 1페이지를 넘어 2페이지 내용까지 포함
+        self.assertEqual(chunks[0]['page_end'], 2)
+        self.assertTrue(all(len(c['text']) <= references.CHUNK_CHARS for c in chunks))
+        # 오버랩: 다음 청크 머리에 이전 청크 꼬리가 겹침
+        self.assertTrue(chunks[1]['text'].startswith(
+            chunks[0]['text'][-references.OVERLAP_CHARS + 100:][:100]))
+
+    def test_search_ranks_by_similarity_and_filters_vendor(self):
+        import numpy as np
+        from .services import references
+        self.make_doc_with_chunks('A10', 'A10/guide.pdf', [
+            ([1.0, 0.0, 0.0, 0.0], 'SSL 오프로드 섹션'),
+            ([0.0, 1.0, 0.0, 0.0], 'VRRP 섹션'),
+        ])
+        self.make_doc_with_chunks('Arista', 'Arista/eos.pdf', [
+            ([0.9, 0.1, 0.0, 0.0], 'EOS SSL 유사 섹션'),
+        ])
+        query_vec = np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+        with patch.object(references, 'embed_texts', return_value=query_vec):
+            results = references.search('ssl offload')
+            self.assertEqual(results[0]['text'], 'SSL 오프로드 섹션')
+            self.assertEqual(results[0]['document'], 'A10/guide.pdf')
+            self.assertIn('p.1-1', results[0]['pages'])
+            # 벤더 필터
+            arista_only = references.search('ssl offload', vendor='Arista')
+            self.assertEqual([r['vendor'] for r in arista_only], ['Arista'])
+
+    def test_search_empty_without_ingested_docs(self):
+        from .services import references
+        self.assertEqual(references.search('anything'), [])
+
+    def test_ingest_skips_unchanged_and_reprocesses_on_force(self):
+        import tempfile
+        from pathlib import Path
+        import numpy as np
+        from .models import ReferenceDocument
+        from .services import references
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / 'guide.pdf'
+            pdf.write_bytes(b'%PDF-fake')
+            fake_pages = [(1, 'ACOS 6.0.8 Test Guide © A10'), (2, 'slb 설정 본문')]
+            with patch.object(references, 'extract_pages', return_value=fake_pages), \
+                 patch.object(references, 'embed_texts',
+                              return_value=np.ones((1, 4), dtype=np.float32)) as embed:
+                self.assertEqual(
+                    references.ingest_file('A10', 'A10/guide.pdf', pdf), 'created')
+                doc = ReferenceDocument.objects.get(filename='A10/guide.pdf')
+                self.assertEqual(doc.title, 'ACOS 6.0.8 Test Guide')
+                self.assertEqual(doc.chunk_count, 1)
+                # 같은 파일 재실행 → 임베딩 호출 없이 건너뜀
+                embed.reset_mock()
+                self.assertEqual(
+                    references.ingest_file('A10', 'A10/guide.pdf', pdf), 'skipped')
+                embed.assert_not_called()
+                # --force → 재처리
+                self.assertEqual(
+                    references.ingest_file('A10', 'A10/guide.pdf', pdf, force=True),
+                    'updated')
+
+
 class BackfillTranslationTests(TestCase):
     """backfill_translations — 번역 누락 메일만 채우고 케이스 필드는 불변."""
 
