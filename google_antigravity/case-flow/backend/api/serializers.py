@@ -45,8 +45,8 @@ class KnowledgeItemSerializer(serializers.ModelSerializer):
         model = KnowledgeItem
         fields = ['id', 'knowledge_id', 'vendor', 'title', 'problem', 'root_cause',
                   'resolution', 'device_model', 'software_version', 'status',
-                  'analyzed_by', 'source_case', 'created_at', 'updated_at']
-        read_only_fields = ['vendor', 'analyzed_by']
+                  'analyzed_by', 'references', 'source_case', 'created_at', 'updated_at']
+        read_only_fields = ['vendor', 'analyzed_by', 'references']
 
 
 class CaseDetailSerializer(CaseSerializer):

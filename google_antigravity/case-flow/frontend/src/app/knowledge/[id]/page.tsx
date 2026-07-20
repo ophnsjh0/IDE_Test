@@ -35,6 +35,13 @@ import { useMe } from '../../lib/useMe';
 // 케이스 상세와 동일한 본문 스타일 — 커맨드/로그의 줄바꿈 유지 + 긴 문자열 강제 줄바꿈
 const bodyTextStyle = { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } as const;
 
+interface KnowledgeReference {
+  document: string;
+  pages: string;
+  score: number;
+  note: string;
+}
+
 interface KnowledgeDetail {
   id: number;
   knowledge_id: string;
@@ -47,6 +54,7 @@ interface KnowledgeDetail {
   software_version: string;
   status: string; // draft | confirmed
   analyzed_by: string;
+  references: KnowledgeReference[];
   source_case: { id: number; case_id: string; status: string; vendor_case_number: string | null } | null;
   created_at: string;
   updated_at: string;
@@ -270,6 +278,21 @@ export default function KnowledgeDetailPage() {
                       </Text>
                     </Paper>
                   </div>
+                  {item.references && item.references.length > 0 && (
+                    <div>
+                      <Text fw={700} size="sm" c="dimmed" mb={4}>공식 문서 근거</Text>
+                      <Stack gap="xs">
+                        {item.references.map((ref, i) => (
+                          <Paper key={i} withBorder p="sm" radius="md">
+                            <Text size="sm" fw={600}>
+                              {ref.document} <Text component="span" c="dimmed">({ref.pages})</Text>
+                            </Text>
+                            <Text size="sm" c="dimmed">{ref.note}</Text>
+                          </Paper>
+                        ))}
+                      </Stack>
+                    </div>
+                  )}
                 </Stack>
               </>
             )}

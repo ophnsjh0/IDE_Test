@@ -8,12 +8,14 @@
     python manage.py extract_knowledge --limit 5          # 앞 5건만
     python manage.py extract_knowledge --case C-1118      # 특정 케이스만 (상태 무관)
     python manage.py extract_knowledge --model claude-haiku-4-5
+    python manage.py extract_knowledge --enrich           # 기존 지식 전체에 공식 문서
+                                                          # 근거(references) 재탐색·저장
 """
 from contextlib import nullcontext
 
 from django.core.management.base import BaseCommand, CommandError
 
-from api.models import Case
+from api.models import Case, KnowledgeItem
 from api.services import knowledge
 from api.services.analyzer import generate_structured, translation_model_override
 
@@ -28,8 +30,12 @@ class Command(BaseCommand):
                             help='처리할 최대 케이스 수 (0=제한 없음)')
         parser.add_argument('--case', help='특정 케이스만 처리 (C-1118 또는 DB id, 상태 무관)')
         parser.add_argument('--model', help='이번 실행에서만 사용할 AI 모델 id')
+        parser.add_argument('--enrich', action='store_true',
+                            help='추출 대신 기존 지식 항목의 공식 문서 근거를 재탐색해 저장')
 
     def handle(self, *args, **options):
+        if options['enrich']:
+            return self._handle_enrich(options)
         cases = self._target_cases(options)
         if not cases:
             self.stdout.write('처리할 케이스가 없습니다.')
@@ -48,6 +54,40 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             f"{mode}완료 — 생성 {counts['created']}건, 기존 {counts['exists']}건, "
             f"지식 없음 {counts['no_knowledge']}건, 실패 {counts['failed']}건"
+        ))
+
+    def _handle_enrich(self, options):
+        items = KnowledgeItem.objects.select_related('case').order_by('id')
+        if options['limit']:
+            items = items[:options['limit']]
+        items = list(items)
+        if not items:
+            self.stdout.write('지식 항목이 없습니다.')
+            return
+
+        counts = {'enriched': 0, 'none_relevant': 0, 'no_candidates': 0,
+                  'unavailable': 0, 'failed': 0}
+        model = options.get('model')
+        with translation_model_override(model) if model else nullcontext():
+            for item in items:
+                outcome = knowledge.enrich_with_references(item)
+                counts[outcome] += 1
+                label = {
+                    'enriched': self.style.SUCCESS(
+                        f'근거 {len(item.references)}건 연결'),
+                    'none_relevant': '후보는 있으나 관련 근거 없음',
+                    'no_candidates': '검색 후보 없음',
+                    'unavailable': self.style.ERROR('임베딩 사용 불가 (OPENAI_API_KEY 확인)'),
+                    'failed': self.style.ERROR('실패 (서버 로그 확인)'),
+                }[outcome]
+                self.stdout.write(f'{item.knowledge_id} [{item.vendor}] '
+                                  f'{item.title[:45]} — {label}')
+                if outcome == 'unavailable':
+                    break
+
+        self.stdout.write(self.style.SUCCESS(
+            f"완료 — 근거 연결 {counts['enriched']}건, 관련 없음 {counts['none_relevant']}건, "
+            f"후보 없음 {counts['no_candidates']}건, 실패 {counts['failed']}건"
         ))
 
     def _target_cases(self, options):

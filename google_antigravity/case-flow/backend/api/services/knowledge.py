@@ -98,4 +98,96 @@ def extract_knowledge(case):
         analyzed_by=get_translation_model(),
     )
     logger.info("Knowledge extracted from %s -> %s", case.case_id, item.knowledge_id)
+    # 공식 문서 근거는 부가 정보 — 실패해도 지식 생성 자체는 유지
+    try:
+        enrich_with_references(item)
+    except Exception:
+        logger.exception("reference enrichment failed for %s", item.knowledge_id)
     return 'created', item
+
+
+# ------------------------------------------------- 공식 문서 근거 보강
+
+ENRICH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "relevant": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "note": {"type": "string"},
+                },
+                "required": ["index", "note"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["relevant"],
+    "additionalProperties": False,
+}
+
+ENRICH_PROMPT = """당신은 TAC 지식 항목(문제-원인-해결)에 벤더 공식 문서 근거를 붙이는
+검수자입니다. 지식 항목과, 벡터 검색으로 찾은 공식 문서 발췌 후보들이 주어집니다.
+
+각 발췌가 이 지식의 해결 조치·원인 설명을 **실제로 뒷받침하거나 배경 설명이 되는지**
+판단해, 관련 있는 발췌의 index만 고르세요. 주제만 비슷하고 이 지식과 직접 관련이
+없는 발췌는 제외하세요. 관련 발췌가 하나도 없으면 relevant를 빈 배열로 두세요.
+
+- index: 후보 발췌 번호 (주어진 번호 그대로)
+- note: 이 발췌가 지식의 어떤 부분을 뒷받침하는지 한 줄 설명 (한국어, 합니다체)"""
+
+
+def enrich_with_references(item, top_k=5):
+    """지식 항목에 공식 문서 근거를 찾아 item.references에 저장한다.
+
+    벡터 검색 후보 → AI가 실제 관련 발췌만 선별 → 코드에서 index 검증
+    (존재하지 않는 문서를 지어내는 것을 구조적으로 차단).
+
+    반환: 'enriched' | 'none_relevant' | 'no_candidates' | 'unavailable' | 'failed'
+    """
+    from . import references as refdocs
+
+    query = ' '.join(filter(None, [
+        item.title, item.device_model, item.software_version,
+        item.resolution[:300],
+    ]))
+    try:
+        candidates = refdocs.search(query, vendor=item.vendor, top_k=top_k)
+    except refdocs.EmbeddingUnavailable:
+        return 'unavailable'
+    if not candidates:
+        item.references = []
+        item.save(update_fields=['references', 'updated_at'])
+        return 'no_candidates'
+
+    parts = [
+        "## 지식 항목",
+        f"제목: {item.title}",
+        f"장비/버전: {item.device_model} / {item.software_version}",
+        f"문제: {item.problem}",
+        f"원인: {item.root_cause}",
+        f"해결 조치:\n{item.resolution}",
+        "\n## 공식 문서 발췌 후보",
+    ]
+    for i, c in enumerate(candidates):
+        parts.append(f"[{i}] {c['document']} {c['pages']}\n{c['text'][:1500]}")
+    result = generate_structured(ENRICH_PROMPT, '\n\n'.join(parts), ENRICH_SCHEMA)
+    if result is None:
+        return 'failed'
+
+    references = []
+    for entry in result.get('relevant', []):
+        index = entry.get('index')
+        if isinstance(index, int) and 0 <= index < len(candidates):
+            c = candidates[index]
+            references.append({
+                'document': c['document'],
+                'pages': c['pages'],
+                'score': c['score'],
+                'note': (entry.get('note') or '')[:300],
+            })
+    item.references = references
+    item.save(update_fields=['references', 'updated_at'])
+    return 'enriched' if references else 'none_relevant'

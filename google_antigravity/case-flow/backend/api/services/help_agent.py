@@ -401,6 +401,8 @@ def _search_knowledge(query='', vendor='', limit=5):
         'software_version': item.software_version,
         'status': item.status,  # draft=AI 초안(미검증), confirmed=엔지니어 확인됨
         'source_case': item.case.case_id if item.case else None,
+        # 공식 문서 근거 — 답변에서 (문서명 p.N) 인용에 활용
+        'references': item.references,
     } for item in items.order_by('status', '-created_at')[:limit]]  # confirmed 우선
     return json.dumps({'results': rows, 'count': len(rows)}, ensure_ascii=False)
 

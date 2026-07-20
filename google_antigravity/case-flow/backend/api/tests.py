@@ -1474,6 +1474,34 @@ class KnowledgeBaseTests(TestCase):
         self.login('ka1')  # admin: 삭제 가능
         self.assertEqual(self.client.delete(url).status_code, 204)
 
+    def test_enrich_validates_indexes_and_saves_references(self):
+        from .services import knowledge
+        from .services import references as refdocs
+        item = self.make_item()
+        candidates = [
+            {'document': 'A10/guide.pdf', 'pages': 'p.1-2', 'score': 0.9,
+             'text': 'ssl 설정 섹션', 'title': '', 'vendor': 'A10'},
+            {'document': 'A10/guide.pdf', 'pages': 'p.9-10', 'score': 0.5,
+             'text': '무관 섹션', 'title': '', 'vendor': 'A10'},
+        ]
+        # AI가 유효 index 0과 존재하지 않는 index 7을 반환 → 7은 코드 검증에서 버려짐
+        ai_result = {'relevant': [{'index': 0, 'note': '해결 절차 근거'},
+                                  {'index': 7, 'note': '지어낸 인용'}]}
+        with patch.object(refdocs, 'search', return_value=candidates), \
+             patch.object(knowledge, 'generate_structured', return_value=ai_result):
+            outcome = knowledge.enrich_with_references(item)
+        self.assertEqual(outcome, 'enriched')
+        item.refresh_from_db()
+        self.assertEqual(len(item.references), 1)
+        self.assertEqual(item.references[0]['pages'], 'p.1-2')
+        self.assertEqual(item.references[0]['note'], '해결 절차 근거')
+
+        # 후보가 없으면 references는 빈 목록으로 확정
+        with patch.object(refdocs, 'search', return_value=[]):
+            self.assertEqual(knowledge.enrich_with_references(item), 'no_candidates')
+        item.refresh_from_db()
+        self.assertEqual(item.references, [])
+
     def test_search_knowledge_tool_filters_and_prefers_confirmed(self):
         self.make_item(title='VRRP 페일오버 반복', resolution='preempt 설정 수정',
                        status='confirmed')

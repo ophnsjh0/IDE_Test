@@ -158,6 +158,9 @@ class KnowledgeItem(models.Model):
     software_version = models.CharField(max_length=50, blank=True, default='')
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='draft')
     analyzed_by = models.CharField(max_length=100, blank=True, default='')  # 추출 모델 id
+    # 이 지식을 뒷받침하는 벤더 공식 문서 발췌 목록 — 벡터 검색 후보를 AI가 선별.
+    # [{'document', 'pages', 'score', 'note'}], 관련 문서 없으면 빈 목록.
+    references = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
