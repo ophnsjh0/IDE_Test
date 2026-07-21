@@ -21,8 +21,9 @@ backend/token.json
 credentials.json
 token.json
 
-# Gmail 동기화 동시 실행 방지용 잠금 파일
+# 동기화(Gmail/지식) 동시 실행 방지용 잠금 파일
 backend/.gmail_sync.lock
+backend/.knowledge_sync.lock
 
 # collectstatic 산출물 (도커 빌드 시 이미지 안에서 생성)
 backend/staticfiles/
