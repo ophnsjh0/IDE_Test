@@ -1,7 +1,7 @@
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import Case, CaseEmail, KnowledgeItem
+from .models import Case, CaseEmail, ChatSession, ChatTurn, KnowledgeItem
 
 
 class CaseEmailSerializer(serializers.ModelSerializer):
@@ -33,6 +33,7 @@ class CaseSerializer(serializers.ModelSerializer):
 class KnowledgeItemSerializer(serializers.ModelSerializer):
     knowledge_id = serializers.ReadOnlyField()
     source_case = serializers.SerializerMethodField()
+    source_session = serializers.SerializerMethodField()
 
     def get_source_case(self, obj):
         if obj.case is None:
@@ -41,12 +42,41 @@ class KnowledgeItemSerializer(serializers.ModelSerializer):
                 'status': obj.case.status,
                 'vendor_case_number': obj.case.vendor_case_number}
 
+    def get_source_session(self, obj):
+        # 대화 원문은 본인만 볼 수 있으므로 세션 내용이 아닌 존재 표시만 노출
+        if obj.chat_session is None:
+            return None
+        return {'id': obj.chat_session.id, 'title': obj.chat_session.title}
+
     class Meta:
         model = KnowledgeItem
         fields = ['id', 'knowledge_id', 'vendor', 'title', 'problem', 'root_cause',
                   'resolution', 'device_model', 'software_version', 'status',
-                  'analyzed_by', 'references', 'source_case', 'created_at', 'updated_at']
+                  'analyzed_by', 'references', 'source_case', 'source_session',
+                  'created_at', 'updated_at']
         read_only_fields = ['vendor', 'analyzed_by', 'references']
+
+
+class ChatTurnSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChatTurn
+        fields = ['id', 'role', 'content', 'agent', 'model', 'tool_calls',
+                  'files', 'created_at']
+
+
+class ChatSessionSerializer(serializers.ModelSerializer):
+    turn_count = serializers.IntegerField(source='turns.count', read_only=True)
+
+    class Meta:
+        model = ChatSession
+        fields = ['id', 'title', 'turn_count', 'created_at', 'updated_at']
+
+
+class ChatSessionDetailSerializer(ChatSessionSerializer):
+    turns = ChatTurnSerializer(many=True, read_only=True)
+
+    class Meta(ChatSessionSerializer.Meta):
+        fields = ChatSessionSerializer.Meta.fields + ['turns']
 
 
 class CaseDetailSerializer(CaseSerializer):

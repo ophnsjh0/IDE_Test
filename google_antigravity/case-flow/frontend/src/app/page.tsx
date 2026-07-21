@@ -542,9 +542,8 @@ function CaseListPage() {
                 })}
               </Tabs.List>
             </Tabs>
-            {/* AI 비용 때문에 테스트 배포 동안 관리자에게만 노출 (서버도 차단) */}
-            {isAdmin && <HelpAgentWidget variant="inline" />}
-            {/* {<HelpAgentWidget variant="inline" />} */}
+            {/* 엔지니어 이상 사용 가능 (서버도 동일하게 차단) */}
+            {canWrite && <HelpAgentWidget variant="inline" />}
             </Group>
 
             <Group mb="md">

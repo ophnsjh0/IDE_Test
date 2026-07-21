@@ -1,7 +1,7 @@
-"""해결된 케이스에서 재사용 가능한 기술 지식(문제-원인-해결)을 AI로 추출한다."""
+"""해결된 케이스·AI 도우미 대화에서 재사용 가능한 기술 지식(문제-원인-해결)을 AI로 추출한다."""
 import logging
 
-from api.models import KnowledgeItem
+from api.models import Case, KnowledgeItem
 from .analyzer import generate_structured, get_translation_model
 
 logger = logging.getLogger(__name__)
@@ -98,6 +98,105 @@ def extract_knowledge(case):
         analyzed_by=get_translation_model(),
     )
     logger.info("Knowledge extracted from %s -> %s", case.case_id, item.knowledge_id)
+    # 공식 문서 근거는 부가 정보 — 실패해도 지식 생성 자체는 유지
+    try:
+        enrich_with_references(item)
+    except Exception:
+        logger.exception("reference enrichment failed for %s", item.knowledge_id)
+    return 'created', item
+
+
+# ------------------------------------------------- AI 도우미 대화에서 추출
+
+# 케이스 추출과 달리 벤더가 컨텍스트에 없어 AI가 대화에서 판별한다.
+# 빈 문자열 = 대화에 벤더 단서가 없음 (추출 거부 사유).
+CHAT_KNOWLEDGE_SCHEMA = {
+    **KNOWLEDGE_SCHEMA,
+    "properties": {
+        **KNOWLEDGE_SCHEMA["properties"],
+        "vendor": {"type": "string",
+                   "enum": [v for v, _ in Case.VENDOR_CHOICES] + [""]},
+    },
+    "required": KNOWLEDGE_SCHEMA["required"] + ["vendor"],
+}
+
+CHAT_SYSTEM_PROMPT = """당신은 네트워크 벤더(A10/Arista/HPE Aruba/Juniper) 기술지원 AI와
+엔지니어가 나눈 문제 해결 대화에서, 나중에 비슷한 문제를 만난 다른 엔지니어가 재사용할 수
+있는 기술 지식을 추출하는 어시스턴트입니다.
+
+대화 전체를 읽고 아래 JSON 필드를 작성하세요. 모든 필드는 한국어(합니다체)로 작성하되,
+기술 용어, 제품명, CLI 명령어, 설정 라인, 로그, 버전 문자열은 원문 그대로 유지합니다.
+
+중요: 대화에는 시행착오가 섞여 있습니다. 중간에 나온 오답·기각된 가설은 버리고,
+**최종적으로 유효하다고 확인된 결론만** 추출하세요.
+
+- has_knowledge: 재사용 가치가 있는 "문제 → 해결" 지식이 있으면 true.
+  다음은 반드시 false: 단순 현황/통계 질문(케이스 몇 건 등), 리포트 생성 요청,
+  일반 상식 문답, 해결책 없이 질문만 오간 대화, 결론이 나지 않은 대화.
+  false면 나머지 필드는 빈 문자열 "".
+- vendor: 대화에서 다룬 장비의 벤더. 대화에 단서가 없으면 빈 문자열 "".
+- title: 문제를 한 줄로 요약 (최대 80자, 검색될 것을 고려해 증상·장비를 담을 것)
+- problem: 증상과 문제 상황 — 어떤 조건에서 무엇이 잘못됐는지. 고객사명은 쓰지 말 것.
+- root_cause: 대화에서 밝혀진 근본 원인. 명확하지 않으면 빈 문자열 "".
+- resolution: 해결 조치를 단계별로. **대화에 나온 CLI 명령어·설정 변경·패치 버전을 그대로
+  포함**할 것. 명령어는 각각 별도 줄에 두세요.
+- device_model: 대상 장비 모델명 원문 그대로. 없으면 "".
+- software_version: 문제가 발생한 소프트웨어 버전 원문 그대로. 없으면 ""."""
+
+
+def build_chat_material(session):
+    """추출 프롬프트에 넣을 대화 텍스트를 구성한다.
+
+    답변이 어떤 도구(케이스/문서/웹 검색)를 근거로 했는지도 포함한다 —
+    추출 모델이 근거 있는 결론과 일반 추측을 구분하는 데 쓰인다.
+    """
+    parts = []
+    remaining = _MAX_CONTEXT_CHARS
+    for turn in session.turns.all():
+        speaker = '엔지니어' if turn.role == 'user' else 'AI'
+        tools = ', '.join(t.get('name', '') for t in (turn.tool_calls or []))
+        header = f"[{speaker}]" + (f" (사용 도구: {tools})" if tools else '')
+        entry = f"{header}\n{turn.content[:6000]}"
+        if remaining - len(entry) < 0:
+            break
+        remaining -= len(entry)
+        parts.append(entry)
+    return '\n\n'.join(parts)
+
+
+def extract_knowledge_from_chat(session):
+    """AI 도우미 대화 1건에서 지식을 추출해 KnowledgeItem(draft)으로 저장한다.
+
+    반환: ('created', item) | ('no_knowledge', None) | ('no_vendor', None)
+    | ('failed', None) | ('exists', 기존 item)
+    """
+    existing = session.knowledge_items.first()
+    if existing:
+        return 'exists', existing
+
+    result = generate_structured(CHAT_SYSTEM_PROMPT, build_chat_material(session),
+                                 CHAT_KNOWLEDGE_SCHEMA)
+    if result is None:
+        return 'failed', None
+    if not result.get('has_knowledge') or not (result.get('resolution') or '').strip():
+        return 'no_knowledge', None
+    vendor = result.get('vendor') or ''
+    if vendor not in dict(Case.VENDOR_CHOICES):
+        return 'no_vendor', None
+
+    item = KnowledgeItem.objects.create(
+        chat_session=session,
+        vendor=vendor,
+        title=result['title'][:200],
+        problem=result['problem'],
+        root_cause=result['root_cause'],
+        resolution=result['resolution'],
+        device_model=result['device_model'][:100],
+        software_version=result['software_version'][:50],
+        analyzed_by=get_translation_model(),
+    )
+    logger.info("Knowledge extracted from chat session %s -> %s",
+                session.id, item.knowledge_id)
     # 공식 문서 근거는 부가 정보 — 실패해도 지식 생성 자체는 유지
     try:
         enrich_with_references(item)

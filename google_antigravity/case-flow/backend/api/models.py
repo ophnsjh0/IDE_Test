@@ -75,6 +75,7 @@ class UsageEvent(models.Model):
         ('report_download', 'Report Download'),
         ('gmail_sync', 'Gmail Sync'),
         ('knowledge_view', 'Knowledge View'),
+        ('knowledge_extract', 'Knowledge Extract from Chat'),
     ]
 
     user = models.ForeignKey(django_settings.AUTH_USER_MODEL, null=True, blank=True,
@@ -140,7 +141,9 @@ class KnowledgeItem(models.Model):
     """해결된 케이스에서 추출한 재사용 가능한 기술 지식 (문제-원인-해결).
 
     AI가 초안(draft)으로 만들고 엔지니어가 확인 후 확정(confirmed)한다.
-    출처 케이스가 삭제돼도 지식은 남도록 SET_NULL.
+    출처(케이스 또는 AI 도우미 대화)가 삭제돼도 지식은 남도록 SET_NULL.
+    케이스 유래는 벤더가 실제 해결한 기록, 대화 유래는 AI 추론 기반이라
+    신뢰도가 한 단계 낮다 — UI에서 출처를 구분해 표시한다.
     """
     STATUS_CHOICES = [
         ('draft', 'AI Draft'),
@@ -149,6 +152,9 @@ class KnowledgeItem(models.Model):
 
     case = models.ForeignKey(Case, null=True, blank=True, on_delete=models.SET_NULL,
                              related_name='knowledge_items')
+    chat_session = models.ForeignKey('ChatSession', null=True, blank=True,
+                                     on_delete=models.SET_NULL,
+                                     related_name='knowledge_items')
     vendor = models.CharField(max_length=50, choices=Case.VENDOR_CHOICES)
     title = models.CharField(max_length=200)          # 문제 한 줄 요약 (목록 표시용)
     problem = models.TextField()                      # 증상/문제 상황
@@ -173,6 +179,51 @@ class KnowledgeItem(models.Model):
     @property
     def knowledge_id(self):
         return f"K-{100 + self.id}"
+
+
+class ChatSession(models.Model):
+    """AI 도우미 대화 세션 — 대화가 휘발되지 않게 서버에 저장한다.
+
+    1차 목적은 데이터 보존(다시 보기·이어가기)이고, 향후 지식 베이스
+    2단계(대화에서 지식 추출)의 원천 데이터가 된다. 대화 원문은
+    본인만 조회 가능. 계정이 삭제돼도 추출 원천은 남도록 SET_NULL.
+    """
+    user = models.ForeignKey(django_settings.AUTH_USER_MODEL, null=True, blank=True,
+                             on_delete=models.SET_NULL, related_name='chat_sessions')
+    title = models.CharField(max_length=200)  # 첫 질문 (목록 표시용)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        return f"{self.user} - {self.title[:40]}"
+
+
+class ChatTurn(models.Model):
+    """세션 내 대화 턴 1개. assistant 턴에는 담당 에이전트/모델/도구 호출도 남긴다
+    (어떤 근거로 답했는지가 지식 추출과 품질 분석의 핵심 재료)."""
+    ROLE_CHOICES = [
+        ('user', 'User'),
+        ('assistant', 'Assistant'),
+    ]
+
+    session = models.ForeignKey(ChatSession, related_name='turns',
+                                on_delete=models.CASCADE)
+    role = models.CharField(max_length=10, choices=ROLE_CHOICES)
+    content = models.TextField()
+    agent = models.CharField(max_length=20, blank=True, default='')
+    model = models.CharField(max_length=100, blank=True, default='')
+    tool_calls = models.JSONField(default=list, blank=True)  # [{'name', 'input'}]
+    files = models.JSONField(default=list, blank=True)  # 리포트 문서 메타
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['id']
+
+    def __str__(self):
+        return f"{self.session_id}#{self.id} {self.role}"
 
 
 class ReferenceDocument(models.Model):

@@ -56,6 +56,7 @@ interface KnowledgeDetail {
   analyzed_by: string;
   references: KnowledgeReference[];
   source_case: { id: number; case_id: string; status: string; vendor_case_number: string | null } | null;
+  source_session: { id: number; title: string } | null;
   created_at: string;
   updated_at: string;
 }
@@ -301,19 +302,32 @@ export default function KnowledgeDetailPage() {
 
             <Group justify="space-between">
               <Group gap="xs">
-                <Text size="sm" c="dimmed">출처 케이스:</Text>
-                {item.source_case ? (
-                  <Button
-                    size="compact-sm"
-                    variant="light"
-                    rightSection={<IconExternalLink size={14} />}
-                    onClick={() => router.push(`/cases/${item.source_case!.id}`)}
-                  >
-                    {item.source_case.case_id}
-                    {item.source_case.vendor_case_number && ` (${item.source_case.vendor_case_number})`}
-                  </Button>
+                {item.source_session ? (
+                  <>
+                    <Text size="sm" c="dimmed">출처:</Text>
+                    {/* 대화 유래 지식은 벤더 해결 기록이 아닌 AI 답변 기반 —
+                        케이스 유래보다 신뢰도가 낮음을 출처로 드러낸다 */}
+                    <Text size="sm" fw={500} c="grape">
+                      AI 도우미 대화 · {item.source_session.title}
+                    </Text>
+                  </>
                 ) : (
-                  <Text size="sm" c="dimmed">삭제됨</Text>
+                  <>
+                    <Text size="sm" c="dimmed">출처 케이스:</Text>
+                    {item.source_case ? (
+                      <Button
+                        size="compact-sm"
+                        variant="light"
+                        rightSection={<IconExternalLink size={14} />}
+                        onClick={() => router.push(`/cases/${item.source_case!.id}`)}
+                      >
+                        {item.source_case.case_id}
+                        {item.source_case.vendor_case_number && ` (${item.source_case.vendor_case_number})`}
+                      </Button>
+                    ) : (
+                      <Text size="sm" c="dimmed">삭제됨</Text>
+                    )}
+                  </>
                 )}
               </Group>
               <Text size="xs" c="dimmed">

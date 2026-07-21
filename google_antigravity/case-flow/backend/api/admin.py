@@ -1,5 +1,6 @@
 from django.contrib import admin
-from .models import Case, ReferenceChunk, ReferenceDocument, UsageEvent
+from .models import (Case, ChatSession, ChatTurn, ReferenceChunk,
+                     ReferenceDocument, UsageEvent)
 
 @admin.register(Case)
 class CaseAdmin(admin.ModelAdmin):
@@ -29,6 +30,23 @@ class ReferenceChunkAdmin(admin.ModelAdmin):
     @admin.display(description='내용 미리보기')
     def preview(self, obj):
         return obj.text[:80]
+
+
+class ChatTurnInline(admin.TabularInline):
+    model = ChatTurn
+    readonly_fields = ('role', 'content', 'agent', 'model', 'tool_calls',
+                       'files', 'created_at')
+    extra = 0
+    can_delete = False
+
+
+@admin.register(ChatSession)
+class ChatSessionAdmin(admin.ModelAdmin):
+    list_display = ('id', 'user', 'title', 'updated_at')
+    list_filter = ('user',)
+    search_fields = ('title', 'turns__content')
+    readonly_fields = ('user', 'title', 'created_at', 'updated_at')
+    inlines = [ChatTurnInline]
 
 
 @admin.register(UsageEvent)

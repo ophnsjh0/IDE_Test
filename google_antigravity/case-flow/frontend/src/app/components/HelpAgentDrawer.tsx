@@ -17,7 +17,17 @@ import {
   ThemeIcon,
   Tooltip,
 } from '@mantine/core';
-import { IconRobotFace, IconSend, IconDatabase, IconFileDownload } from '@tabler/icons-react';
+import {
+  IconRobotFace,
+  IconSend,
+  IconDatabase,
+  IconFileDownload,
+  IconBulb,
+  IconCheck,
+  IconHistory,
+  IconMessagePlus,
+  IconTrash,
+} from '@tabler/icons-react';
 import { apiFetch } from '../lib/api';
 import classes from './HelpAgentWidget.module.css';
 
@@ -35,6 +45,21 @@ interface ChatMessage {
   files?: GeneratedFile[]; // 리포팅 에이전트가 생성한 문서 (워드/엑셀/PPT)
 }
 
+interface SessionSummary {
+  id: number;
+  title: string;
+  turn_count: number;
+  updated_at: string;
+}
+
+interface SessionTurn {
+  role: 'user' | 'assistant';
+  content: string;
+  agent?: string;
+  tool_calls?: { name: string }[];
+  files?: GeneratedFile[];
+}
+
 const AGENT_LABELS: Record<string, string> = {
   search: '검색',
   report: '리포팅',
@@ -48,7 +73,12 @@ const TOOL_LABELS: Record<string, string> = {
   get_case_stats: '통계 집계',
   list_recent_cases: '최근 케이스',
   web_search: '웹 검색',
+  search_references: '공식 문서 검색',
+  search_knowledge: '지식 베이스 검색',
 };
+
+const toolNoteOf = (toolCalls?: { name: string }[]) =>
+  (toolCalls || []).map((t) => TOOL_LABELS[t.name] || t.name).join(' → ');
 
 const SUGGESTIONS = [
   'VRRP failover 유사 사례 찾아줘',
@@ -72,6 +102,13 @@ export default function HelpAgentWidget({
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [drawerWidth, setDrawerWidth] = useState(DRAWER_DEFAULT_WIDTH);
+  // 서버에 저장된 대화 세션 — 이어가기(sessionId)와 이전 대화 목록(view)
+  const [sessionId, setSessionId] = useState<number | null>(null);
+  const [view, setView] = useState<'chat' | 'history'>('chat');
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  // 지식 추출: 세션당 1회 — 성공하면 K-번호를 기억해 버튼을 완료 표시로 바꾼다
+  const [extracting, setExtracting] = useState(false);
+  const [extractedId, setExtractedId] = useState<string | null>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
 
   // 좌측 가장자리 드래그로 너비 조절 — 표 등 긴 내용을 볼 때 넓혀 쓴다
@@ -116,13 +153,13 @@ export default function HelpAgentWidget({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           messages: history.map(({ role, content }) => ({ role, content })),
+          session_id: sessionId,
         }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      const toolNote = (data.tool_calls || [])
-        .map((t: { name: string }) => TOOL_LABELS[t.name] || t.name)
-        .join(' → ');
+      if (data.session_id) setSessionId(data.session_id);
+      const toolNote = toolNoteOf(data.tool_calls);
       setMessages((prev) => [
         ...prev,
         {
@@ -169,6 +206,94 @@ export default function HelpAgentWidget({
           content: `파일 다운로드에 실패했습니다: ${e instanceof Error ? e.message : e}`,
         },
       ]);
+    }
+  };
+
+  const newChat = () => {
+    setMessages([]);
+    setSessionId(null);
+    setExtractedId(null);
+    setView('chat');
+  };
+
+  // 대화가 유효한 결론에 도달했다고 사용자가 판단했을 때 지식 베이스로 정제 저장.
+  // AI가 시행착오를 걸러 문제-원인-해결 초안(draft)을 만들고, 검토 후 확정된다.
+  const extractKnowledge = async () => {
+    if (!sessionId || extracting) return;
+    setExtracting(true);
+    try {
+      const res = await apiFetch(`/api/help-agent/sessions/${sessionId}/knowledge/`, {
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      const kid = data.item.knowledge_id;
+      setExtractedId(kid);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content:
+            data.outcome === 'exists'
+              ? `이 대화는 이미 지식 ${kid}(으)로 저장되어 있습니다. 지식 베이스에서 확인하세요.`
+              : `대화 내용을 지식 초안 ${kid}(으)로 저장했습니다. 지식 베이스에서 내용을 검토한 뒤 확정해주세요.`,
+        },
+      ]);
+    } catch (e) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: `${e instanceof Error ? e.message : e}`,
+        },
+      ]);
+    } finally {
+      setExtracting(false);
+    }
+  };
+
+  const openHistory = async () => {
+    setView('history');
+    try {
+      const res = await apiFetch('/api/help-agent/sessions/');
+      if (res.ok) setSessions(await res.json());
+    } catch {
+      // 목록 로드 실패는 빈 목록으로 표시
+    }
+  };
+
+  const loadSession = async (id: number) => {
+    try {
+      const res = await apiFetch(`/api/help-agent/sessions/${id}/`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setMessages(
+        (data.turns as SessionTurn[]).map((t) => ({
+          role: t.role,
+          content: t.content,
+          agent: t.agent || undefined,
+          toolNote: toolNoteOf(t.tool_calls),
+          files: t.files?.length ? t.files : undefined,
+        })),
+      );
+      setSessionId(id);
+      setExtractedId(null);
+      setView('chat');
+    } catch {
+      setView('chat');
+      setMessages([{ role: 'assistant', content: '대화를 불러오지 못했습니다.' }]);
+    }
+  };
+
+  const deleteSession = async (id: number) => {
+    try {
+      const res = await apiFetch(`/api/help-agent/sessions/${id}/`, { method: 'DELETE' });
+      if (res.ok) {
+        setSessions((prev) => prev.filter((s) => s.id !== id));
+        if (sessionId === id) newChat();
+      }
+    } catch {
+      // 삭제 실패 시 목록 유지
     }
   };
 
@@ -221,6 +346,21 @@ export default function HelpAgentWidget({
               <Text fw={700} size="sm" lh={1.2}>AI 도우미</Text>
               <Text size="xs" c="dimmed" lh={1.2}>케이스 이력 검색 · DB 근거 답변</Text>
             </div>
+            <Tooltip label="새 대화" position="bottom">
+              <ActionIcon variant="subtle" color="gray" onClick={newChat} aria-label="새 대화">
+                <IconMessagePlus size={18} />
+              </ActionIcon>
+            </Tooltip>
+            <Tooltip label="이전 대화" position="bottom">
+              <ActionIcon
+                variant={view === 'history' ? 'light' : 'subtle'}
+                color="gray"
+                onClick={() => (view === 'history' ? setView('chat') : openHistory())}
+                aria-label="이전 대화"
+              >
+                <IconHistory size={18} />
+              </ActionIcon>
+            </Tooltip>
           </Group>
         }
       >
@@ -234,6 +374,40 @@ export default function HelpAgentWidget({
 
         {/* 입력란이 화면 맨 아래에 붙지 않도록 높이를 줄여 위쪽에 배치 */}
         <Stack h="calc(100vh - 180px)" gap="sm">
+          {view === 'history' ? (
+            <ScrollArea style={{ flex: 1 }}>
+              <Stack gap={6} pb="sm">
+                <Text size="xs" c="dimmed" fw={600}>이전 대화 (본인만 볼 수 있어요)</Text>
+                {sessions.length === 0 && (
+                  <Text size="sm" c="dimmed">저장된 대화가 없습니다.</Text>
+                )}
+                {sessions.map((s) => (
+                  <Paper key={s.id} p="sm" radius="md" withBorder>
+                    <Group gap="xs" wrap="nowrap">
+                      <Box
+                        style={{ flex: 1, cursor: 'pointer', minWidth: 0 }}
+                        onClick={() => loadSession(s.id)}
+                      >
+                        <Text size="sm" fw={500} truncate>{s.title}</Text>
+                        <Text size="xs" c="dimmed">
+                          {new Date(s.updated_at).toLocaleString('ko-KR')} · {s.turn_count}턴
+                        </Text>
+                      </Box>
+                      <ActionIcon
+                        variant="subtle"
+                        color="red"
+                        onClick={() => deleteSession(s.id)}
+                        aria-label="대화 삭제"
+                      >
+                        <IconTrash size={16} />
+                      </ActionIcon>
+                    </Group>
+                  </Paper>
+                ))}
+              </Stack>
+            </ScrollArea>
+          ) : (
+          <>
           <ScrollArea style={{ flex: 1 }} viewportRef={viewportRef}>
             <Stack gap="md" pb="sm">
               <Paper
@@ -340,6 +514,23 @@ export default function HelpAgentWidget({
             </Stack>
           </ScrollArea>
 
+          {/* 결론에 도달한 대화를 지식 베이스로 정제 저장 (세션당 1회) */}
+          {sessionId !== null && messages.some((m) => m.role === 'assistant') && (
+            <Button
+              size="xs"
+              variant="light"
+              color={extractedId ? 'teal' : 'grape'}
+              leftSection={extractedId ? <IconCheck size={14} /> : <IconBulb size={14} />}
+              loading={extracting}
+              disabled={!!extractedId}
+              onClick={extractKnowledge}
+            >
+              {extractedId
+                ? `지식 ${extractedId} 저장됨 — 지식 베이스에서 검토하세요`
+                : '이 대화를 지식으로 저장'}
+            </Button>
+          )}
+
           <div className={classes.inputWrap}>
             <Group gap="xs" align="flex-end">
               <Textarea
@@ -371,6 +562,8 @@ export default function HelpAgentWidget({
               </ActionIcon>
             </Group>
           </div>
+          </>
+          )}
         </Stack>
       </Drawer>
     </>

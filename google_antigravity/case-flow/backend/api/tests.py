@@ -493,6 +493,198 @@ class RolePermissionTests(TestCase):
         self.assertFalse(me['is_admin'])
 
 
+class ChatSessionTests(TestCase):
+    """AI 도우미 대화 저장(ChatSession/ChatTurn)과 엔지니어 이상 권한."""
+
+    FAKE_RESULT = {
+        'reply': 'C-1001 케이스가 유사합니다.',
+        'tool_calls': [{'name': 'search_cases', 'input': {'query': 'VRRP'}}],
+        'model': 'claude-haiku-4-5-20251001',
+        'agent': 'search',
+    }
+
+    def setUp(self):
+        from django.contrib.auth.models import User
+        from .permissions import set_user_role
+        for username, role in (('v1', 'viewer'), ('e1', 'engineer'), ('e2', 'engineer')):
+            user = User.objects.create_user(username, password='role-pass-123!')
+            set_user_role(user, role)
+
+    def login(self, username):
+        self.client.post('/api/auth/login/',
+                         {'username': username, 'password': 'role-pass-123!'},
+                         content_type='application/json')
+
+    def chat(self, content, session_id=None):
+        with patch('api.views.help_agent.chat', return_value=dict(self.FAKE_RESULT)):
+            return self.client.post(
+                '/api/help-agent/chat/',
+                {'messages': [{'role': 'user', 'content': content}],
+                 'session_id': session_id},
+                content_type='application/json')
+
+    def test_engineer_can_chat_viewer_cannot(self):
+        self.login('e1')
+        self.assertEqual(self.chat('VRRP 유사 사례').status_code, 200)
+        self.login('v1')
+        self.assertEqual(self.chat('VRRP 유사 사례').status_code, 403)
+
+    def test_first_chat_creates_session_with_both_turns(self):
+        from .models import ChatSession, ChatTurn
+        self.login('e1')
+        data = self.chat('VRRP 유사 사례 찾아줘').json()
+
+        session = ChatSession.objects.get(id=data['session_id'])
+        self.assertEqual(session.user.username, 'e1')
+        self.assertEqual(session.title, 'VRRP 유사 사례 찾아줘')
+        turns = list(ChatTurn.objects.filter(session=session))
+        self.assertEqual([t.role for t in turns], ['user', 'assistant'])
+        self.assertEqual(turns[1].agent, 'search')
+        self.assertEqual(turns[1].tool_calls, self.FAKE_RESULT['tool_calls'])
+
+    def test_followup_appends_to_same_session(self):
+        from .models import ChatTurn
+        self.login('e1')
+        first = self.chat('첫 질문').json()
+        second = self.chat('두 번째 질문', session_id=first['session_id']).json()
+        self.assertEqual(second['session_id'], first['session_id'])
+        self.assertEqual(
+            ChatTurn.objects.filter(session_id=first['session_id']).count(), 4)
+
+    def test_sessions_are_private_to_owner(self):
+        self.login('e1')
+        session_id = self.chat('e1의 질문').json()['session_id']
+
+        self.login('e2')
+        self.assertEqual(
+            self.client.get(f'/api/help-agent/sessions/{session_id}/').status_code, 404)
+        self.assertEqual(self.client.get('/api/help-agent/sessions/').json(), [])
+        # 남의 세션에 이어 쓰기도 차단
+        self.assertEqual(self.chat('가로채기', session_id=session_id).status_code, 404)
+
+    def test_session_list_and_detail_and_delete(self):
+        from .models import ChatSession
+        self.login('e1')
+        session_id = self.chat('목록 테스트').json()['session_id']
+
+        sessions = self.client.get('/api/help-agent/sessions/').json()
+        self.assertEqual([s['id'] for s in sessions], [session_id])
+        self.assertEqual(sessions[0]['turn_count'], 2)
+
+        detail = self.client.get(f'/api/help-agent/sessions/{session_id}/').json()
+        self.assertEqual(len(detail['turns']), 2)
+        self.assertEqual(detail['turns'][1]['content'], self.FAKE_RESULT['reply'])
+
+        delete = self.client.delete(f'/api/help-agent/sessions/{session_id}/')
+        self.assertEqual(delete.status_code, 204)
+        self.assertFalse(ChatSession.objects.filter(id=session_id).exists())
+
+    def test_save_failure_still_returns_reply(self):
+        self.login('e1')
+        with patch('api.views.ChatSession.objects.create', side_effect=RuntimeError('db down')):
+            response = self.chat('저장 실패해도 답변은 온다')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data['reply'], self.FAKE_RESULT['reply'])
+        self.assertIsNone(data['session_id'])
+
+
+class ChatKnowledgeExtractTests(TestCase):
+    """대화 세션 -> 지식 추출 (2단계): 명시적 버튼, AI 정제, draft 등록."""
+
+    EXTRACTED = {
+        'has_knowledge': True,
+        'vendor': 'A10',
+        'title': 'VRRP failover 시 세션 동기화 누락',
+        'problem': 'failover 후 기존 세션이 끊깁니다.',
+        'root_cause': 'session sync 미설정.',
+        'resolution': 'vrrp-a session-sync enable 설정을 추가합니다.',
+        'device_model': 'TH4435',
+        'software_version': '5.2.1-P10',
+    }
+
+    def setUp(self):
+        from django.contrib.auth.models import User
+        from .permissions import set_user_role
+        from .models import ChatSession, ChatTurn
+        for username in ('e1', 'e2'):
+            user = User.objects.create_user(username, password='role-pass-123!')
+            set_user_role(user, 'engineer')
+        owner = User.objects.get(username='e1')
+        self.session = ChatSession.objects.create(user=owner, title='VRRP 문제')
+        ChatTurn.objects.create(session=self.session, role='user',
+                                content='VRRP failover 후 세션이 끊겨요')
+        ChatTurn.objects.create(
+            session=self.session, role='assistant', agent='tech',
+            content='vrrp-a session-sync enable 설정이 필요합니다.',
+            tool_calls=[{'name': 'search_references', 'input': {'query': 'vrrp'}}])
+
+    def login(self, username):
+        self.client.post('/api/auth/login/',
+                         {'username': username, 'password': 'role-pass-123!'},
+                         content_type='application/json')
+
+    def extract(self, session_id=None, ai_result='default'):
+        if ai_result == 'default':
+            ai_result = dict(self.EXTRACTED)
+        with patch('api.services.knowledge.generate_structured',
+                   return_value=ai_result), \
+             patch('api.services.knowledge.enrich_with_references',
+                   return_value='no_candidates'):
+            return self.client.post(
+                f'/api/help-agent/sessions/{session_id or self.session.id}/knowledge/')
+
+    def test_extracts_draft_knowledge_with_session_source(self):
+        from .models import KnowledgeItem
+        self.login('e1')
+        res = self.extract()
+        self.assertEqual(res.status_code, 201)
+        data = res.json()
+        self.assertEqual(data['outcome'], 'created')
+        self.assertEqual(data['item']['source_session']['id'], self.session.id)
+        self.assertIsNone(data['item']['source_case'])
+
+        item = KnowledgeItem.objects.get(id=data['item']['id'])
+        self.assertEqual(item.chat_session, self.session)
+        self.assertEqual(item.vendor, 'A10')
+        self.assertEqual(item.status, 'draft')
+        self.assertIn('session-sync', item.resolution)
+
+    def test_second_extract_returns_existing(self):
+        from .models import KnowledgeItem
+        self.login('e1')
+        first = self.extract().json()
+        res = self.extract()
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()['outcome'], 'exists')
+        self.assertEqual(res.json()['item']['id'], first['item']['id'])
+        self.assertEqual(KnowledgeItem.objects.count(), 1)
+
+    def test_no_knowledge_conversation_rejected(self):
+        self.login('e1')
+        res = self.extract(ai_result={**self.EXTRACTED, 'has_knowledge': False,
+                                      'resolution': ''})
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.json()['outcome'], 'no_knowledge')
+
+    def test_unknown_vendor_rejected(self):
+        self.login('e1')
+        res = self.extract(ai_result={**self.EXTRACTED, 'vendor': ''})
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.json()['outcome'], 'no_vendor')
+
+    def test_other_users_session_not_found(self):
+        self.login('e2')
+        self.assertEqual(self.extract().status_code, 404)
+
+    def test_chat_material_includes_tools_and_roles(self):
+        from .services.knowledge import build_chat_material
+        material = build_chat_material(self.session)
+        self.assertIn('[엔지니어]', material)
+        self.assertIn('[AI] (사용 도구: search_references)', material)
+        self.assertIn('vrrp-a session-sync enable', material)
+
+
 class SignupRequestTests(TestCase):
     """계정 발급 요청 -> 승인 메일 -> 링크 클릭으로 계정 생성."""
 
@@ -1097,11 +1289,13 @@ class HelpAgentTemplateTests(TestCase):
 class HelpAgentEndpointTests(TestCase):
     """POST /api/help-agent/chat/ 의 인증·검증·응답.
 
-    AI 호출 비용 때문에 테스트 배포 동안 관리자 전용 (2026-07-11 결정).
+    엔지니어 이상 사용 가능 (2026-07-21, 관리자 전용에서 확대).
     """
 
     def setUp(self):
-        User.objects.create_user('viewer1', password='pw123456')
+        from .permissions import set_user_role
+        viewer = User.objects.create_user('viewer1', password='pw123456')
+        set_user_role(viewer, 'viewer')
         User.objects.create_user('admin1', password='pw123456', is_staff=True)
 
     def login(self, username):
@@ -1115,7 +1309,7 @@ class HelpAgentEndpointTests(TestCase):
                                content_type='application/json')
         self.assertIn(res.status_code, (401, 403))
 
-    def test_non_admin_is_blocked(self):
+    def test_viewer_is_blocked(self):
         self.login('viewer1')
         res = self.client.post('/api/help-agent/chat/',
                                {'messages': [{'role': 'user', 'content': '안녕'}]},
@@ -1144,7 +1338,7 @@ class HelpAgentEndpointTests(TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json()['reply'], '안녕하세요')
 
-    def test_file_download_requires_admin(self):
+    def test_file_download_blocks_viewer(self):
         self.login('viewer1')
         res = self.client.get('/api/help-agent/files/file_abc123/')
         self.assertEqual(res.status_code, 403)

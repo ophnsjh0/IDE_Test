@@ -4,6 +4,7 @@ from datetime import timedelta
 from urllib.parse import quote
 
 import anthropic
+from django.db import transaction
 from django.db.models import Count, F, Max, Q
 from django.http import HttpResponse
 from django.db.models.functions import Coalesce, TruncDate
@@ -16,9 +17,10 @@ from rest_framework.views import APIView
 
 from django.conf import settings
 
-from .models import AppSetting, Case, KnowledgeItem, UsageEvent
+from .models import AppSetting, Case, ChatSession, ChatTurn, KnowledgeItem, UsageEvent
 from .permissions import IsAdminRole, IsEngineerOrAbove
 from .serializers import (CaseSerializer, CaseDetailSerializer,
+                          ChatSessionDetailSerializer, ChatSessionSerializer,
                           KnowledgeItemSerializer)
 from .services.usage import log_event
 from .services.analyzer import (
@@ -271,12 +273,14 @@ class GmailSyncView(APIView):
 class HelpAgentChatView(APIView):
     """POST /api/help-agent/chat/ — 케이스 DB 검색 헬프 에이전트와 대화.
 
-    호출마다 AI API 비용이 발생하므로 테스트 배포 동안은 관리자 전용
-    (2026-07-11 결정). 전체 공개 시 permission만 되돌리면 됨.
-    본문: {"messages": [{"role": "user"|"assistant", "content": "..."}]}
+    엔지니어 이상 사용 가능 (2026-07-21, 관리자 전용에서 확대).
+    본문: {"messages": [{"role", "content"}, ...], "session_id": 123(선택)}
+    대화는 ChatSession/ChatTurn으로 저장된다 — session_id가 오면 그 세션에
+    마지막 질문·답변 턴만 추가하고(이전 턴은 이미 저장돼 있음), 없으면
+    새 세션을 만든다. 응답에 session_id를 돌려줘 프론트가 이어가게 한다.
     """
 
-    permission_classes = [IsAdminRole]
+    permission_classes = [IsEngineerOrAbove]
 
     MAX_CONTENT_LENGTH = 4000
 
@@ -285,6 +289,15 @@ class HelpAgentChatView(APIView):
         error = self._validate(messages)
         if error:
             return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
+
+        session = None
+        session_id = request.data.get('session_id')
+        if session_id is not None:
+            session = ChatSession.objects.filter(
+                id=session_id, user=request.user).first()
+            if session is None:
+                return Response({'error': '세션을 찾을 수 없습니다.'},
+                                status=status.HTTP_404_NOT_FOUND)
 
         try:
             result = help_agent.chat(messages)
@@ -308,7 +321,37 @@ class HelpAgentChatView(APIView):
         # 어떤 에이전트가 어떤 질문을 받았는지 파일럿 지표로 남긴다 (질문은 앞 80자만)
         log_event(request.user, 'agent_chat',
                   detail=f"[{result.get('agent', '?')}] {messages[-1]['content'][:80]}")
+        result['session_id'] = self._save_turns(
+            request.user, session, messages[-1]['content'], result)
         return Response(result)
+
+    @staticmethod
+    def _save_turns(user, session, question, result):
+        """질문·답변 턴을 세션에 저장하고 세션 id를 반환.
+
+        저장은 부가 기능 — 이미 비용이 발생한 답변을 저장 실패로 잃지
+        않도록 예외를 전파하지 않는다 (session_id: null로 응답).
+        """
+        try:
+            with transaction.atomic():
+                if session is None:
+                    session = ChatSession.objects.create(
+                        user=user, title=question[:200])
+                ChatTurn.objects.create(
+                    session=session, role='user', content=question)
+                ChatTurn.objects.create(
+                    session=session, role='assistant',
+                    content=result.get('reply', ''),
+                    agent=result.get('agent', ''),
+                    model=result.get('model', ''),
+                    tool_calls=result.get('tool_calls', []),
+                    files=result.get('files', []),
+                )
+                session.save(update_fields=['updated_at'])
+            return session.id
+        except Exception:
+            logger.exception("failed to persist chat session")
+            return None
 
     def _validate(self, messages):
         if not isinstance(messages, list) or not messages:
@@ -326,16 +369,101 @@ class HelpAgentChatView(APIView):
         return None
 
 
+class ChatSessionListView(generics.ListAPIView):
+    """GET /api/help-agent/sessions/ — 내 대화 세션 목록 (최근 갱신순).
+
+    대화 원문은 본인만 접근 (질문을 남이 본다는 부담이 사용을 위축시키지
+    않도록). 지식 추출 2단계에서 정제된 지식만 전체 공유될 예정.
+    """
+
+    permission_classes = [IsEngineerOrAbove]
+    serializer_class = ChatSessionSerializer
+
+    def get_queryset(self):
+        return ChatSession.objects.filter(user=self.request.user)
+
+
+class ChatSessionDetailView(APIView):
+    """GET/DELETE /api/help-agent/sessions/<id>/ — 세션 대화 내용 조회/삭제 (본인만)."""
+
+    permission_classes = [IsEngineerOrAbove]
+
+    def _get_session(self, request, session_id):
+        return ChatSession.objects.filter(id=session_id, user=request.user).first()
+
+    def get(self, request, session_id):
+        session = self._get_session(request, session_id)
+        if session is None:
+            return Response({'error': '세션을 찾을 수 없습니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        return Response(ChatSessionDetailSerializer(session).data)
+
+    def delete(self, request, session_id):
+        session = self._get_session(request, session_id)
+        if session is None:
+            return Response({'error': '세션을 찾을 수 없습니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        session.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ChatKnowledgeExtractView(APIView):
+    """POST /api/help-agent/sessions/<id>/knowledge/ — 대화에서 지식 추출.
+
+    사용자가 대화가 유효한 결론에 도달했다고 판단했을 때 명시적으로 호출
+    ("이 대화를 지식으로 저장" 버튼). AI가 시행착오를 걸러 문제-원인-해결을
+    정제해 KnowledgeItem(draft, 출처=chat_session)으로 저장한다.
+    본인 세션만 가능. 이미 추출된 세션이면 기존 항목을 돌려준다.
+    """
+
+    permission_classes = [IsEngineerOrAbove]
+
+    ERROR_MESSAGES = {
+        'no_knowledge': '이 대화에서는 재사용할 만한 문제-해결 지식을 찾지 못했습니다. '
+                        '해결책이 오간 대화에서 다시 시도해주세요.',
+        'no_vendor': '대화에서 어느 벤더(A10/Arista/HPE Aruba/Juniper) 장비인지 알 수 '
+                     '없어 지식으로 저장하지 못했습니다. 벤더나 장비 모델을 언급한 뒤 '
+                     '다시 시도해주세요.',
+        'failed': 'AI 추출에 실패했습니다. 잠시 후 다시 시도해주세요.',
+    }
+
+    def post(self, request, session_id):
+        session = ChatSession.objects.filter(id=session_id, user=request.user).first()
+        if session is None:
+            return Response({'error': '세션을 찾을 수 없습니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        from .services.knowledge import extract_knowledge_from_chat
+        try:
+            outcome, item = extract_knowledge_from_chat(session)
+        except Exception:
+            logger.exception("chat knowledge extraction failed (session %s)", session_id)
+            return Response({'error': self.ERROR_MESSAGES['failed']},
+                            status=status.HTTP_502_BAD_GATEWAY)
+
+        if outcome in self.ERROR_MESSAGES:
+            return Response({'error': self.ERROR_MESSAGES[outcome], 'outcome': outcome},
+                            status=status.HTTP_502_BAD_GATEWAY
+                            if outcome == 'failed' else status.HTTP_400_BAD_REQUEST)
+
+        log_event(request.user, 'knowledge_extract',
+                  detail=f"session={session_id} -> {item.knowledge_id} ({outcome})")
+        return Response({'outcome': outcome,
+                         'item': KnowledgeItemSerializer(item).data},
+                        status=status.HTTP_201_CREATED if outcome == 'created'
+                        else status.HTTP_200_OK)
+
+
 RE_ANTHROPIC_FILE_ID = re.compile(r'^file_[A-Za-z0-9_-]+$')
 
 
 class HelpAgentFileView(APIView):
     """GET /api/help-agent/files/<file_id>/ — 리포팅 에이전트가 생성한
     문서(워드/엑셀/PPT)를 Anthropic Files API에서 받아 다운로드로 중계.
-    채팅과 동일하게 테스트 배포 동안 관리자 전용.
+    채팅과 동일하게 엔지니어 이상.
     """
 
-    permission_classes = [IsAdminRole]
+    permission_classes = [IsEngineerOrAbove]
 
     def get(self, request, file_id):
         if not RE_ANTHROPIC_FILE_ID.match(file_id):

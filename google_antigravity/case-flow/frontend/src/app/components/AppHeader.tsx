@@ -20,6 +20,7 @@ export default function AppHeader() {
   const router = useRouter();
   const [username, setUsername] = useState('');
   const [isAdmin, setIsAdmin] = useState(false);
+  const [isEngineer, setIsEngineer] = useState(false);
   const [connError, setConnError] = useState(false);
 
   // 로그인 상태 확인 겸 csrftoken 쿠키 발급. 미로그인이면 로그인 페이지로,
@@ -35,6 +36,7 @@ export default function AppHeader() {
         if (data.authenticated) {
           setUsername(data.name || data.username);
           setIsAdmin(!!data.is_admin);
+          setIsEngineer(data.role === 'engineer' || data.role === 'admin');
         } else {
           router.push('/login');
         }
@@ -93,9 +95,8 @@ export default function AppHeader() {
           </Button>
         )}
         {/* 리스트 페이지(/)는 status 필터 줄에 인라인 버튼이 있어 플로팅 생략.
-            AI 비용 때문에 테스트 배포 동안 관리자에게만 노출 (서버도 차단) */}
-        {pathname !== '/' && isAdmin && <HelpAgentWidget />}
-        {/* {pathname !== '/' && <HelpAgentWidget />} */}
+            엔지니어 이상 사용 가능 (서버도 동일하게 차단) */}
+        {pathname !== '/' && isEngineer && <HelpAgentWidget />}
         {connError && (
           <Group gap={6} ml="md">
             <Text size="sm" c="red" fw={600}>

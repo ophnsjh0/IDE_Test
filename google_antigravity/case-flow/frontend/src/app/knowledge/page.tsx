@@ -43,6 +43,7 @@ interface KnowledgeItem {
   status: string; // draft | confirmed
   analyzed_by: string;
   source_case: { id: number; case_id: string; status: string; vendor_case_number: string | null } | null;
+  source_session: { id: number; title: string } | null;
   created_at: string;
   updated_at: string;
 }
@@ -261,6 +262,8 @@ function KnowledgeListPage() {
       <Table.Td style={{ whiteSpace: 'nowrap' }}>
         {element.source_case ? (
           <Text size="sm" fw={500}>{element.source_case.case_id}</Text>
+        ) : element.source_session ? (
+          <Text size="sm" fw={500} c="grape">AI 대화</Text>
         ) : (
           <Text size="sm" c="dimmed">—</Text>
         )}
