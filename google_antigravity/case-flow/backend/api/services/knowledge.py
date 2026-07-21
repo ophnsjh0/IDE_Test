@@ -1,8 +1,14 @@
 """해결된 케이스·AI 도우미 대화에서 재사용 가능한 기술 지식(문제-원인-해결)을 AI로 추출한다."""
+import fcntl
 import logging
+import os
+
+from django.conf import settings
+from django.utils import timezone
 
 from api.models import Case, KnowledgeItem
 from .analyzer import generate_structured, get_translation_model
+from .gmail_sync import SyncInProgress
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +81,8 @@ def extract_knowledge(case):
 
     반환: ('created', item) | ('no_knowledge', None) | ('failed', None)
     이미 이 케이스에서 추출한 지식이 있으면 ('exists', 기존 item).
+    검토가 끝난 케이스(created/no_knowledge)는 knowledge_checked_at을 찍어
+    다음 동기화에서 건너뛴다 — failed는 남겨 재시도되게 한다.
     """
     existing = case.knowledge_items.first()
     if existing:
@@ -84,6 +92,7 @@ def extract_knowledge(case):
     if result is None:
         return 'failed', None
     if not result.get('has_knowledge') or not (result.get('resolution') or '').strip():
+        _mark_checked(case)
         return 'no_knowledge', None
 
     item = KnowledgeItem.objects.create(
@@ -98,12 +107,63 @@ def extract_knowledge(case):
         analyzed_by=get_translation_model(),
     )
     logger.info("Knowledge extracted from %s -> %s", case.case_id, item.knowledge_id)
+    _mark_checked(case)
     # 공식 문서 근거는 부가 정보 — 실패해도 지식 생성 자체는 유지
     try:
         enrich_with_references(item)
     except Exception:
         logger.exception("reference enrichment failed for %s", item.knowledge_id)
     return 'created', item
+
+
+def _mark_checked(case):
+    case.knowledge_checked_at = timezone.now()
+    case.save(update_fields=['knowledge_checked_at'])
+
+
+# ------------------------------------------------- 지식 동기화 (버튼/일괄)
+
+_SYNC_LOCK_FILE = os.path.join(settings.BASE_DIR, '.knowledge_sync.lock')
+
+# 한 번에 처리할 최대 케이스 수 — 케이스당 AI 호출이 있어 HTTP 타임아웃과
+# 무료 티어 일일 한도(Gemini ~20건) 안에서 끊는다. 남은 건은 재클릭으로 이어간다.
+SYNC_MAX_CASES = 10
+
+
+def sync_from_cases(limit=SYNC_MAX_CASES):
+    """미검토 Resolved 케이스에서 지식을 일괄 추출한다 (지식 동기화 버튼).
+
+    Gmail 동기화와 같은 파일 잠금으로 동시 실행을 차단한다.
+    반환: {'scanned', 'created', 'no_knowledge', 'failed', 'remaining'}
+    """
+    lock_file = open(_SYNC_LOCK_FILE, 'w')
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        raise SyncInProgress('지식 동기화가 이미 진행 중입니다. 잠시 후 다시 시도하세요.')
+    try:
+        return _sync_from_cases(limit)
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def _sync_from_cases(limit):
+    pending = (Case.objects
+               .filter(status='Resolved', knowledge_items__isnull=True,
+                       knowledge_checked_at__isnull=True)
+               .prefetch_related('emails').order_by('id'))
+    cases = list(pending[:limit])
+
+    summary = {'scanned': len(cases), 'created': 0, 'no_knowledge': 0, 'failed': 0}
+    for case in cases:
+        outcome, _ = extract_knowledge(case)
+        # exists는 쿼리셋 조건상 나올 수 없지만, 경쟁 상황을 대비해 안전 처리
+        summary[outcome if outcome != 'exists' else 'no_knowledge'] += 1
+    # failed는 checked_at이 안 찍혀 남는다 — 재클릭 시 재시도 대상
+    summary['remaining'] = pending.count()
+    return summary
 
 
 # ------------------------------------------------- AI 도우미 대화에서 추출

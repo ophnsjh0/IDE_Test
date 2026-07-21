@@ -25,10 +25,12 @@ import {
   IconChevronUp,
   IconChevronDown,
   IconSelector,
+  IconDatabaseImport,
 } from '@tabler/icons-react';
 import AppHeader from '../components/AppHeader';
 import ScrollToTopButton from '../components/ScrollToTopButton';
 import { apiFetch } from '../lib/api';
+import { useMe } from '../lib/useMe';
 
 interface KnowledgeItem {
   id: number;
@@ -113,6 +115,9 @@ function KnowledgeListPage() {
     SORT_KEYS.includes(initialSort as SortKey) ? (initialSort as SortKey) : null
   );
   const [sortAsc, setSortAsc] = useState(searchParams.get('dir') !== 'desc');
+  const [syncing, setSyncing] = useState(false);
+  const [syncMessage, setSyncMessage] = useState('');
+  const { isAdmin } = useMe();
   const router = useRouter();
 
   const fetchItems = async () => {
@@ -136,6 +141,36 @@ function KnowledgeListPage() {
   useEffect(() => {
     fetchItems();
   }, []);
+
+  // 미검토 Resolved 케이스에서 지식 일괄 추출 (관리자 전용, 한 번에 최대 10건)
+  const syncKnowledge = async () => {
+    setSyncing(true);
+    setSyncMessage('');
+    try {
+      const response = await apiFetch('/api/knowledge/sync/', { method: 'POST' });
+      const data = await response.json();
+      if (response.ok) {
+        setSyncMessage(
+          data.scanned === 0
+            ? '동기화 완료: 검토할 새 Resolved 케이스가 없습니다.'
+            : `동기화 완료: 케이스 ${data.scanned}건 검토, 지식 ${data.created}건 생성` +
+              (data.no_knowledge > 0 ? `, 지식 없음 ${data.no_knowledge}건` : '') +
+              (data.failed > 0 ? `, 실패 ${data.failed}건` : '') +
+              (data.remaining > 0
+                ? ` — 미처리 ${data.remaining}건, 버튼을 다시 눌러 계속하세요`
+                : '')
+        );
+        fetchItems();
+      } else {
+        setSyncMessage(`동기화 실패: ${data.error || response.statusText}`);
+      }
+    } catch (error) {
+      console.error('Error syncing knowledge:', error);
+      setSyncMessage('동기화 실패: 백엔드 서버에 연결할 수 없습니다.');
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   const getVendorFilter = (tab: string | null) => {
     if (tab === 'all' || !tab) return null;
@@ -287,10 +322,28 @@ function KnowledgeListPage() {
               <Title order={2}>Knowledge Base</Title>
               <Text c="dimmed">해결된 케이스에서 추출한 문제-원인-해결 지식</Text>
             </div>
-            <Button leftSection={<IconRefresh size={14} />} variant="default" onClick={fetchItems}>
-              Refresh
-            </Button>
+            <Group gap="xs">
+              {isAdmin && (
+                <Button
+                  leftSection={<IconDatabaseImport size={14} />}
+                  variant="light"
+                  onClick={syncKnowledge}
+                  loading={syncing}
+                >
+                  지식 동기화
+                </Button>
+              )}
+              <Button leftSection={<IconRefresh size={14} />} variant="default" onClick={fetchItems}>
+                Refresh
+              </Button>
+            </Group>
           </Group>
+
+          {syncMessage && (
+            <Text size="sm" c={syncMessage.startsWith('동기화 완료') ? 'teal' : 'red'} mb="sm">
+              {syncMessage}
+            </Text>
+          )}
 
           <Paper shadow="xs" p="md" withBorder>
             <Tabs

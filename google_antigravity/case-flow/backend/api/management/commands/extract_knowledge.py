@@ -32,6 +32,9 @@ class Command(BaseCommand):
         parser.add_argument('--model', help='이번 실행에서만 사용할 AI 모델 id')
         parser.add_argument('--enrich', action='store_true',
                             help='추출 대신 기존 지식 항목의 공식 문서 근거를 재탐색해 저장')
+        parser.add_argument('--recheck', action='store_true',
+                            help='지식 없음으로 검토 완료된 케이스도 다시 스캔 '
+                                 '(기본은 미검토 케이스만 — 지식 동기화 버튼과 동일)')
 
     def handle(self, *args, **options):
         if options['enrich']:
@@ -105,6 +108,8 @@ class Command(BaseCommand):
 
         qs = (Case.objects.filter(status='Resolved', knowledge_items__isnull=True)
               .prefetch_related('emails').order_by('id'))
+        if not options['recheck']:
+            qs = qs.filter(knowledge_checked_at__isnull=True)
         if options['limit']:
             qs = qs[:options['limit']]
         return list(qs)

@@ -690,6 +690,80 @@ class ChatKnowledgeExtractTests(TestCase):
         self.assertIn('vrrp-a session-sync enable', material)
 
 
+class KnowledgeSyncTests(TestCase):
+    """지식 동기화 버튼: 미검토 Resolved 케이스 일괄 추출 (admin 전용)."""
+
+    EXTRACTED = {
+        'has_knowledge': True,
+        'title': '문제 요약',
+        'problem': '증상',
+        'root_cause': '원인',
+        'resolution': 'fix 명령을 실행합니다.',
+        'device_model': '',
+        'software_version': '',
+    }
+
+    def setUp(self):
+        from django.contrib.auth.models import User
+        from .permissions import set_user_role
+        for username, role in (('e1', 'engineer'), ('a1', 'admin')):
+            user = User.objects.create_user(username, password='role-pass-123!')
+            set_user_role(user, role)
+
+    def login(self, username):
+        self.client.post('/api/auth/login/',
+                         {'username': username, 'password': 'role-pass-123!'},
+                         content_type='application/json')
+
+    def sync(self, ai_result='default'):
+        if ai_result == 'default':
+            ai_result = dict(self.EXTRACTED)
+        with patch('api.services.knowledge.generate_structured',
+                   return_value=ai_result), \
+             patch('api.services.knowledge.enrich_with_references',
+                   return_value='no_candidates'):
+            return self.client.post('/api/knowledge/sync/')
+
+    def test_engineer_is_blocked(self):
+        self.login('e1')
+        self.assertEqual(self.sync().status_code, 403)
+
+    def test_sync_extracts_and_marks_checked(self):
+        from .models import KnowledgeItem
+        resolved = make_case(vendor='A10', status='Resolved', summary='해결된 케이스')
+        make_case(vendor='A10', status='Open', summary='미해결 케이스')
+
+        self.login('a1')
+        data = self.sync().json()
+        self.assertEqual(data, {'scanned': 1, 'created': 1, 'no_knowledge': 0,
+                                'failed': 0, 'remaining': 0})
+        item = KnowledgeItem.objects.get()
+        self.assertEqual(item.case, resolved)
+        resolved.refresh_from_db()
+        self.assertIsNotNone(resolved.knowledge_checked_at)
+
+    def test_no_knowledge_case_is_not_rescanned(self):
+        case = make_case(vendor='A10', status='Resolved', summary='공지 케이스')
+        self.login('a1')
+        data = self.sync(ai_result={**self.EXTRACTED, 'has_knowledge': False,
+                                    'resolution': ''}).json()
+        self.assertEqual((data['scanned'], data['no_knowledge']), (1, 1))
+        case.refresh_from_db()
+        self.assertIsNotNone(case.knowledge_checked_at)
+        # 재클릭: 이미 검토된 케이스는 다시 스캔하지 않는다 (AI 비용 절감)
+        data = self.sync().json()
+        self.assertEqual(data['scanned'], 0)
+
+    def test_failed_case_remains_for_retry(self):
+        make_case(vendor='A10', status='Resolved', summary='AI 오류 케이스')
+        self.login('a1')
+        data = self.sync(ai_result=None).json()
+        self.assertEqual((data['failed'], data['remaining']), (1, 1))
+        # 실패 건은 검토 표시가 없어 다음 동기화에서 재시도된다
+        data = self.sync().json()
+        self.assertEqual((data['scanned'], data['created']), (1, 1))
+
+
 class SignupRequestTests(TestCase):
     """계정 발급 요청 -> 승인 메일 -> 링크 클릭으로 계정 생성."""
 

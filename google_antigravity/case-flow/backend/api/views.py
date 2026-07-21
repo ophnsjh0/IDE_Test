@@ -407,6 +407,31 @@ class ChatSessionDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+class KnowledgeSyncView(APIView):
+    """POST /api/knowledge/sync/ — 미검토 Resolved 케이스에서 지식 일괄 추출.
+
+    Gmail 동기화와 같은 관리자 버튼. 케이스당 AI 호출 비용이 들어
+    한 번에 SYNC_MAX_CASES건까지만 처리하고 남은 건수를 돌려준다.
+    """
+
+    permission_classes = [IsAdminRole]
+
+    def post(self, request):
+        from .services.knowledge import sync_from_cases
+        try:
+            summary = sync_from_cases()
+        except SyncInProgress as e:
+            return Response({'error': str(e)}, status=status.HTTP_409_CONFLICT)
+        except Exception:
+            logger.exception("knowledge sync failed")
+            return Response({'error': '지식 동기화 중 오류가 발생했습니다. 서버 로그를 확인하세요.'},
+                            status=status.HTTP_502_BAD_GATEWAY)
+        log_event(request.user, 'knowledge_extract',
+                  detail=(f"sync scanned={summary['scanned']} created={summary['created']} "
+                          f"remaining={summary['remaining']}"))
+        return Response(summary)
+
+
 class ChatKnowledgeExtractView(APIView):
     """POST /api/help-agent/sessions/<id>/knowledge/ — 대화에서 지식 추출.
 

@@ -20,6 +20,7 @@ urlpatterns = [
     path('cases/<int:id>/relations/<int:other_id>/', views.CaseRelationView.as_view(),
          name='case-relation-remove'),
     path('knowledge/', views.KnowledgeListView.as_view(), name='knowledge-list'),
+    path('knowledge/sync/', views.KnowledgeSyncView.as_view(), name='knowledge-sync'),
     path('knowledge/<int:id>/', views.KnowledgeDetailView.as_view(),
          name='knowledge-detail'),
     path('gmail/sync/', views.GmailSyncView.as_view(), name='gmail-sync'),

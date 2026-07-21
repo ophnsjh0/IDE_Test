@@ -126,6 +126,9 @@ class Case(models.Model):
     software_version = models.CharField(max_length=50, blank=True, default='')
     # 같은 사건에서 파생됐지만 별도 트랙인 케이스들의 상호 참조 (병합 대신 링크)
     related_cases = models.ManyToManyField('self', blank=True)
+    # 지식 추출 검토 완료 시각 — 지식이 없다고 판정된 케이스를 동기화 때마다
+    # 다시 AI로 스캔하지 않기 위한 표시 (비용 절감). null = 미검토.
+    knowledge_checked_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
