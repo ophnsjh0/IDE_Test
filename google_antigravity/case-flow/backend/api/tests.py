@@ -669,9 +669,14 @@ class ChatKnowledgeExtractTests(TestCase):
 
     def test_unknown_vendor_rejected(self):
         self.login('e1')
-        res = self.extract(ai_result={**self.EXTRACTED, 'vendor': ''})
+        res = self.extract(ai_result={**self.EXTRACTED, 'vendor': 'Unknown'})
         self.assertEqual(res.status_code, 400)
         self.assertEqual(res.json()['outcome'], 'no_vendor')
+
+    def test_chat_schema_has_no_empty_enum_value(self):
+        # Gemini는 enum의 빈 문자열을 400 INVALID_ARGUMENT로 거부한다
+        from .services.knowledge import CHAT_KNOWLEDGE_SCHEMA
+        self.assertNotIn('', CHAT_KNOWLEDGE_SCHEMA['properties']['vendor']['enum'])
 
     def test_other_users_session_not_found(self):
         self.login('e2')

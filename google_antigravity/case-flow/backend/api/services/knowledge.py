@@ -109,13 +109,14 @@ def extract_knowledge(case):
 # ------------------------------------------------- AI 도우미 대화에서 추출
 
 # 케이스 추출과 달리 벤더가 컨텍스트에 없어 AI가 대화에서 판별한다.
-# 빈 문자열 = 대화에 벤더 단서가 없음 (추출 거부 사유).
+# "Unknown" = 대화에 벤더 단서가 없음 (추출 거부 사유).
+# 빈 문자열 센티널은 쓰지 않는다 — Gemini가 enum의 빈 값을 400으로 거부.
 CHAT_KNOWLEDGE_SCHEMA = {
     **KNOWLEDGE_SCHEMA,
     "properties": {
         **KNOWLEDGE_SCHEMA["properties"],
         "vendor": {"type": "string",
-                   "enum": [v for v, _ in Case.VENDOR_CHOICES] + [""]},
+                   "enum": [v for v, _ in Case.VENDOR_CHOICES] + ["Unknown"]},
     },
     "required": KNOWLEDGE_SCHEMA["required"] + ["vendor"],
 }
@@ -134,7 +135,7 @@ CHAT_SYSTEM_PROMPT = """당신은 네트워크 벤더(A10/Arista/HPE Aruba/Junip
   다음은 반드시 false: 단순 현황/통계 질문(케이스 몇 건 등), 리포트 생성 요청,
   일반 상식 문답, 해결책 없이 질문만 오간 대화, 결론이 나지 않은 대화.
   false면 나머지 필드는 빈 문자열 "".
-- vendor: 대화에서 다룬 장비의 벤더. 대화에 단서가 없으면 빈 문자열 "".
+- vendor: 대화에서 다룬 장비의 벤더. 대화에 단서가 없으면 "Unknown".
 - title: 문제를 한 줄로 요약 (최대 80자, 검색될 것을 고려해 증상·장비를 담을 것)
 - problem: 증상과 문제 상황 — 어떤 조건에서 무엇이 잘못됐는지. 고객사명은 쓰지 말 것.
 - root_cause: 대화에서 밝혀진 근본 원인. 명확하지 않으면 빈 문자열 "".
