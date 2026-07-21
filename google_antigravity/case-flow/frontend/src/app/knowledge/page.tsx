@@ -26,11 +26,25 @@ import {
   IconChevronDown,
   IconSelector,
   IconDatabaseImport,
+  IconSparkles,
 } from '@tabler/icons-react';
 import AppHeader from '../components/AppHeader';
 import ScrollToTopButton from '../components/ScrollToTopButton';
 import { apiFetch } from '../lib/api';
 import { useMe } from '../lib/useMe';
+
+interface ModelInfo {
+  id: string;
+  provider: string;
+  note: string;
+  key_configured: boolean;
+}
+
+const PROVIDER_LABELS: Record<string, string> = {
+  anthropic: 'Anthropic Claude',
+  openai: 'OpenAI',
+  google: 'Google Gemini',
+};
 
 interface KnowledgeItem {
   id: number;
@@ -117,8 +131,62 @@ function KnowledgeListPage() {
   const [sortAsc, setSortAsc] = useState(searchParams.get('dir') !== 'desc');
   const [syncing, setSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState('');
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [currentModel, setCurrentModel] = useState<string | null>(null);
+  const [modelSaving, setModelSaving] = useState(false);
   const { isAdmin } = useMe();
   const router = useRouter();
+
+  // 케이스 목록과 동일한 전역 AI 모델 설정 — 지식 추출도 이 모델을 쓴다
+  const fetchModelInfo = async () => {
+    try {
+      const response = await apiFetch('/api/settings/translation-model/');
+      if (response.ok) {
+        const data = await response.json();
+        setModels(data.models);
+        setCurrentModel(data.current);
+      }
+    } catch (error) {
+      console.error('Error fetching model info:', error);
+    }
+  };
+
+  const changeModel = async (model: string | null) => {
+    if (!model || model === currentModel) return;
+    setModelSaving(true);
+    try {
+      const response = await apiFetch('/api/settings/translation-model/', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model }),
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setCurrentModel(data.current);
+        setSyncMessage(`AI 분석 모델이 ${data.current}(으)로 변경되었습니다.`);
+      } else {
+        setSyncMessage(`모델 변경 실패: ${data.error || response.statusText}`);
+      }
+    } catch (error) {
+      console.error('Error changing model:', error);
+      setSyncMessage('모델 변경 실패: 백엔드 서버에 연결할 수 없습니다.');
+    } finally {
+      setModelSaving(false);
+    }
+  };
+
+  const modelSelectData = Object.keys(PROVIDER_LABELS)
+    .map((provider) => ({
+      group: PROVIDER_LABELS[provider],
+      items: models
+        .filter((m) => m.provider === provider)
+        .map((m) => ({
+          value: m.id,
+          label: `${m.id} (${m.note})`,
+          disabled: !m.key_configured,
+        })),
+    }))
+    .filter((group) => group.items.length > 0);
 
   const fetchItems = async () => {
     setLoading(true);
@@ -140,6 +208,7 @@ function KnowledgeListPage() {
 
   useEffect(() => {
     fetchItems();
+    fetchModelInfo();
   }, []);
 
   // 미검토 Resolved 케이스에서 지식 일괄 추출 (관리자 전용, 한 번에 최대 10건)
@@ -323,6 +392,21 @@ function KnowledgeListPage() {
               <Text c="dimmed">해결된 케이스에서 추출한 문제-원인-해결 지식</Text>
             </div>
             <Group gap="xs">
+              {isAdmin && (
+                <Select
+                  leftSection={<IconSparkles size={14} />}
+                  placeholder="AI 분석 모델"
+                  data={modelSelectData}
+                  value={currentModel}
+                  onChange={changeModel}
+                  disabled={modelSaving}
+                  w={300}
+                  size="sm"
+                  searchable={false}
+                  allowDeselect={false}
+                  comboboxProps={{ width: 340, position: 'bottom-end' }}
+                />
+              )}
               {isAdmin && (
                 <Button
                   leftSection={<IconDatabaseImport size={14} />}
