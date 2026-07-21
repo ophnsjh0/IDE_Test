@@ -109,14 +109,17 @@ def _process_message(message):
     date_header = gmail_client.get_header(message, 'Date')
     thread_id = message.get('threadId', '')
 
-    ignore_reason = email_parser.find_ignore_reason(sender, subject)
+    x_original_sender = gmail_client.get_header(message, 'X-Original-Sender')
+
+    ignore_reason = email_parser.find_ignore_reason(
+        sender, subject, original_sender=x_original_sender)
     if ignore_reason:
         logger.info("Ignoring bulk mail %s (%s): %s", message_id, ignore_reason, subject)
         return 'ignored'
 
     vendor, direction = email_parser.detect_vendor_and_direction(
         sender, recipient,
-        original_sender=(gmail_client.get_header(message, 'X-Original-Sender')
+        original_sender=(x_original_sender
                          or gmail_client.get_header(message, 'Reply-To')),
         cc=gmail_client.get_header(message, 'Cc'),
     )

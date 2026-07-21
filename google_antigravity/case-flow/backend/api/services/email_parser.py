@@ -170,6 +170,17 @@ def parse_received_at(date_header):
 # Sender local parts that are always bulk/marketing, never a TAC engineer.
 MARKETING_SENDER_PREFIXES = ('marketing', 'newsletter', 'news', 'promo', 'events')
 
+# 자동 발송 전용 주소 — TAC 케이스 메일은 항상 회신 가능한 주소(엔지니어,
+# support@)에서 오므로 no-reply 발신은 케이스가 아니다 (Arista Community
+# Central, HPE 계정 안내 등).
+NO_REPLY_SENDER_LOCALS = ('no-reply', 'noreply', 'do-not-reply', 'donotreply')
+
+# 벤더 자동 공지 피드 제목. Arista는 'New End of Sale email notification',
+# 'Security advisory Update email notification' 류 제목으로 공지를 보낸다.
+# 케이스가 아니므로 버린다 — CaseFlow/Ignored 라벨이 남으므로 향후
+# 공지/Advisory 피드 기능이 재수집할 수 있다.
+NOTIFICATION_SUBJECT_KEYWORDS = ('email notification',)
+
 
 def build_gmail_query():
     """Search query covering mail exchanged with any known vendor domain.
@@ -190,22 +201,27 @@ def build_gmail_query():
     if settings.GMAIL_SYNC_LOOKBACK_DAYS > 0:
         query += f' newer_than:{settings.GMAIL_SYNC_LOOKBACK_DAYS}d'
 
-    if settings.GMAIL_SYNC_EXCLUDE_SUBJECTS:
+    exclude_keywords = (list(settings.GMAIL_SYNC_EXCLUDE_SUBJECTS)
+                        + list(NOTIFICATION_SUBJECT_KEYWORDS))
+    if exclude_keywords:
         exclusions = ' '.join(
             f'subject:"{kw}"' if ' ' in kw else f'subject:{kw}'
-            for kw in settings.GMAIL_SYNC_EXCLUDE_SUBJECTS
+            for kw in exclude_keywords
         )
         query += ' -{' + exclusions + '}'
 
     return query
 
 
-def find_ignore_reason(sender, subject):
+def find_ignore_reason(sender, subject, original_sender=''):
     """Rule-based bulk-mail check run before AI analysis.
 
     Returns a short reason string when the mail should be discarded,
     or None when it looks like real case mail. Second net behind the
     Gmail query exclusions (subject: only matches whole words there).
+
+    그룹 중계 메일은 From이 그룹 주소로 바뀌므로 발신자 규칙은
+    original_sender(X-Original-Sender)에도 함께 적용한다.
 
     Deliberately does NOT use the List-Unsubscribe header: internal
     Google Groups add it to every relayed mail, including case mail.
@@ -214,10 +230,18 @@ def find_ignore_reason(sender, subject):
     for keyword in settings.GMAIL_SYNC_EXCLUDE_SUBJECTS:
         if keyword.lower() in subject_lower:
             return f'subject keyword "{keyword}"'
+    for keyword in NOTIFICATION_SUBJECT_KEYWORDS:
+        if keyword in subject_lower:
+            return f'vendor notification "{keyword}"'
 
-    local_part = parseaddr(sender or '')[1].split('@', 1)[0].lower()
-    for prefix in MARKETING_SENDER_PREFIXES:
-        if local_part == prefix or local_part.startswith((prefix + '-', prefix + '.')):
-            return f'marketing sender "{local_part}@"'
+    for address in (sender, original_sender):
+        local_part = parseaddr(address or '')[1].split('@', 1)[0].lower()
+        if not local_part:
+            continue
+        if local_part in NO_REPLY_SENDER_LOCALS:
+            return f'no-reply sender "{local_part}@"'
+        for prefix in MARKETING_SENDER_PREFIXES:
+            if local_part == prefix or local_part.startswith((prefix + '-', prefix + '.')):
+                return f'marketing sender "{local_part}@"'
 
     return None

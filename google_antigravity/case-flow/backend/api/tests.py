@@ -14,7 +14,8 @@ from .models import AppSetting, Case, CaseEmail
 from .services import help_agent
 from .services.email_parser import (build_gmail_query, clean_subject,
                                     detect_vendor_and_direction,
-                                    extract_device_info, normalize_body)
+                                    extract_device_info, find_ignore_reason,
+                                    normalize_body)
 from .services.gmail_sync import _find_case, apply_device_info
 
 
@@ -668,6 +669,54 @@ class CustomerThreadVendorTests(TestCase):
         self.assertIn('subject:Caseopen', query)
         # OR 그룹({}) 안에 들어가야 벤더 도메인 조건과 합집합이 된다
         self.assertIn('subject:Caseopen', query.split('}')[0])
+
+
+class IgnoreRuleTests(TestCase):
+    """공지/자동발송 메일이 케이스로 등록되는 것을 막는 규칙.
+
+    실제로 쓰레기 케이스로 등록됐던 메일(Arista 공지 피드, Arista Community
+    Central, HPE 계정 안내)의 발신자·제목을 그대로 사용한다.
+    """
+
+    GROUP_SENDER = '"\'Arista Networks\' via 기술부" <support@ubersys.co.kr>'
+
+    def test_arista_notification_feed_subjects_are_ignored(self):
+        for subject in ('New End of Sale email notification',
+                        'New Field notice email notification',
+                        'Security advisory Update email notification',
+                        'Field notice Update email notification',
+                        'New Software Release email notification'):
+            reason = find_ignore_reason(self.GROUP_SENDER, subject)
+            self.assertIsNotNone(reason, subject)
+
+    def test_no_reply_sender_is_ignored(self):
+        self.assertIsNotNone(find_ignore_reason(
+            'Arista Community Central <no-reply@arista.com>',
+            'Action Required: Please Update your Arista Community Central Nickname'))
+        self.assertIsNotNone(find_ignore_reason(
+            '"Hewlett Packard Enterprise (HPE)" <no-reply@auth.hpe.com>',
+            'Action Required: Password Reset'))
+
+    def test_relayed_no_reply_original_sender_is_ignored(self):
+        # 그룹 중계로 From이 그룹 주소가 되어도 X-Original-Sender로 걸러진다
+        reason = find_ignore_reason(
+            self.GROUP_SENDER, 'Some vendor announcement',
+            original_sender='noreply@arista.com')
+        self.assertIsNotNone(reason)
+
+    def test_real_case_mail_is_not_ignored(self):
+        self.assertIsNone(find_ignore_reason(
+            'A10 Customer Support Team <support@a10networks.com>',
+            'A10 Networks Case Confirmation: NHN Cloud opened Case # 00457396'))
+        self.assertIsNone(find_ignore_reason(
+            self.GROUP_SENDER,
+            'Re: New UBER Systems Co. Ltd Case: SR 834065 40G Interface Link FLAP',
+            original_sender='tac-engineer@arista.com'))
+
+    def test_gmail_query_excludes_notification_subjects(self):
+        query = build_gmail_query()
+        self.assertIn('-{', query)
+        self.assertIn('subject:"email notification"', query.split('-{', 1)[1])
 
 
 @override_settings(GMAIL_SYNC_INCLUDE_SUBJECTS=['Caseopen'])
