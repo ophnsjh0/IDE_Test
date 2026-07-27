@@ -436,16 +436,18 @@ class ChatKnowledgeExtractView(APIView):
     """POST /api/help-agent/sessions/<id>/knowledge/ — 대화에서 지식 추출.
 
     사용자가 대화가 유효한 결론에 도달했다고 판단했을 때 명시적으로 호출
-    ("이 대화를 지식으로 저장" 버튼). AI가 시행착오를 걸러 문제-원인-해결을
-    정제해 KnowledgeItem(draft, 출처=chat_session)으로 저장한다.
+    ("이 대화를 지식으로 저장" 버튼). AI가 시행착오를 걸러 문제-원인-해결
+    또는 설정 절차/가이드를 정제해 KnowledgeItem(draft, 출처=chat_session)으로
+    저장한다.
     본인 세션만 가능. 이미 추출된 세션이면 기존 항목을 돌려준다.
     """
 
     permission_classes = [IsEngineerOrAbove]
 
     ERROR_MESSAGES = {
-        'no_knowledge': '이 대화에서는 재사용할 만한 문제-해결 지식을 찾지 못했습니다. '
-                        '해결책이 오간 대화에서 다시 시도해주세요.',
+        'no_knowledge': '이 대화에서는 재사용할 만한 지식(문제-해결 또는 설정 절차)을 '
+                        '찾지 못했습니다. 해결책이나 구체적인 설정이 오간 대화에서 '
+                        '다시 시도해주세요.',
         'no_vendor': '대화에서 어느 벤더(A10/Arista/HPE Aruba/Juniper) 장비인지 알 수 '
                      '없어 지식으로 저장하지 못했습니다. 벤더나 장비 모델을 언급한 뒤 '
                      '다시 시도해주세요.',
