@@ -282,7 +282,7 @@ class HelpAgentChatView(APIView):
 
     permission_classes = [IsEngineerOrAbove]
 
-    MAX_CONTENT_LENGTH = 4000
+    MAX_CONTENT_LENGTH = 20000
 
     def post(self, request):
         messages = request.data.get('messages')
