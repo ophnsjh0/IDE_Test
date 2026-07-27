@@ -22,17 +22,25 @@ class SignupRequest(models.Model):
     """로그인 화면의 계정 발급 요청. 승인자가 메일의 승인 링크를 누르면 계정이 생성된다.
 
     비밀번호는 요청 시점에 해시로만 저장되고(평문 미보관), 승인 시 그 해시가
-    그대로 User.password가 된다.
+    그대로 User.password가 된다. requested_role은 신청자가 고른 희망 역할로,
+    승인 시 그대로 부여된다 — admin은 자율 신청 대상에서 제외(권한 상승 방지),
+    반드시 viewer/engineer 중 하나여야 한다.
     """
     STATUS_CHOICES = [
         ('pending', 'Pending'),
         ('approved', 'Approved'),
+    ]
+    REQUESTABLE_ROLE_CHOICES = [
+        ('viewer', 'Viewer'),
+        ('engineer', 'Engineer'),
     ]
 
     username = models.CharField(max_length=150)
     name = models.CharField(max_length=100, blank=True, default='')
     reason = models.CharField(max_length=300, blank=True, default='')
     password_hash = models.CharField(max_length=128)
+    requested_role = models.CharField(max_length=10, choices=REQUESTABLE_ROLE_CHOICES,
+                                       default='viewer')
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
     created_at = models.DateTimeField(auto_now_add=True)
     approved_at = models.DateTimeField(null=True, blank=True)

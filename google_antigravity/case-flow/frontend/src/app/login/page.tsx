@@ -9,6 +9,7 @@ import {
   Modal,
   Paper,
   PasswordInput,
+  SegmentedControl,
   Stack,
   Text,
   Textarea,
@@ -36,7 +37,7 @@ export default function LoginPage() {
   });
 
   const signupForm = useForm({
-    initialValues: { username: '', name: '', password: '', reason: '' },
+    initialValues: { username: '', name: '', password: '', reason: '', requested_role: 'viewer' },
     validate: {
       username: (v) => (v.trim() ? null : '아이디를 입력하세요'),
       password: (v) => (v.length < 8 ? '비밀번호는 8자 이상이어야 합니다' : null),
@@ -167,6 +168,23 @@ export default function LoginPage() {
               placeholder="8자 이상, 숫자만은 불가"
               {...signupForm.getInputProps('password')}
             />
+            <div>
+              <Text size="sm" fw={500} mb={4}>
+                신청 역할
+              </Text>
+              <SegmentedControl
+                fullWidth
+                data={[
+                  { label: '조회자 (viewer)', value: 'viewer' },
+                  { label: '엔지니어 (engineer)', value: 'engineer' },
+                ]}
+                {...signupForm.getInputProps('requested_role')}
+              />
+              <Text size="xs" c="dimmed" mt={4}>
+                조회자는 조회만, 엔지니어는 케이스 등록·수정과 AI 도우미까지 사용할 수 있습니다.
+                관리자 권한은 별도 요청해 주세요.
+              </Text>
+            </div>
             <Textarea
               label="요청 사유"
               placeholder="예: OO팀, 케이스 조회 필요 (선택)"

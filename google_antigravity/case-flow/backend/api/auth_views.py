@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 SIGNUP_TOKEN_SALT = 'caseflow-signup-approval'
 
 VALID_ROLES = [choice[0] for choice in UserProfile.ROLE_CHOICES]
+REQUESTABLE_ROLES = [choice[0] for choice in SignupRequest.REQUESTABLE_ROLE_CHOICES]
+ROLE_LABELS_KO = {'viewer': '조회자', 'engineer': '엔지니어', 'admin': '관리자'}
 
 
 def _user_payload(user):
@@ -203,9 +205,13 @@ class SignupRequestView(APIView):
         password = request.data.get('password') or ''
         name = (request.data.get('name') or '').strip()
         reason = (request.data.get('reason') or '').strip()
+        requested_role = request.data.get('requested_role') or 'viewer'
 
         if not username:
             return Response({'error': '아이디를 입력하세요.'}, status=status.HTTP_400_BAD_REQUEST)
+        if requested_role not in REQUESTABLE_ROLES:
+            return Response({'error': f'신청 가능한 역할이 아닙니다: {requested_role}'},
+                            status=status.HTTP_400_BAD_REQUEST)
         if User.objects.filter(username__iexact=username).exists():
             return Response({'error': f'이미 존재하는 아이디입니다: {username}'},
                             status=status.HTTP_400_BAD_REQUEST)
@@ -218,7 +224,7 @@ class SignupRequestView(APIView):
 
         signup = SignupRequest.objects.create(
             username=username, name=name, reason=reason[:300],
-            password_hash=make_password(password),
+            password_hash=make_password(password), requested_role=requested_role,
         )
 
         token = signing.dumps({'id': signup.id}, salt=SIGNUP_TOKEN_SALT)
@@ -232,7 +238,7 @@ class SignupRequestView(APIView):
             <tr><td><b>이름</b></td><td>{signup.name or '-'}</td></tr>
             <tr><td><b>요청 사유</b></td><td>{signup.reason or '-'}</td></tr>
             <tr><td><b>요청 시각</b></td><td>{requested_at}</td></tr>
-            <tr><td><b>생성될 역할</b></td><td>조회자 (승인 후 계정 관리에서 변경 가능)</td></tr>
+            <tr><td><b>신청 역할</b></td><td>{ROLE_LABELS_KO[signup.requested_role]} (승인 후 계정 관리에서 변경 가능)</td></tr>
           </table>
           <p style="margin-top:20px">
             <a href="{approve_url}"
@@ -304,12 +310,13 @@ class SignupApproveView(APIView):
         user = User(username=signup.username, first_name=signup.name,
                     password=signup.password_hash)
         user.save()
-        set_user_role(user, 'viewer')
+        set_user_role(user, signup.requested_role)
         signup.status = 'approved'
         signup.approved_at = timezone.now()
         signup.save()
-        logger.info("Signup approved: %s", signup.username)
+        logger.info("Signup approved: %s (%s)", signup.username, signup.requested_role)
 
+        role_label = ROLE_LABELS_KO[signup.requested_role]
         return self._page('계정이 생성되었습니다',
-                          f'<b>{signup.username}</b> 계정이 조회자 역할로 생성되었습니다. '
+                          f'<b>{signup.username}</b> 계정이 {role_label} 역할로 생성되었습니다. '
                           '요청자에게 로그인 가능함을 알려주시고, 필요하면 계정 관리에서 역할을 조정하세요.')

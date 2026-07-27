@@ -837,6 +837,23 @@ class SignupRequestTests(TestCase):
         response, _ = self.request_signup()  # 같은 아이디 재요청
         self.assertEqual(response.status_code, 400)
 
+    def test_requested_role_engineer_is_granted_on_approval(self):
+        from django.contrib.auth.models import User
+        from api.permissions import get_user_role
+        _, mock_send = self.request_signup(requested_role='engineer')
+        url = self.extract_approve_url(mock_send)
+
+        response = self.client.get(url)
+        self.assertIn('엔지니어', response.content.decode())
+
+        user = User.objects.get(username='newbie')
+        self.assertEqual(get_user_role(user), 'engineer')
+
+    def test_requesting_admin_role_is_rejected(self):
+        response, mock_send = self.request_signup(requested_role='admin')
+        self.assertEqual(response.status_code, 400)
+        mock_send.assert_not_called()
+
     def test_mail_failure_rolls_back_request(self):
         from unittest.mock import patch
         from api.models import SignupRequest
