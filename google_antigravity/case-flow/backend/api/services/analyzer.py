@@ -148,6 +148,18 @@ def _build_request_params(subject, body, direction, is_new_case, case_context=''
     }
 
 
+def _fix_literal_escapes(data):
+    """일부 모델(Gemini 등)이 구조화 출력에서 개행을 JSON 이스케이프 대신
+    문자열 값 안에 리터럴 백슬래시-n(등)으로 그대로 남기는 경우가 있어
+    파싱 후 되돌린다 (2026-07-27, 알림 메일 번역에서 실제 발생 확인 —
+    같은 템플릿이 정상 처리된 케이스도 있어 모델의 비결정적 오류로 판단)."""
+    if isinstance(data, dict):
+        return {k: _fix_literal_escapes(v) for k, v in data.items()}
+    if isinstance(data, str):
+        return data.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\\t', '\t')
+    return data
+
+
 def _parse_response(response, subject=''):
     """Messages API 응답에서 분석 JSON을 추출. 거부/파싱 실패 시 None."""
     if response.stop_reason == "refusal":
@@ -155,7 +167,7 @@ def _parse_response(response, subject=''):
         return None
     try:
         text = next(b.text for b in response.content if b.type == "text")
-        return json.loads(text)
+        return _fix_literal_escapes(json.loads(text))
     except Exception:
         logger.exception("Failed to parse analysis response for subject: %s", subject)
         return None
@@ -186,7 +198,7 @@ def _analyze_openai(subject, body, direction, is_new_case, case_context=''):
             "json_schema": {"name": "case_analysis", "schema": ANALYSIS_SCHEMA, "strict": True},
         },
     )
-    return json.loads(response.choices[0].message.content)
+    return _fix_literal_escapes(json.loads(response.choices[0].message.content))
 
 
 def _gemini_schema(schema):
@@ -212,7 +224,7 @@ def _analyze_gemini(subject, body, direction, is_new_case, case_context=''):
             "max_output_tokens": 16000,
         },
     )
-    return json.loads(response.text)
+    return _fix_literal_escapes(json.loads(response.text))
 
 
 _PROVIDER_ANALYZERS = {
@@ -258,7 +270,7 @@ def generate_structured(system, user_content, schema, max_tokens=16000):
                     "json_schema": {"name": "extraction", "schema": schema, "strict": True},
                 },
             )
-            return json.loads(response.choices[0].message.content)
+            return _fix_literal_escapes(json.loads(response.choices[0].message.content))
         from google import genai
         client = genai.Client(api_key=settings.GOOGLE_API_KEY)
         response = client.models.generate_content(
@@ -271,7 +283,7 @@ def generate_structured(system, user_content, schema, max_tokens=16000):
                 "max_output_tokens": max_tokens,
             },
         )
-        return json.loads(response.text)
+        return _fix_literal_escapes(json.loads(response.text))
     except Exception:
         logger.exception("Structured generation failed (%s/%s)", provider, model)
         return None
