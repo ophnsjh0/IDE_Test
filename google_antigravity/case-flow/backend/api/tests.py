@@ -589,6 +589,103 @@ class ChatSessionTests(TestCase):
         self.assertIsNone(data['session_id'])
 
 
+class HelpAgentToolLoopTests(TestCase):
+    """도구 호출 루프가 반복 상한을 소진해도 최종 답변을 생성해야 한다."""
+
+    @staticmethod
+    def _tool_response(i):
+        return SimpleNamespace(
+            stop_reason='tool_use',
+            content=[SimpleNamespace(type='tool_use', name='search_cases',
+                                     input={'query': f'q{i}'}, id=f'tool_{i}')],
+        )
+
+    def test_exhausted_tool_loop_forces_final_answer(self):
+        final = SimpleNamespace(
+            stop_reason='end_turn',
+            content=[SimpleNamespace(type='text', text='수집한 근거 기준 최종 답변')],
+        )
+        calls = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            if kwargs.get('tool_choice') == {'type': 'none'}:
+                return final
+            return self._tool_response(len(calls))
+
+        client = SimpleNamespace(messages=SimpleNamespace(create=create))
+        reply, trace, _, _ = help_agent._run_agent(
+            client, 'search', [{'role': 'user', 'content': '질문'}])
+
+        self.assertEqual(reply, '수집한 근거 기준 최종 답변')
+        # 루프 상한만큼 도구 호출 후, 마무리 호출은 도구를 차단한다
+        self.assertEqual(len(trace), help_agent.MAX_TOOL_ITERATIONS)
+        self.assertEqual(len(calls), help_agent.MAX_TOOL_ITERATIONS + 1)
+        self.assertEqual(calls[-1]['tool_choice'], {'type': 'none'})
+
+    def test_wrap_up_failure_falls_back_to_last_response(self):
+        calls = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            if kwargs.get('tool_choice') == {'type': 'none'}:
+                raise anthropic.APIConnectionError(request=MagicMock())
+            return self._tool_response(len(calls))
+
+        client = SimpleNamespace(messages=SimpleNamespace(create=create))
+        reply, _, _, _ = help_agent._run_agent(
+            client, 'search', [{'role': 'user', 'content': '질문'}])
+        self.assertEqual(reply, '')  # chat()에서 안내 문구로 대체된다
+
+
+class FetchUrlToolTests(TestCase):
+    """fetch_url 도구: SSRF 차단과 본문 추출."""
+
+    def test_non_http_scheme_blocked(self):
+        out = json.loads(help_agent._fetch_url('ftp://example.com/file'))
+        self.assertIn('http/https', out['error'])
+
+    def test_private_ip_blocked(self):
+        out = json.loads(help_agent._fetch_url('http://192.168.74.158/admin'))
+        self.assertIn('내부망', out['error'])
+
+    def test_localhost_blocked(self):
+        out = json.loads(help_agent._fetch_url('http://localhost:8000/api/'))
+        self.assertIn('내부망', out['error'])
+
+    def test_html_content_extracted(self):
+        html = (b'<html><head><title>Security Advisory</title></head>'
+                b'<body><script>tracker()</script>'
+                b'<p>ACOS 6.0.9 fixes CVE-2026-45447</p></body></html>')
+        title, text = help_agent._extract_page_content('text/html; charset=utf-8', html)
+        self.assertEqual(title, 'Security Advisory')
+        self.assertIn('ACOS 6.0.9', text)
+        self.assertNotIn('tracker()', text)
+
+    def test_plain_text_passthrough(self):
+        title, text = help_agent._extract_page_content('text/plain', 'release note 본문'.encode())
+        self.assertEqual(text, 'release note 본문')
+
+    def test_fetch_returns_payload_and_truncates(self):
+        body = (b'<html><head><title>Long</title></head><body>'
+                + b'A' * (help_agent.FETCH_MAX_CHARS + 100) + b'</body></html>')
+        response = MagicMock()
+        response.headers = {'content-type': 'text/html'}
+        response.iter_bytes.return_value = [body]
+        response.url = 'https://vendor.example/advisory'
+        client = MagicMock()
+        client.stream.return_value.__enter__.return_value = response
+
+        with patch.object(help_agent.httpx, 'Client') as client_cls, \
+             patch.object(help_agent, '_assert_public_http_url'):
+            client_cls.return_value.__enter__.return_value = client
+            out = json.loads(help_agent._fetch_url('https://vendor.example/advisory'))
+
+        self.assertEqual(out['title'], 'Long')
+        self.assertEqual(len(out['content']), help_agent.FETCH_MAX_CHARS)
+        self.assertIn('notice', out)
+
+
 class ChatKnowledgeExtractTests(TestCase):
     """대화 세션 -> 지식 추출 (2단계): 명시적 버튼, AI 정제, draft 등록."""
 

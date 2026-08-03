@@ -15,10 +15,14 @@
 제거 사실을 도구 결과에 표기해 에이전트가 인지하게 한다.
 """
 import hashlib
+import ipaddress
 import json
 import logging
 import re
+import socket
 from datetime import timedelta
+from io import BytesIO
+from urllib.parse import urlparse
 
 import anthropic
 import httpx
@@ -132,6 +136,10 @@ TECH_SYSTEM_PROMPT = """당신은 네트워크 벤더(A10/Arista/HPE Aruba/Junip
   벤더 공식 config guide 벡터 검색)를 조회하세요 — 검색어는 문서가 영어이므로
   영어 기술 용어가 효과적입니다. 결과가 부족하거나 최신 정보(버그, 보안 권고,
   릴리즈 노트)가 필요하면 web_search로 보완하세요.
+- 사용자가 URL을 제시하면 추측하지 말고 fetch_url로 그 페이지 본문을 직접 확인한
+  뒤 답하세요. web_search 스니펫만으로 판단이 어려울 때도(영향 버전 표, 권고문
+  본문 등) 해당 결과 URL을 fetch_url로 열어 확인하세요. 같은 검색·조회를
+  반복하지 말고, 도구 몇 번으로 확인이 안 되면 확인된 범위까지만 답하세요.
 - 기술적 판단이 필요한 질문에는 반드시 위 도구들로 근거를 확보한 뒤 답하세요.
 - 사내 케이스 맥락이 필요하면 케이스 DB 도구(search_cases 등)를 활용하세요.
 - 모든 기술적 주장에는 출처를 인용하세요 — 웹은 [제목](URL), 사내 문서는
@@ -306,6 +314,23 @@ _SEARCH_TOOL_DEFS = {
                 'num_results': {'type': 'integer', 'description': '결과 수 (기본 8, 최대 10)'},
             },
             'required': ['query'],
+        },
+    },
+    'fetch_url': {
+        'name': 'fetch_url',
+        'description': (
+            '웹 페이지나 PDF의 URL 본문을 직접 가져와 확인한다. 사용자가 URL을 '
+            '제시했거나, web_search 결과의 스니펫만으로는 부족해 특정 페이지의 '
+            '상세 내용(영향 버전 표, 보안 권고 본문, 릴리즈 노트 등)을 확인해야 '
+            '할 때 사용할 것. 같은 URL을 반복 조회하지 말 것. 내부망 주소는 '
+            '보안 정책으로 차단된다.'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'url': {'type': 'string', 'description': '조회할 http/https URL'},
+            },
+            'required': ['url'],
         },
     },
 }
@@ -538,6 +563,92 @@ def _web_search(query, num_results=8):
     return json.dumps(payload, ensure_ascii=False)
 
 
+# URL 조회 상한 — 응답 크기(스트리밍 중단)와 모델에 넘길 본문 길이
+FETCH_MAX_BYTES = 5_000_000
+FETCH_MAX_CHARS = 8000
+FETCH_MAX_PDF_PAGES = 20
+FETCH_USER_AGENT = 'Mozilla/5.0 (compatible; CaseFlowBot/1.0)'
+
+
+def _assert_public_http_url(url):
+    """http(s) + 공인 IP만 허용 — 내부망 SSRF 차단. 위반 시 ValueError."""
+    parsed = urlparse(str(url))
+    if parsed.scheme not in ('http', 'https'):
+        raise ValueError('http/https URL만 조회할 수 있습니다.')
+    host = parsed.hostname or ''
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        raise ValueError(f'호스트를 찾을 수 없습니다: {host}')
+    for info in infos:
+        if not ipaddress.ip_address(info[4][0]).is_global:
+            raise ValueError('내부망 주소는 보안 정책으로 조회할 수 없습니다.')
+
+
+def _extract_page_content(content_type, data, url=''):
+    """응답 바이트에서 (제목, 본문 텍스트) 추출. HTML/PDF/텍스트 지원."""
+    if 'pdf' in content_type or str(url).lower().split('?')[0].endswith('.pdf'):
+        from pypdf import PdfReader
+        reader = PdfReader(BytesIO(data))
+        pages = reader.pages[:FETCH_MAX_PDF_PAGES]
+        text = '\n'.join(page.extract_text() or '' for page in pages)
+        if len(reader.pages) > FETCH_MAX_PDF_PAGES:
+            text += f'\n\n[이하 생략 — 전체 {len(reader.pages)}페이지 중 {FETCH_MAX_PDF_PAGES}페이지까지만 표시]'
+        return '', text
+
+    if 'html' in content_type or data.lstrip()[:1] == b'<':
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(data, 'html.parser')
+        title = soup.title.get_text(strip=True) if soup.title else ''
+        for tag in soup(['script', 'style', 'noscript']):
+            tag.decompose()
+        return title, soup.get_text('\n', strip=True)
+
+    return '', data.decode('utf-8', errors='replace')
+
+
+def _fetch_url(url):
+    def guard(request):
+        _assert_public_http_url(request.url)
+
+    try:
+        _assert_public_http_url(url)
+        with httpx.Client(follow_redirects=True, timeout=20,
+                          headers={'User-Agent': FETCH_USER_AGENT},
+                          event_hooks={'request': [guard]}) as http:
+            with http.stream('GET', url) as response:
+                response.raise_for_status()
+                content_type = response.headers.get('content-type', '').lower()
+                data = b''
+                for chunk in response.iter_bytes():
+                    data += chunk
+                    if len(data) > FETCH_MAX_BYTES:
+                        break
+                final_url = str(response.url)
+    except ValueError as exc:
+        return json.dumps({'error': str(exc)}, ensure_ascii=False)
+    except httpx.HTTPStatusError as exc:
+        return json.dumps({'error': f'페이지 조회 실패: HTTP {exc.response.status_code}'},
+                          ensure_ascii=False)
+    except httpx.HTTPError as exc:
+        return json.dumps({'error': f'페이지 조회 실패: {type(exc).__name__}'},
+                          ensure_ascii=False)
+
+    try:
+        title, text = _extract_page_content(content_type, data, final_url)
+    except Exception:
+        logger.warning('fetch_url content parse failed: %s', final_url, exc_info=True)
+        return json.dumps({'error': '본문을 해석할 수 없는 형식입니다.'}, ensure_ascii=False)
+
+    truncated = len(text) > FETCH_MAX_CHARS
+    payload = {'url': final_url, 'content': text[:FETCH_MAX_CHARS]}
+    if title:
+        payload['title'] = title
+    if truncated:
+        payload['notice'] = f'본문이 길어 앞 {FETCH_MAX_CHARS}자만 표시했습니다.'
+    return json.dumps(payload, ensure_ascii=False)
+
+
 TOOL_HANDLERS = {
     'search_cases': _search_cases,
     'search_knowledge': _search_knowledge,
@@ -546,6 +657,7 @@ TOOL_HANDLERS = {
     'get_case_stats': _get_case_stats,
     'list_recent_cases': _list_recent_cases,
     'web_search': _web_search,
+    'fetch_url': _fetch_url,
 }
 
 
@@ -610,8 +722,8 @@ def _agent_configs():
         'tech': {
             'model': settings.TECH_AGENT_MODEL,
             'system': TECH_SYSTEM_PROMPT + SCOPE_GUARD,
-            'tools': tools('search_references', 'web_search', 'search_knowledge',
-                           'search_cases', 'get_case_detail'),
+            'tools': tools('search_references', 'web_search', 'fetch_url',
+                           'search_knowledge', 'search_cases', 'get_case_detail'),
             'max_tokens': 6000,
         },
     }
@@ -861,6 +973,28 @@ def _run_agent(client, agent, messages):
             })
         if results:
             convo.append({'role': 'user', 'content': results})
+
+    # 반복 상한을 소진할 때까지 도구만 호출하면 최종 텍스트가 없어 빈 답변이 된다
+    # (증상: "답변을 생성하지 못했습니다"). 도구를 막은 마무리 호출로 답변을 강제한다.
+    if response.stop_reason == 'tool_use':
+        convo[-1]['content'].append({
+            'type': 'text',
+            'text': ('[시스템] 도구 호출 한도에 도달했습니다. 추가 도구 호출 없이 '
+                     '지금까지 수집한 정보만으로 최종 답변을 작성하세요. '
+                     '확인하지 못한 사항은 확인하지 못했다고 명시하세요.'),
+        })
+        try:
+            response = create(
+                model=config['model'],
+                max_tokens=config.get('max_tokens', 4096),
+                system=system_prompt,
+                tools=config['tools'],
+                tool_choice={'type': 'none'},
+                messages=convo,
+            )
+        except anthropic.APIError:
+            # 마무리 호출까지 실패하면 기존 폴백 문구 경로로 둔다
+            logger.warning('help agent wrap-up call failed', exc_info=True)
 
     reply = ''.join(b.text for b in response.content if b.type == 'text').strip()
     files = _describe_files(client, file_ids) if file_ids else []
