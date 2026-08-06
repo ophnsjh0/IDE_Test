@@ -15,12 +15,13 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from .models import AppSetting, Case, CaseEmail
-from .services import help_agent
+from .services import analyzer, gmail_sync, help_agent
 from .services.email_parser import (build_gmail_query, clean_subject,
                                     detect_vendor_and_direction,
                                     extract_device_info, find_ignore_reason,
                                     normalize_body)
-from .services.gmail_sync import _find_case, apply_device_info
+from .services.gmail_sync import (SyncInProgress, _find_case,
+                                  apply_device_info)
 
 
 def make_case(**kwargs):
@@ -2223,6 +2224,102 @@ class ReferenceSearchTests(TestCase):
             self.assertIn('조치: RMA 진행', chunks[1]['text'])
             self.assertNotIn('증상:', chunks[1]['text'])  # 빈 셀 생략
             self.assertEqual(chunks[1]['page_start'], 4)  # 실제 행 번호 유지
+
+
+@override_settings(TRANSLATION_FALLBACK_MODELS=['claude-haiku-4-5'],
+                   ANTHROPIC_API_KEY='k', GOOGLE_API_KEY='k')
+class AnalyzerFallbackTests(TestCase):
+    """무료 모델이 실패하면 폴백 모델로 재시도 (429/503 대비)."""
+
+    ANALYSIS = {'subject_ko': '제목', 'body_ko': '본문', 'summary': '요약',
+                'description': '설명', 'action_update': '조치', 'resolution': '',
+                'suggested_status': 'Open', 'device_model': '', 'device_serial': '',
+                'software_version': ''}
+
+    def analyze(self):
+        return analyzer.analyze_email('subject', 'body', 'inbound', True)
+
+    def test_fallback_model_is_used_when_free_model_fails(self):
+        calls = []
+
+        def call(model, *args, **kwargs):
+            calls.append(model)
+            if model.startswith('gemini'):
+                raise RuntimeError('429 quota exceeded')
+            return dict(self.ANALYSIS)
+
+        with patch.object(analyzer, '_call_provider', side_effect=call), \
+                analyzer.translation_model_override('gemini-3.5-flash'):
+            result = self.analyze()
+
+        self.assertEqual(calls, ['gemini-3.5-flash', 'claude-haiku-4-5'])
+        self.assertEqual(result[analyzer.ANALYZED_BY_KEY], 'claude-haiku-4-5')
+
+    def test_fallback_is_not_called_when_free_model_succeeds(self):
+        with patch.object(analyzer, '_call_provider',
+                          return_value=dict(self.ANALYSIS)) as mocked, \
+                analyzer.translation_model_override('gemini-3.5-flash'):
+            result = self.analyze()
+
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(result[analyzer.ANALYZED_BY_KEY], 'gemini-3.5-flash')
+
+    def test_unparsable_response_also_falls_back(self):
+        # 예외 없이 None(파싱 실패)이 와도 다음 모델로 넘어간다
+        results = [None, dict(self.ANALYSIS)]
+        with patch.object(analyzer, '_call_provider', side_effect=results), \
+                analyzer.translation_model_override('gemini-3.5-flash'):
+            result = self.analyze()
+
+        self.assertEqual(result[analyzer.ANALYZED_BY_KEY], 'claude-haiku-4-5')
+
+    def test_all_models_failing_returns_none(self):
+        with patch.object(analyzer, '_call_provider', side_effect=RuntimeError('boom')), \
+                analyzer.translation_model_override('gemini-3.5-flash'):
+            self.assertIsNone(self.analyze())
+
+    def test_case_records_the_model_that_actually_ran(self):
+        case = make_case(vendor='A10')
+        analysis = dict(self.ANALYSIS, **{analyzer.ANALYZED_BY_KEY: 'claude-haiku-4-5'})
+        with analyzer.translation_model_override('gemini-3.5-flash'):
+            gmail_sync.apply_analysis_to_case(case, analysis, 'inbound', timezone.now())
+        case.refresh_from_db()
+        self.assertEqual(case.analyzed_by, 'claude-haiku-4-5')
+
+    def test_model_override_restores_the_previous_model(self):
+        with analyzer.translation_model_override('gemini-3.5-flash'):
+            with analyzer.translation_model_override('claude-haiku-4-5'):
+                self.assertEqual(analyzer.get_translation_model(), 'claude-haiku-4-5')
+            self.assertEqual(analyzer.get_translation_model(), 'gemini-3.5-flash')
+
+
+class SyncGmailCommandTests(TestCase):
+    """sync_gmail 관리 명령 — cron 실행용 옵션."""
+
+    def test_model_option_overrides_only_this_run(self):
+        seen = {}
+
+        def fake_sync(max_results):
+            seen['model'] = analyzer.get_translation_model()
+            seen['max_results'] = max_results
+            return dict(fetched=0, cases_created=0, emails_added=0,
+                        ignored=0, no_vendor=0, skipped=0, errors=0)
+
+        with patch('api.management.commands.sync_gmail.sync_gmail', side_effect=fake_sync):
+            call_command('sync_gmail', '--model', 'gemini-3.5-flash',
+                         '--max-results', '20', stdout=StringIO())
+
+        self.assertEqual(seen, {'model': 'gemini-3.5-flash', 'max_results': 20})
+        # 실행이 끝나면 앱 설정 모델로 돌아온다
+        self.assertNotEqual(analyzer.get_translation_model(), 'gemini-3.5-flash')
+
+    def test_concurrent_run_exits_quietly(self):
+        # cron과 웹 버튼이 겹쳐도 cron 메일이 날아가지 않도록 정상 종료
+        out = StringIO()
+        with patch('api.management.commands.sync_gmail.sync_gmail',
+                   side_effect=SyncInProgress('이미 진행 중입니다.')):
+            call_command('sync_gmail', stdout=out)
+        self.assertIn('이미 진행 중', out.getvalue())
 
 
 class BackfillTranslationTests(TestCase):

@@ -284,6 +284,16 @@ _TRANSLATION_MODEL_DEFAULT = 'claude-haiku-4-5'         # $1/$5 — 최저 비�
 # _TRANSLATION_MODEL_DEFAULT = 'gemini-3.1-flash-lite'  # 무료 티어 — Flash-Lite (최저 비용)
 TRANSLATION_MODEL = os.environ.get('CASEFLOW_TRANSLATION_MODEL', _TRANSLATION_MODEL_DEFAULT)
 
+# 분석 실패 시 순서대로 재시도할 폴백 모델 (쉼표 구분, 빈 값이면 폴백 없음).
+# 무료 티어(Gemini)를 기본으로 쓰면 할당량 초과(429)·과부하(503)로 번역이 통째로
+# 비는 일이 생기므로, 유료 저비용 모델을 뒤에 둔다.
+TRANSLATION_FALLBACK_MODELS = [
+    model.strip()
+    for model in os.environ.get(
+        'CASEFLOW_TRANSLATION_FALLBACK_MODELS', 'claude-haiku-4-5').split(',')
+    if model.strip()
+]
+
 # 벤더 공식 문서(config guide 등) 벡터 검색 — reference_docs/<벤더>/*.pdf 를
 # ingest_references 커맨드로 임베딩한다 (OpenAI 임베딩 API, OPENAI_API_KEY 사용).
 # 모델 교체 시 전체 재임베딩 필요(ingest_references --force) — 비용은 전체 문서

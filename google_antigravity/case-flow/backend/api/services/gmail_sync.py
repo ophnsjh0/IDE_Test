@@ -12,7 +12,7 @@ from django.utils import timezone
 
 from ..models import Case, CaseEmail
 from . import email_parser, gmail_client
-from .analyzer import analyze_email, get_translation_model
+from .analyzer import ANALYZED_BY_KEY, analyze_email, get_translation_model
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +203,8 @@ def apply_analysis_to_case(case, analysis, direction, received_at):
         case.save()  # updated_at 갱신
         return
 
-    case.analyzed_by = get_translation_model()
+    # 폴백이 걸리면 실제 사용 모델이 설정값과 다르다 — 실제 값을 남긴다
+    case.analyzed_by = analysis.get(ANALYZED_BY_KEY) or get_translation_model()
 
     stamp = timezone.localtime(received_at).strftime('%Y-%m-%d %H:%M')
     direction_label = '수신' if direction == 'inbound' else '발신'

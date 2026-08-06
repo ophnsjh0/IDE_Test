@@ -79,11 +79,12 @@ def translation_model_override(model):
     """블록 안에서만 사용할 모델을 강제한다 — 앱 설정(AppSetting)은 건드리지 않아
     동시 실행 중인 동기화가 영향받지 않는다."""
     global _model_override
+    previous = _model_override
     _model_override = model
     try:
         yield
     finally:
-        _model_override = None
+        _model_override = previous
 
 
 def get_translation_model():
@@ -132,10 +133,10 @@ def _build_user_content(subject, body, direction, is_new_case, case_context=''):
     return '\n\n'.join(parts)
 
 
-def _build_request_params(subject, body, direction, is_new_case, case_context=''):
+def _build_request_params(subject, body, direction, is_new_case, case_context='', model=None):
     """Anthropic Messages API 파라미터 생성 (동기/배치 공용)."""
     return {
-        "model": get_translation_model(),
+        "model": model or get_translation_model(),
         "max_tokens": 16000,
         "system": SYSTEM_PROMPT,
         "output_config": {
@@ -173,34 +174,6 @@ def _parse_response(response, subject=''):
         return None
 
 
-def _analyze_anthropic(subject, body, direction, is_new_case, case_context=''):
-    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-    response = client.messages.create(
-        **_build_request_params(subject, body, direction, is_new_case, case_context)
-    )
-    return _parse_response(response, subject)
-
-
-def _analyze_openai(subject, body, direction, is_new_case, case_context=''):
-    from openai import OpenAI
-
-    client = OpenAI(api_key=settings.OPENAI_API_KEY)
-    response = client.chat.completions.create(
-        model=get_translation_model(),
-        max_completion_tokens=16000,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",
-             "content": _build_user_content(subject, body, direction, is_new_case, case_context)},
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": "case_analysis", "schema": ANALYSIS_SCHEMA, "strict": True},
-        },
-    )
-    return _fix_literal_escapes(json.loads(response.choices[0].message.content))
-
-
 def _gemini_schema(schema):
     """Gemini responseSchema는 additionalProperties를 지원하지 않으므로 제거."""
     if isinstance(schema, dict):
@@ -210,102 +183,121 @@ def _gemini_schema(schema):
     return schema
 
 
-def _analyze_gemini(subject, body, direction, is_new_case, case_context=''):
+def _call_provider(model, system, user_content, schema, max_tokens):
+    """모델 하나로 구조화 응답을 생성한다. 제공자는 모델 접두어로 판별.
+
+    응답을 파싱하지 못하면 None, API 호출 자체가 실패하면 예외를 올린다
+    (호출 측이 폴백 모델로 넘어갈지 판단한다)."""
+    provider = detect_provider(model)
+    if provider == 'anthropic':
+        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system,
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+            messages=[{"role": "user", "content": user_content}],
+        )
+        return _parse_response(response)
+    if provider == 'openai':
+        from openai import OpenAI
+
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model=model,
+            max_completion_tokens=max_tokens,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user_content}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "extraction", "schema": schema, "strict": True},
+            },
+        )
+        return _fix_literal_escapes(json.loads(response.choices[0].message.content))
+
     from google import genai
 
     client = genai.Client(api_key=settings.GOOGLE_API_KEY)
     response = client.models.generate_content(
-        model=get_translation_model(),
-        contents=_build_user_content(subject, body, direction, is_new_case, case_context),
+        model=model,
+        contents=user_content,
         config={
-            "system_instruction": SYSTEM_PROMPT,
+            "system_instruction": system,
             "response_mime_type": "application/json",
-            "response_schema": _gemini_schema(ANALYSIS_SCHEMA),
-            "max_output_tokens": 16000,
+            "response_schema": _gemini_schema(schema),
+            "max_output_tokens": max_tokens,
         },
     )
     return _fix_literal_escapes(json.loads(response.text))
 
 
-_PROVIDER_ANALYZERS = {
-    'anthropic': _analyze_anthropic,
-    'openai': _analyze_openai,
-    'google': _analyze_gemini,
-}
+def model_candidates():
+    """실제로 시도할 모델 순서: 현재 선택 모델 → settings의 폴백 모델들.
+
+    무료 티어(Gemini)를 기본으로 쓰면 할당량 초과(429)·과부하(503)로 분석이
+    통째로 비는 일이 생겨, 유료 저비용 모델로 한 번 더 시도한다.
+    """
+    models = [get_translation_model()]
+    for fallback in settings.TRANSLATION_FALLBACK_MODELS:
+        if fallback not in models:
+            models.append(fallback)
+    return models
+
+
+def _generate_with_fallback(system, user_content, schema, max_tokens, label=''):
+    """모델 후보를 순서대로 시도해 첫 성공 결과를 (모델, 결과)로 돌려준다.
+
+    키가 없는 제공자는 건너뛰고, 호출 실패·파싱 실패는 다음 모델로 넘긴다.
+    모두 실패하면 (None, None) — 호출 측은 원문 저장 등으로 폴백한다.
+    """
+    for model in model_candidates():
+        provider = detect_provider(model)
+        if not provider_api_key(provider):
+            logger.warning("API key for %s not set; skipping %s.", provider, model)
+            continue
+        try:
+            result = _call_provider(model, system, user_content, schema, max_tokens)
+        except Exception:
+            logger.exception("Generation failed (%s/%s) %s", provider, model, label)
+            result = None
+        if result is not None:
+            return model, result
+        logger.warning("Model %s produced no result %s; trying next model.", model, label)
+    return None, None
 
 
 def generate_structured(system, user_content, schema, max_tokens=16000):
     """임의 프롬프트+JSON 스키마로 구조화 응답을 생성하는 범용 헬퍼.
 
-    analyze_email과 동일하게 현재 번역 모델 설정을 따라 제공자를 라우팅하며,
-    실패/키 미설정 시 None을 반환한다. 지식 추출 등 분석 외 작업용.
+    analyze_email과 동일하게 현재 번역 모델 설정을 따라 제공자를 라우팅하고
+    실패 시 폴백 모델로 재시도하며, 모두 실패하면 None. 지식 추출 등 분석 외 작업용.
     """
-    model = get_translation_model()
-    provider = detect_provider(model)
-    if not provider_api_key(provider):
-        logger.warning("API key for %s not set; skipping structured generation.", provider)
-        return None
+    _, result = _generate_with_fallback(system, user_content, schema, max_tokens)
+    return result
 
-    try:
-        if provider == 'anthropic':
-            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-            response = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=system,
-                output_config={"format": {"type": "json_schema", "schema": schema}},
-                messages=[{"role": "user", "content": user_content}],
-            )
-            return _parse_response(response)
-        if provider == 'openai':
-            from openai import OpenAI
-            client = OpenAI(api_key=settings.OPENAI_API_KEY)
-            response = client.chat.completions.create(
-                model=model,
-                max_completion_tokens=max_tokens,
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": user_content}],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {"name": "extraction", "schema": schema, "strict": True},
-                },
-            )
-            return _fix_literal_escapes(json.loads(response.choices[0].message.content))
-        from google import genai
-        client = genai.Client(api_key=settings.GOOGLE_API_KEY)
-        response = client.models.generate_content(
-            model=model,
-            contents=user_content,
-            config={
-                "system_instruction": system,
-                "response_mime_type": "application/json",
-                "response_schema": _gemini_schema(schema),
-                "max_output_tokens": max_tokens,
-            },
-        )
-        return _fix_literal_escapes(json.loads(response.text))
-    except Exception:
-        logger.exception("Structured generation failed (%s/%s)", provider, model)
-        return None
+
+# 실제로 분석에 쓰인 모델을 결과에 실어 보내는 키 — 폴백이 걸리면 현재 설정
+# 모델과 달라지므로, 케이스의 analyzed_by에는 이 값을 기록한다.
+ANALYZED_BY_KEY = '_analyzed_by'
 
 
 def analyze_email(subject, body, direction, is_new_case, case_context=''):
     """메일 1건을 번역+분석. 실패 또는 API 키 미설정 시 None을 반환하고,
     호출 측은 원문 그대로 저장하는 폴백으로 처리한다.
 
-    settings.TRANSLATION_MODEL의 접두어(claude-/gpt-/gemini-)에 따라
-    Anthropic / OpenAI / Google Gemini API로 자동 라우팅된다."""
-    provider = detect_provider(get_translation_model())
-    if not provider_api_key(provider):
-        logger.warning("API key for %s not set; skipping analysis.", provider)
+    모델 이름 접두어(claude-/gpt-/gemini-)에 따라 Anthropic / OpenAI /
+    Google Gemini API로 자동 라우팅되며, 실패하면 폴백 모델로 재시도한다."""
+    model, result = _generate_with_fallback(
+        SYSTEM_PROMPT,
+        _build_user_content(subject, body, direction, is_new_case, case_context),
+        ANALYSIS_SCHEMA,
+        16000,
+        label=f'for subject: {subject}',
+    )
+    if result is None:
         return None
-
-    try:
-        return _PROVIDER_ANALYZERS[provider](subject, body, direction, is_new_case, case_context)
-    except Exception:
-        logger.exception("Email analysis failed (%s/%s) for subject: %s",
-                         provider, get_translation_model(), subject)
-        return None
+    result[ANALYZED_BY_KEY] = model
+    return result
 
 
 def analyze_emails_batch(requests_by_id, poll_interval=15, timeout=3600):
