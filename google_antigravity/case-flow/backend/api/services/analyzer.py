@@ -244,25 +244,60 @@ def model_candidates():
     return models
 
 
+# 할당량 초과(429)를 만난 모델은 잠시 건너뛴다 — 무료 티어는 한도가 하루
+# 수십 건 수준이라, 소진된 뒤에도 메일마다 호출하면 시간만 버리고 로그만 쌓인다.
+QUOTA_COOLDOWN_SECONDS = 900
+_QUOTA_MARKERS = ('429', 'resource_exhausted', 'quota', 'rate limit')
+_cooldown_until = {}
+
+
+def _is_quota_error(exc):
+    text = str(exc).lower()
+    return any(marker in text for marker in _QUOTA_MARKERS)
+
+
+def _in_cooldown(model):
+    until = _cooldown_until.get(model)
+    return until is not None and time.monotonic() < until
+
+
 def _generate_with_fallback(system, user_content, schema, max_tokens, label=''):
     """모델 후보를 순서대로 시도해 첫 성공 결과를 (모델, 결과)로 돌려준다.
 
-    키가 없는 제공자는 건너뛰고, 호출 실패·파싱 실패는 다음 모델로 넘긴다.
-    모두 실패하면 (None, None) — 호출 측은 원문 저장 등으로 폴백한다.
+    키가 없거나 할당량 초과로 쉬는 중인 모델은 건너뛰고, 호출 실패·파싱 실패는
+    다음 모델로 넘긴다. 모두 실패하면 (None, None) — 호출 측은 원문 저장 등으로
+    폴백한다.
+
+    실패는 한 줄로만 남기고(트레이스백은 cron 로그를 뒤덮는다) 모든 후보가
+    실패했을 때만 마지막 예외를 스택과 함께 기록한다.
     """
+    last_error = None
     for model in model_candidates():
         provider = detect_provider(model)
         if not provider_api_key(provider):
             logger.warning("API key for %s not set; skipping %s.", provider, model)
             continue
+        if _in_cooldown(model):
+            logger.info("Skipping %s — quota cooldown in effect.", model)
+            continue
         try:
             result = _call_provider(model, system, user_content, schema, max_tokens)
-        except Exception:
-            logger.exception("Generation failed (%s/%s) %s", provider, model, label)
-            result = None
+        except Exception as exc:
+            last_error = exc
+            if _is_quota_error(exc):
+                _cooldown_until[model] = time.monotonic() + QUOTA_COOLDOWN_SECONDS
+                logger.warning("Quota exhausted for %s; pausing it for %ds.",
+                               model, QUOTA_COOLDOWN_SECONDS)
+            else:
+                logger.warning("Generation failed (%s/%s) %s: %s: %s", provider, model,
+                               label, type(exc).__name__, str(exc)[:200])
+            continue
         if result is not None:
             return model, result
-        logger.warning("Model %s produced no result %s; trying next model.", model, label)
+        logger.warning("Model %s returned an unusable response %s; trying next model.",
+                       model, label)
+    if last_error is not None:
+        logger.error("All models failed %s", label, exc_info=last_error)
     return None, None
 
 

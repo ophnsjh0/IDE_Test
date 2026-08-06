@@ -115,15 +115,34 @@ cp 새템플릿.docx ~/IDE_Test/google_antigravity/case-flow/backend/report_temp
 
 ---
 
-## 백업 cron (등록 완료 상태)
+## cron (등록 완료 상태)
 
 ```cron
+# DB 백업 (매일 03:00) + 14일 초과분 삭제
 0 3 * * * cd /home/case/IDE_Test/google_antigravity/case-flow && /usr/bin/docker compose exec -T db pg_dump -U caseflow caseflow | /usr/bin/age -r age1v53ducmhgvqxfkapq7nce80v5fgxn0t7ypfm8hm9cyjeagcxn4fsg57vuj -o /home/case/backups/caseflow-$(date +\%F).sql.age 2>> /home/case/backups/cron.log
 30 3 * * * find /home/case/backups -name 'caseflow-*.sql.age' -mtime +14 -delete
+# Gmail 수집 (평일 08:00~19:50, 10분 간격)
+*/10 8-19 * * 1-5 /home/case/bin/caseflow-sync.sh
 ```
 
 - 공개키(`age1v53...`)는 노출돼도 무해 — 암호화만 가능, 복호화는 PC 개인키로만.
 - 동작 확인: `ls -la ~/backups/` (날짜별 `.sql.age`), 실패 시 `~/backups/cron.log` 확인.
+
+### Gmail 수집 cron
+
+`~/bin/caseflow-sync.sh` (원본: `scripts/caseflow-sync.sh`, 배포 시 재복사 필요)
+
+- 무료 모델(`gemini-3.5-flash`)로 분석하고, 실패하면 `TRANSLATION_FALLBACK_MODELS`
+  (기본 `claude-haiku-4-5`)로 자동 재시도한다. `--model`은 이번 실행에만 적용되므로
+  웹 UI의 모델 선택은 영향받지 않는다.
+- **무료 한도는 생각보다 작다** — 2026-08-06 운영 키 실측으로 gemini-3.5-flash는
+  하루 20건에서 429. 소진되면 15분간 해당 모델을 건너뛰고 폴백 모델이 처리한다.
+  실질 비용은 Haiku 기준이므로, 무료 비중을 늘리려면 Google Cloud 콘솔에서
+  할당량을 확인하거나 `CASEFLOW_SYNC_MODEL`로 다른 무료 모델을 지정한다.
+- 로그: `~/logs/gmail-sync.log` (5,000줄 넘으면 최근 2,000줄만 유지)
+  - 정상 한 줄 예: `2026-08-06 06:41:48 fetched=3 cases_created=1 emails_added=3 ... errors=0`
+- 동기화가 이미 실행 중이면(웹 버튼과 겹침) 조용히 정상 종료 — cron 오류 메일 없음.
+- 수집 후 케이스 중복 점검: `docker compose exec backend python manage.py find_duplicate_cases`
 
 ## 기타
 

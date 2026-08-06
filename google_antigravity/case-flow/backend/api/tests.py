@@ -2236,6 +2236,9 @@ class AnalyzerFallbackTests(TestCase):
                 'suggested_status': 'Open', 'device_model': '', 'device_serial': '',
                 'software_version': ''}
 
+    def setUp(self):
+        analyzer._cooldown_until.clear()   # 할당량 쿨다운은 프로세스 전역 상태
+
     def analyze(self):
         return analyzer.analyze_email('subject', 'body', 'inbound', True)
 
@@ -2285,6 +2288,40 @@ class AnalyzerFallbackTests(TestCase):
             gmail_sync.apply_analysis_to_case(case, analysis, 'inbound', timezone.now())
         case.refresh_from_db()
         self.assertEqual(case.analyzed_by, 'claude-haiku-4-5')
+
+    def test_quota_error_pauses_the_model_for_later_calls(self):
+        # 무료 한도가 소진되면 메일마다 다시 찔러보지 않는다
+        calls = []
+
+        def call(model, *args, **kwargs):
+            calls.append(model)
+            if model.startswith('gemini'):
+                raise RuntimeError('429 RESOURCE_EXHAUSTED: quota exceeded')
+            return dict(self.ANALYSIS)
+
+        with patch.object(analyzer, '_call_provider', side_effect=call), \
+                analyzer.translation_model_override('gemini-3.5-flash'):
+            self.analyze()
+            self.analyze()
+
+        self.assertEqual(calls.count('gemini-3.5-flash'), 1)
+        self.assertEqual(calls.count('claude-haiku-4-5'), 2)
+
+    def test_non_quota_error_does_not_pause_the_model(self):
+        calls = []
+
+        def call(model, *args, **kwargs):
+            calls.append(model)
+            if model.startswith('gemini'):
+                raise RuntimeError('connection reset')
+            return dict(self.ANALYSIS)
+
+        with patch.object(analyzer, '_call_provider', side_effect=call), \
+                analyzer.translation_model_override('gemini-3.5-flash'):
+            self.analyze()
+            self.analyze()
+
+        self.assertEqual(calls.count('gemini-3.5-flash'), 2)
 
     def test_model_override_restores_the_previous_model(self):
         with analyzer.translation_model_override('gemini-3.5-flash'):

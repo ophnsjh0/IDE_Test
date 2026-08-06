@@ -279,7 +279,9 @@ _TRANSLATION_MODEL_DEFAULT = 'claude-haiku-4-5'         # $1/$5 — 최저 비�
 # _TRANSLATION_MODEL_DEFAULT = 'gpt-5.4'                # $2.5/$15 — 중간
 # _TRANSLATION_MODEL_DEFAULT = 'gpt-5.4-nano'           # $0.2/$1.25 — 로우 (대량 처리용)
 #
-# --- Google Gemini (GOOGLE_API_KEY / GEMINI_API_KEY, 무료 티어 1,500건/일) ---
+# --- Google Gemini (GOOGLE_API_KEY / GEMINI_API_KEY, 무료 티어) ---
+# 무료 한도는 모델·프로젝트마다 다르다 — 2026-08-06 운영 키 실측으로 gemini-3.5-flash는
+# 하루 20건에서 429(RESOURCE_EXHAUSTED)가 났다. 소진 후에는 폴백 모델이 처리한다.
 # _TRANSLATION_MODEL_DEFAULT = 'gemini-3.5-flash'       # 무료 티어 — Flash (최신 GA)
 # _TRANSLATION_MODEL_DEFAULT = 'gemini-3.1-flash-lite'  # 무료 티어 — Flash-Lite (최저 비용)
 TRANSLATION_MODEL = os.environ.get('CASEFLOW_TRANSLATION_MODEL', _TRANSLATION_MODEL_DEFAULT)
