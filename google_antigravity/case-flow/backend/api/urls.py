@@ -38,4 +38,6 @@ urlpatterns = [
     path('usage/stats/', views.UsageStatsView.as_view(), name='usage-stats'),
     path('settings/translation-model/', views.TranslationModelView.as_view(),
          name='translation-model'),
+    path('settings/gmail-sync/', views.GmailSyncScheduleView.as_view(),
+         name='gmail-sync-schedule'),
 ]

@@ -477,6 +477,30 @@ class RolePermissionTests(TestCase):
         self.login('a1')
         self.assertEqual(self.client.delete(f'/api/cases/{self.case.id}/').status_code, 204)
 
+    def test_gmail_sync_switch_is_readable_by_all_but_admin_only_writable(self):
+        url = '/api/settings/gmail-sync/'
+        self.login('v1')
+        payload = self.client.get(url).json()
+        self.assertTrue(payload['enabled'])          # 미설정이면 켜짐이 기본
+        self.assertIn('schedule', payload)
+        self.assertEqual(self.client.put(url, {'enabled': False},
+                                         content_type='application/json').status_code, 403)
+
+        self.login('e1')
+        self.assertEqual(self.client.put(url, {'enabled': False},
+                                         content_type='application/json').status_code, 403)
+
+        self.login('a1')
+        response = self.client.put(url, {'enabled': False}, content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()['enabled'])
+        self.assertFalse(gmail_sync.is_cron_enabled())
+
+        # 잘못된 값은 거부하고 기존 상태를 유지
+        self.assertEqual(self.client.put(url, {'enabled': 'yes'},
+                                         content_type='application/json').status_code, 400)
+        self.assertFalse(gmail_sync.is_cron_enabled())
+
     def test_admin_changes_role_but_cannot_demote_self(self):
         from django.contrib.auth.models import User
         self.login('a1')
@@ -2349,6 +2373,23 @@ class SyncGmailCommandTests(TestCase):
         self.assertEqual(seen, {'model': 'gemini-3.5-flash', 'max_results': 20})
         # 실행이 끝나면 앱 설정 모델로 돌아온다
         self.assertNotEqual(analyzer.get_translation_model(), 'gemini-3.5-flash')
+
+    def test_cron_run_is_skipped_when_the_switch_is_off(self):
+        gmail_sync.set_cron_enabled(False)
+        out = StringIO()
+        with patch('api.management.commands.sync_gmail.sync_gmail') as mocked:
+            call_command('sync_gmail', '--cron', stdout=out)
+        mocked.assert_not_called()
+        self.assertIn('꺼져 있습니다', out.getvalue())
+
+    def test_manual_run_ignores_the_switch(self):
+        # 웹 버튼/수동 실행은 스위치와 무관하게 동작한다
+        gmail_sync.set_cron_enabled(False)
+        with patch('api.management.commands.sync_gmail.sync_gmail',
+                   return_value=dict(fetched=0, cases_created=0, emails_added=0,
+                                     ignored=0, no_vendor=0, skipped=0, errors=0)) as mocked:
+            call_command('sync_gmail', stdout=StringIO())
+        mocked.assert_called_once()
 
     def test_concurrent_run_exits_quietly(self):
         # cron과 웹 버튼이 겹쳐도 cron 메일이 날아가지 않도록 정상 종료

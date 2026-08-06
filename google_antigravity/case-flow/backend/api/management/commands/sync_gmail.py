@@ -1,7 +1,7 @@
 from django.core.management.base import BaseCommand
 
 from api.services.analyzer import translation_model_override
-from api.services.gmail_sync import SyncInProgress, sync_gmail
+from api.services.gmail_sync import SyncInProgress, is_cron_enabled, sync_gmail
 
 
 class Command(BaseCommand):
@@ -13,8 +13,14 @@ class Command(BaseCommand):
         parser.add_argument('--model',
                             help='이번 실행에만 사용할 분석 모델 (앱 설정은 그대로 둔다). '
                                  '실패 시 settings.TRANSLATION_FALLBACK_MODELS로 재시도')
+        parser.add_argument('--cron', action='store_true',
+                            help='관리자 페이지의 자동 수집 스위치를 따른다 '
+                                 '(꺼져 있으면 수집하지 않고 종료). cron 전용')
 
     def handle(self, *args, **options):
+        if options['cron'] and not is_cron_enabled():
+            self.stdout.write('자동 수집이 관리자 페이지에서 꺼져 있습니다 — 건너뜁니다.')
+            return
         try:
             with translation_model_override(options['model']):
                 summary = sync_gmail(max_results=options['max_results'])

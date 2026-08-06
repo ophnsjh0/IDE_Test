@@ -286,6 +286,11 @@ _TRANSLATION_MODEL_DEFAULT = 'claude-haiku-4-5'         # $1/$5 — 최저 비�
 # _TRANSLATION_MODEL_DEFAULT = 'gemini-3.1-flash-lite'  # 무료 티어 — Flash-Lite (최저 비용)
 TRANSLATION_MODEL = os.environ.get('CASEFLOW_TRANSLATION_MODEL', _TRANSLATION_MODEL_DEFAULT)
 
+# cron 수집 주기 안내 문구 — 실제 스케줄은 VM crontab이 정하므로(관리자 페이지의
+# 스위치는 실행 여부만 제어) 주기를 바꾸면 이 값도 함께 맞춘다.
+GMAIL_SYNC_SCHEDULE_LABEL = os.environ.get(
+    'CASEFLOW_GMAIL_SYNC_SCHEDULE_LABEL', '평일 08:00~19:50, 10분 간격')
+
 # 분석 실패 시 순서대로 재시도할 폴백 모델 (쉼표 구분, 빈 값이면 폴백 없음).
 # 무료 티어(Gemini)를 기본으로 쓰면 할당량 초과(429)·과부하(503)로 번역이 통째로
 # 비는 일이 생기므로, 유료 저비용 모델을 뒤에 둔다.

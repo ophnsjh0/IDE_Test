@@ -32,7 +32,8 @@ from .services.analyzer import (
 )
 from .services import help_agent
 from .services.gmail_client import GmailAuthError
-from .services.gmail_sync import SyncInProgress, sync_gmail
+from .services.gmail_sync import (LAST_RUN_SETTING_KEY, SyncInProgress,
+                                  is_cron_enabled, set_cron_enabled, sync_gmail)
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +269,41 @@ class GmailSyncView(APIView):
         log_event(request.user, 'gmail_sync',
                   detail=f"fetched={summary.get('fetched')} created={summary.get('cases_created')}")
         return Response(summary)
+
+
+class GmailSyncScheduleView(APIView):
+    """GET/PUT /api/settings/gmail-sync/ — cron 자동 수집 스위치.
+
+    VM의 crontab은 계속 돌지만, 이 스위치가 꺼져 있으면 수집을 건너뛴다
+    (컨테이너에서 호스트 crontab을 직접 못 건드리므로 DB 값으로 제어).
+    웹의 수동 동기화 버튼은 이 스위치와 무관하게 동작한다.
+    """
+
+    def get_permissions(self):
+        # 조회는 전 역할(상태 표시), 변경은 관리자만
+        if self.request.method == 'PUT':
+            return [IsAdminRole()]
+        return super().get_permissions()
+
+    def get(self, request):
+        return Response(self._payload())
+
+    def put(self, request):
+        enabled = request.data.get('enabled')
+        if not isinstance(enabled, bool):
+            return Response({'error': 'enabled는 true/false여야 합니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        set_cron_enabled(enabled)
+        log_event(request.user, 'gmail_cron_toggle', detail='on' if enabled else 'off')
+        return Response(self._payload())
+
+    @staticmethod
+    def _payload():
+        return {
+            'enabled': is_cron_enabled(),
+            'last_run': AppSetting.get(LAST_RUN_SETTING_KEY),
+            'schedule': settings.GMAIL_SYNC_SCHEDULE_LABEL,
+        }
 
 
 class HelpAgentChatView(APIView):

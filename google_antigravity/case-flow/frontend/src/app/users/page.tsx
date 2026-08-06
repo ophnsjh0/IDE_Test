@@ -15,16 +15,23 @@ import {
   PasswordInput,
   Select,
   Stack,
+  Switch,
   Table,
   Text,
   TextInput,
   Title,
 } from '@mantine/core';
 import { useForm } from '@mantine/form';
-import { IconKey, IconPlus, IconTrash, IconUserCheck, IconUserOff } from '@tabler/icons-react';
+import { IconKey, IconMailDown, IconPlus, IconTrash, IconUserCheck, IconUserOff } from '@tabler/icons-react';
 import AppHeader from '../components/AppHeader';
 import { apiFetch } from '../lib/api';
 import { ROLE_LABELS, Role, useMe } from '../lib/useMe';
+
+interface SyncSchedule {
+  enabled: boolean;
+  last_run: string;
+  schedule: string;
+}
 
 interface Account {
   id: number;
@@ -71,6 +78,38 @@ export default function UsersPage() {
   useEffect(() => {
     fetchAccounts();
   }, [fetchAccounts]);
+
+  // Gmail 자동 수집 스위치 — VM cron은 계속 돌고, 이 값이 꺼져 있으면 수집을 건너뛴다
+  const [schedule, setSchedule] = useState<SyncSchedule | null>(null);
+  const [scheduleSaving, setScheduleSaving] = useState(false);
+
+  useEffect(() => {
+    apiFetch('/api/settings/gmail-sync/')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => data && setSchedule(data))
+      .catch(() => {});
+  }, []);
+
+  const handleScheduleToggle = async (enabled: boolean) => {
+    setScheduleSaving(true);
+    try {
+      const response = await apiFetch('/api/settings/gmail-sync/', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      if (response.ok) {
+        setSchedule(await response.json());
+        setMessage(enabled ? '자동 수집을 켰습니다.' : '자동 수집을 껐습니다.');
+      } else {
+        setMessage('자동 수집 설정 변경에 실패했습니다.');
+      }
+    } catch {
+      setMessage('백엔드 서버에 연결할 수 없습니다.');
+    } finally {
+      setScheduleSaving(false);
+    }
+  };
 
   const createForm = useForm({
     initialValues: { username: '', name: '', password: '', role: 'viewer' as Role },
@@ -271,6 +310,35 @@ export default function UsersPage() {
             <Text size="sm" c="teal" mb="sm">
               {message}
             </Text>
+          )}
+
+          {schedule && (
+            <Paper shadow="xs" p="md" withBorder mb="lg">
+              <Group justify="space-between" wrap="nowrap">
+                <Group gap="sm" wrap="nowrap">
+                  <IconMailDown size={20} />
+                  <div>
+                    <Text fw={600}>Gmail 자동 수집</Text>
+                    <Text size="sm" c="dimmed">
+                      {schedule.schedule}에 벤더 케이스 메일을 자동으로 가져옵니다.
+                      끄면 수집이 멈추고, 케이스 목록의 &quot;Gmail 동기화&quot; 버튼으로는
+                      계속 수동 수집할 수 있습니다.
+                    </Text>
+                    <Text size="xs" c="dimmed" mt={4}>
+                      마지막 수집: {schedule.last_run || '기록 없음'}
+                    </Text>
+                  </div>
+                </Group>
+                <Switch
+                  size="md"
+                  checked={schedule.enabled}
+                  disabled={scheduleSaving}
+                  onChange={(event) => handleScheduleToggle(event.currentTarget.checked)}
+                  label={schedule.enabled ? '켜짐' : '꺼짐'}
+                  labelPosition="left"
+                />
+              </Group>
+            </Paper>
           )}
 
           <Paper shadow="xs" p="md" withBorder>

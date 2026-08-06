@@ -10,11 +10,26 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from ..models import Case, CaseEmail
+from ..models import AppSetting, Case, CaseEmail
 from . import email_parser, gmail_client
 from .analyzer import ANALYZED_BY_KEY, analyze_email, get_translation_model
 
 logger = logging.getLogger(__name__)
+
+# 관리자 페이지에서 켜고 끄는 cron 수집 스위치. cron은 항상 돌지만 이 값이
+# 꺼져 있으면 수집을 건너뛴다 (호스트 crontab은 컨테이너에서 못 건드린다).
+# 웹의 수동 동기화 버튼은 이 스위치와 무관하게 동작한다.
+CRON_ENABLED_SETTING_KEY = 'gmail_sync_cron_enabled'
+LAST_RUN_SETTING_KEY = 'gmail_sync_last_run'
+
+
+def is_cron_enabled():
+    """미설정이면 켜짐 — 스위치를 도입하기 전과 같은 동작."""
+    return AppSetting.get(CRON_ENABLED_SETTING_KEY, '1') != '0'
+
+
+def set_cron_enabled(enabled):
+    AppSetting.set(CRON_ENABLED_SETTING_KEY, '1' if enabled else '0')
 
 
 class SyncInProgress(Exception):
@@ -88,7 +103,16 @@ def _sync_gmail(max_results):
             logger.exception("Failed to process Gmail message %s", message.get('id'))
             summary['errors'] += 1
 
+    _record_last_run(summary)
     return summary
+
+
+def _record_last_run(summary):
+    """마지막 수집 시각과 결과를 남긴다 (관리자 페이지 표시용)."""
+    stamp = timezone.localtime().strftime('%Y-%m-%d %H:%M')
+    detail = (f"수집 {summary['fetched']}통 · 새 케이스 {summary['cases_created']}건 "
+              f"· 오류 {summary['errors']}건")
+    AppSetting.set(LAST_RUN_SETTING_KEY, f'{stamp} · {detail}')
 
 
 def _process_message(message):
