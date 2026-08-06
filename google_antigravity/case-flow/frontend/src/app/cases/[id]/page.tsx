@@ -18,6 +18,7 @@ import {
   TextInput,
   Textarea,
   Select,
+  Modal,
 } from '@mantine/core';
 import { useForm } from '@mantine/form';
 import {
@@ -27,6 +28,7 @@ import {
   IconMailDown,
   IconMailUp,
   IconLanguage,
+  IconTrash,
 } from '@tabler/icons-react'; // IconDeviceFloppy for Save
 import ScrollToTopButton from '../../components/ScrollToTopButton';
 import AppHeader from '../../components/AppHeader';
@@ -86,7 +88,10 @@ export default function CaseDetailPage() {
   const [loading, setLoading] = useState(true);
   const [isEditing, setIsEditing] = useState(false);
   const [saving, setSaving] = useState(false);
-  const { canWrite } = useMe();
+  const [deleteOpened, setDeleteOpened] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
+  const { canWrite, isAdmin } = useMe();
 
   const form = useForm({
     initialValues: {
@@ -177,6 +182,24 @@ export default function CaseDetailPage() {
       }
   };
 
+  // 삭제는 관리자만 (서버도 IsAdminRole로 차단). 케이스에 딸린 메일도 함께 지워진다.
+  const handleDelete = async () => {
+    setDeleting(true);
+    setDeleteError('');
+    try {
+      const response = await apiFetch(`/api/cases/${id}/`, { method: 'DELETE' });
+      if (response.ok) {
+        router.push('/');
+      } else {
+        setDeleteError('삭제에 실패했습니다. 권한을 확인해 주세요.');
+      }
+    } catch {
+      setDeleteError('삭제 요청 중 오류가 발생했습니다.');
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   const handleCancel = () => {
       if (caseDetail) {
         form.setValues({
@@ -227,14 +250,26 @@ export default function CaseDetailPage() {
             </Button>
             
             {!isEditing ? (
-                canWrite && (
-                <Button 
-                    leftSection={<IconEdit size={16} />} 
-                    onClick={() => setIsEditing(true)}
-                >
-                    Edit Case
-                </Button>
-                )
+                <Group>
+                    {canWrite && (
+                    <Button
+                        leftSection={<IconEdit size={16} />}
+                        onClick={() => setIsEditing(true)}
+                    >
+                        Edit Case
+                    </Button>
+                    )}
+                    {isAdmin && (
+                    <Button
+                        color="red"
+                        variant="light"
+                        leftSection={<IconTrash size={16} />}
+                        onClick={() => { setDeleteError(''); setDeleteOpened(true); }}
+                    >
+                        삭제
+                    </Button>
+                    )}
+                </Group>
             ) : (
                 <Group>
                     <Button variant="default" onClick={handleCancel} disabled={saving}>Cancel</Button>
@@ -416,6 +451,38 @@ export default function CaseDetailPage() {
             </Paper>
           )}
         </Container>
+
+        <Modal
+          opened={deleteOpened}
+          onClose={() => setDeleteOpened(false)}
+          title={`케이스 삭제 — ${caseDetail.case_id}`}
+          centered
+        >
+          <Stack>
+            <Text size="sm">
+              <Text span fw={600}>{caseDetail.summary}</Text> 케이스를 완전히 삭제합니다.
+              이 작업은 되돌릴 수 없습니다.
+            </Text>
+            {caseDetail.emails?.length > 0 && (
+              <Text size="sm" c="red">
+                이메일 타임라인 {caseDetail.emails.length}통도 함께 삭제됩니다.
+              </Text>
+            )}
+            <Text size="xs" c="dimmed">
+              중복 생성된 케이스라면 삭제 대신 병합이 필요할 수 있습니다.
+              이 케이스에서 추출된 지식 항목은 삭제되지 않고 남습니다.
+            </Text>
+            {deleteError && <Text size="sm" c="red">{deleteError}</Text>}
+            <Group justify="flex-end">
+              <Button variant="default" onClick={() => setDeleteOpened(false)} disabled={deleting}>
+                취소
+              </Button>
+              <Button color="red" loading={deleting} onClick={handleDelete}>
+                삭제
+              </Button>
+            </Group>
+          </Stack>
+        </Modal>
 
         {/* 이메일 타임라인이 길어 스크롤이 깊어지면 맨 위로 복귀 */}
         <ScrollToTopButton />
