@@ -3,7 +3,7 @@
     python manage.py merge_cases C-1150 C-1153 C-1159 --dry-run
     python manage.py merge_cases C-1150 C-1153 C-1159
 
-기본 대상(남길 케이스)은 가장 오래된 케이스이며 `--into`로 지정할 수 있다.
+기본 대상(남길 케이스)은 첫 메일이 가장 이른 케이스이며 `--into`로 지정할 수 있다.
 이메일·지식·연관 케이스를 대상 케이스로 옮기고, 조치 타임라인은 시각순으로
 다시 합친 뒤 나머지 케이스를 삭제한다.
 """
@@ -28,7 +28,7 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument('case_ids', nargs='+',
                             help='병합할 케이스 (C-1150 또는 150 형식)')
-        parser.add_argument('--into', help='남길 케이스 (기본: 가장 오래된 케이스)')
+        parser.add_argument('--into', help='남길 케이스 (기본: 첫 메일이 가장 이른 케이스)')
         parser.add_argument('--dry-run', action='store_true',
                             help='변경 없이 병합 결과만 출력')
 
@@ -41,7 +41,10 @@ class Command(BaseCommand):
         if len(vendors) > 1:
             raise CommandError(f'벤더가 서로 다릅니다: {", ".join(sorted(vendors))}')
 
-        target = _load_cases([options['into']])[0] if options['into'] else cases[0]
+        # 기본 대상은 대화를 시작한 케이스 — 케이스 생성 순(id)은 동기화 순서라
+        # 대화 순서와 다를 수 있으므로 첫 메일 시각으로 고른다
+        target = (_load_cases([options['into']])[0] if options['into']
+                  else min(cases, key=_first_activity_at))
         sources = [case for case in cases if case.pk != target.pk]
         if not sources:
             raise CommandError('--into 케이스만 지정되어 병합할 대상이 없습니다.')
@@ -102,6 +105,11 @@ def merge_cases(target, sources):
 
     Case.objects.filter(pk__in=source_ids).delete()
     return moved
+
+
+def _first_activity_at(case):
+    first_email = case.emails.order_by('received_at').first()
+    return first_email.received_at if first_email else case.created_at
 
 
 def _last_activity_at(case):

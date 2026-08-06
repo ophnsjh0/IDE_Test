@@ -1,5 +1,7 @@
 import json
 import tempfile
+from datetime import timedelta
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1151,12 +1153,90 @@ class ExactSubjectMatchTests(TestCase):
         found = _find_case(None, 'thread-2', 'A10', f'FW: RE:(12) {self.THREAD_SUBJECT}')
         self.assertEqual(found, case)
 
+    def test_resend_with_remind_tag_matches_existing_case(self):
+        # '[Remind] FW: RE:(2) 제목' — 재발송 표시가 접두어 앞에 붙어도 같은 대화
+        case = make_case(vendor='A10')
+        make_email(case, '[문의] GW Health Check 설정', thread_id='thread-1')
+        found = _find_case(None, 'thread-2', 'A10',
+                           '[Remind] FW: RE:(2) [문의] GW Health Check 설정')
+        self.assertEqual(found, case)
+
+    def test_meaningful_bracket_tag_is_kept(self):
+        # 뜻이 담긴 대괄호 태그는 벗기지 않는다 — 고객사가 다르면 다른 케이스
+        case = make_case(vendor='A10')
+        make_email(case, '[삼성SDS] A10 receive-buffer 설정 건', thread_id='thread-1')
+        found = _find_case(None, 'thread-2', 'A10', 'RE: A10 receive-buffer 설정 건')
+        self.assertIsNone(found)
+
+    def test_different_vendor_case_number_is_not_merged(self):
+        # 같은 증상으로 번호만 새로 딴 재접수 — 번호가 제목에 박혀 있어
+        # 정리된 제목이 달라지므로 제목 폴백으로 이어붙지 않는다
+        case = make_case(vendor='A10', vendor_case_number='455910')
+        make_email(case, 'Case # 455910 [Samsung SDS] Increase TH940 Disk Case',
+                   thread_id='thread-1')
+        found = _find_case('459173', 'thread-2', 'A10',
+                           'Re: Case # 459173 [Samsung SDS] Increase TH940 Disk Case')
+        self.assertIsNone(found)
+
     def test_new_conversation_without_reply_prefix_creates_new_case(self):
         # 접두어도 오픈 키워드도 없는 새 제목은 기존 케이스에 붙지 않는다
         case = make_case(vendor='A10')
         make_email(case, f'RE:(4) {self.THREAD_SUBJECT}', thread_id='thread-1')
         found = _find_case(None, 'thread-2', 'A10', self.THREAD_SUBJECT)
         self.assertIsNone(found)
+
+
+class FindDuplicateCasesTests(TestCase):
+    """제목이 같은데 갈린 케이스 묶음 보고 (find_duplicate_cases 관리 명령)."""
+
+    def _run(self):
+        out = StringIO()
+        call_command('find_duplicate_cases', stdout=out)
+        return out.getvalue()
+
+    def test_split_conversation_is_reported_as_mergeable(self):
+        first = make_case(vendor='A10', summary='첫 케이스')
+        second = make_case(vendor='A10', summary='갈린 케이스')
+        make_email(first, '[삼성SDS] A10 receive-buffer 설정 건', thread_id='t1')
+        make_email(second, 'RE:(6) [삼성SDS] A10 receive-buffer 설정 건', thread_id='t2')
+
+        output = self._run()
+        self.assertIn(first.case_id, output)
+        self.assertIn(f'{second.case_id} [Open]', output)
+        self.assertIn('병합 대상', output)
+
+    def test_repeated_notice_is_reported_without_merge_mark(self):
+        # 공지성 메일은 제목이 같아도 병합 대상이 아니다 — 보고만 한다
+        first = make_case(vendor='Arista')
+        second = make_case(vendor='Arista')
+        make_email(first, 'New End of Sale email notification', thread_id='t1')
+        make_email(second, 'New End of Sale email notification', thread_id='t2')
+
+        self.assertNotIn('병합 대상', self._run())
+
+    def test_reopened_case_with_new_number_is_not_marked_mergeable(self):
+        # 번호만 새로 딴 재접수는 회신이어도 제목에 번호가 박혀 있어 병합 대상이 아니다
+        first = make_case(vendor='A10', vendor_case_number='455910')
+        second = make_case(vendor='A10', vendor_case_number='459173')
+        make_email(first, 'Re: Case # 455910 [Samsung SDS] Increase TH940 Disk Case',
+                   thread_id='t1')
+        make_email(first, '[Samsung SDS] Increase TH940 Disk Case', thread_id='t1')
+        # 번호 없는 제목이 겹쳐 같은 묶음으로 잡히지만, 첫 메일 제목엔 새 번호가 박혀 있다
+        make_email(second, 'Re: Case # 459173 [Samsung SDS] Increase TH940 Disk Case',
+                   thread_id='t2')
+        make_email(second, '[Samsung SDS] Increase TH940 Disk Case', thread_id='t2')
+
+        output = self._run()
+        self.assertIn(first.case_id, output)      # 묶음으로는 보고하되
+        self.assertNotIn('병합 대상', output)      # 자동 병합 대상은 아님
+
+    def test_unrelated_cases_are_not_grouped(self):
+        first = make_case(vendor='A10')
+        second = make_case(vendor='A10')
+        make_email(first, '[문의] GW Health Check 설정', thread_id='t1')
+        make_email(second, '[문의] DSR 및 IPIP Tunnel 설정 검토', thread_id='t2')
+
+        self.assertIn('중복 의심 묶음이 없습니다', self._run())
 
 
 class MergeCasesTests(TestCase):
@@ -1189,6 +1269,19 @@ class MergeCasesTests(TestCase):
         self.assertEqual(self.target.device_model, 'TH1040-F')
         # 상태는 가장 최근 메일을 받은 케이스의 것을 따른다
         self.assertEqual(self.target.status, 'Pending')
+
+    def test_merge_target_is_the_case_that_started_the_conversation(self):
+        # 케이스 id 순이 아니라 첫 메일이 이른 쪽이 남는다 (동기화 순서 ≠ 대화 순서)
+        older_talk = make_case(vendor='A10', summary='먼저 시작된 대화')
+        email = make_email(older_talk, 'RE:(2) [삼성SDS] receive-buffer 설정 건')
+        email.received_at = timezone.now() - timedelta(days=3)
+        email.save()
+
+        call_command('merge_cases', self.target.case_id, older_talk.case_id)
+
+        older_talk.refresh_from_db()
+        self.assertEqual(older_talk.emails.count(), 2)
+        self.assertFalse(Case.objects.filter(pk=self.target.pk).exists())
 
     def test_merge_rejects_different_vendors(self):
         arista = make_case(vendor='Arista')

@@ -21,8 +21,12 @@ CASE_NUMBER_PATTERNS = [
     re.compile(r'ticket\s*#?\s*[:\-]?\s*(\d{5,})', re.IGNORECASE),
 ]
 
-# 'RE:(2) (2) 제목' — 일부 메일러(삼성 등)는 회신 횟수를 (n)으로 붙이므로 함께 벗긴다
-RE_PREFIX = re.compile(r'^\s*((re|fw|fwd|답장|전달)\s*:\s*|\(\d+\)\s*)+', re.IGNORECASE)
+# 'RE:(2) (2) 제목' — 일부 메일러(삼성 등)는 회신 횟수를 (n)으로 붙이므로 함께 벗긴다.
+# '[Remind] FW: RE:(2) 제목'처럼 재발송 표시가 앞에 붙는 경우도 같은 대화이므로
+# 함께 벗긴다 — 뜻이 담긴 대괄호 태그([삼성SDS] 등)는 목록에 없어 그대로 남는다.
+RE_PREFIX = re.compile(
+    r'^\s*((re|fw|fwd|답장|전달)\s*:\s*|\(\d+\)\s*|\[\s*(remind|reminder|재발송)\s*\]\s*)+',
+    re.IGNORECASE)
 
 # 케이스 오픈 템플릿의 'Serial Number : TH1015...' / 'Serial : HBG...' 줄
 RE_SERIAL_NUMBER = re.compile(
