@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 import anthropic
 
 from django.contrib.auth.models import User
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
@@ -1131,6 +1133,67 @@ class ExactSubjectMatchTests(TestCase):
         make_email(case, self.SUBJECT, thread_id='thread-1')
         found = _find_case(None, 'thread-2', 'A10', f'Re: {self.SUBJECT}')
         self.assertIsNone(found)
+
+    # 오픈 키워드가 없는 고객사 스레드 — 회신 접두어를 신호로 이어붙인다
+    THREAD_SUBJECT = '[삼성SDS] A10 receive-buffer 설정 건'
+
+    def test_reply_without_open_keyword_matches_existing_case(self):
+        case = make_case(vendor='A10')
+        make_email(case, self.THREAD_SUBJECT, thread_id='thread-1')
+        found = _find_case(None, 'thread-2', 'A10', f'RE:(6) {self.THREAD_SUBJECT}')
+        self.assertEqual(found, case)
+
+    def test_reply_matches_case_started_mid_conversation(self):
+        # 스레드가 매번 갈리면 케이스의 첫 메일부터 이미 'RE:(4) …' 회신이다
+        case = make_case(vendor='A10')
+        make_email(case, f'RE:(4) {self.THREAD_SUBJECT}', thread_id='thread-1')
+        make_email(case, f'RE: RE:(4) {self.THREAD_SUBJECT}', thread_id='thread-1')
+        found = _find_case(None, 'thread-2', 'A10', f'FW: RE:(12) {self.THREAD_SUBJECT}')
+        self.assertEqual(found, case)
+
+    def test_new_conversation_without_reply_prefix_creates_new_case(self):
+        # 접두어도 오픈 키워드도 없는 새 제목은 기존 케이스에 붙지 않는다
+        case = make_case(vendor='A10')
+        make_email(case, f'RE:(4) {self.THREAD_SUBJECT}', thread_id='thread-1')
+        found = _find_case(None, 'thread-2', 'A10', self.THREAD_SUBJECT)
+        self.assertIsNone(found)
+
+
+class MergeCasesTests(TestCase):
+    """중복 생성된 케이스 병합 (merge_cases 관리 명령)."""
+
+    def setUp(self):
+        self.target = make_case(vendor='A10', status='Open', summary='receive-buffer 설정 건',
+                                action_steps='[2026-07-31 05:14 발신] 설정값 문의')
+        self.other = make_case(vendor='A10', status='Pending', summary='receive-buffer 문의',
+                               action_steps='[2026-08-03 03:12 수신] 벤더 회신 도착',
+                               device_model='TH1040-F')
+        make_email(self.target, 'RE:(4) [삼성SDS] receive-buffer 설정 건')
+        self.moved = make_email(self.other, 'RE:(7) [삼성SDS] receive-buffer 설정 건')
+
+    def test_merge_moves_emails_and_deletes_source(self):
+        call_command('merge_cases', self.target.case_id, self.other.case_id)
+
+        self.moved.refresh_from_db()
+        self.assertEqual(self.moved.case_id, self.target.pk)
+        self.assertEqual(self.target.emails.count(), 2)
+        self.assertFalse(Case.objects.filter(pk=self.other.pk).exists())
+
+    def test_merge_orders_timeline_and_fills_empty_fields(self):
+        call_command('merge_cases', self.target.case_id, self.other.case_id)
+
+        self.target.refresh_from_db()
+        steps = self.target.action_steps
+        self.assertLess(steps.index('설정값 문의'), steps.index('벤더 회신 도착'))
+        self.assertIn('병합했습니다', steps)
+        self.assertEqual(self.target.device_model, 'TH1040-F')
+        # 상태는 가장 최근 메일을 받은 케이스의 것을 따른다
+        self.assertEqual(self.target.status, 'Pending')
+
+    def test_merge_rejects_different_vendors(self):
+        arista = make_case(vendor='Arista')
+        with self.assertRaises(CommandError):
+            call_command('merge_cases', self.target.case_id, arista.case_id)
 
 
 class HelpAgentToolTests(TestCase):

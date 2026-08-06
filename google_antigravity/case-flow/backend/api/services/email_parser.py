@@ -109,6 +109,15 @@ def clean_subject(subject):
     return RE_PREFIX.sub('', subject or '').strip()
 
 
+def has_reply_prefix(subject):
+    """제목에 회신/전달 접두어(RE:, FW:, (n))가 붙어 있는가.
+
+    새로 시작된 대화가 아니라 기존 대화의 후속 메일이라는 신호 — 매번 새로
+    발송되는 공지성 메일과 스레드가 갈린 회신을 구분하는 데 쓴다.
+    """
+    return bool(RE_PREFIX.match(subject or ''))
+
+
 def extract_serial_number(body):
     match = RE_SERIAL_NUMBER.search(body or '')
     if not match:

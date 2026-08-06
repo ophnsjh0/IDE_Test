@@ -277,38 +277,49 @@ def _find_case(case_number, thread_id, vendor=None, subject='', body=''):
     return None
 
 
-# 제목 폴백 매칭 파라미터: 짧은 제목 오탐 방지 최소 길이, 후보 케이스 탐색 기간
+# 제목 폴백 매칭 파라미터: 짧은 제목 오탐 방지 최소 길이, 후보 탐색 기간/개수
 SUBJECT_MATCH_MIN_LENGTH = 10
 SUBJECT_MATCH_WINDOW_DAYS = 60
+SUBJECT_MATCH_MAX_CANDIDATES = 200
 
 
 def _find_case_by_exact_subject(vendor, subject):
     """고객사↔당사 케이스 스레드([Caseopen] 등)가 스레드 절단으로 갈릴 때의 폴백.
 
     삼성 등 일부 메일러는 회신할 때마다 새 Gmail 스레드를 만들고 제목에
-    'RE:(2) (2)' 카운터를 붙여 번호/스레드 매칭이 모두 실패한다. 케이스 오픈
-    키워드(GMAIL_SYNC_INCLUDE_SUBJECTS)가 제목에 있는 메일에 한해, 정리된
-    제목이 정확히 같은 케이스와 병합한다 — 오픈 키워드 제목은 케이스당 한 번
-    작성되므로 제목이 반복되는 공지성 메일과 달리 동일 제목 = 동일 케이스다.
+    'RE:(2) (2)' 카운터를 붙여 번호/스레드 매칭이 모두 실패한다. 정리된 제목이
+    정확히 같은 기존 케이스와 병합하되, 제목이 매번 반복되는 공지성 메일까지
+    한 케이스로 뭉치지 않도록 아래 둘 중 하나일 때만 적용한다.
+
+    - 케이스 오픈 키워드(GMAIL_SYNC_INCLUDE_SUBJECTS)가 제목에 있는 메일
+      — 오픈 제목은 케이스당 한 번 작성되므로 동일 제목 = 동일 케이스.
+    - 회신/전달 접두어가 붙은 메일 — 새로 시작된 대화가 아니라 기존 대화의
+      후속임이 제목에 드러나므로, 매번 새로 발송되는 공지와 구분된다.
+
+    비교 대상은 케이스의 첫 메일이 아니라 모든 메일이다. 스레드가 회신마다
+    갈리면 케이스의 첫 메일 제목부터 이미 'RE:(4) …' 회신이라, 대화 중간에서
+    시작된 케이스와도 제목을 맞춰봐야 이어붙는다.
     """
     subject_lower = (subject or '').lower()
-    if not any(keyword.lower() in subject_lower
-               for keyword in settings.GMAIL_SYNC_INCLUDE_SUBJECTS):
+    is_case_open = any(keyword.lower() in subject_lower
+                       for keyword in settings.GMAIL_SYNC_INCLUDE_SUBJECTS)
+    if not is_case_open and not email_parser.has_reply_prefix(subject):
         return None
     cleaned = email_parser.clean_subject(subject).lower()
     if len(cleaned) < SUBJECT_MATCH_MIN_LENGTH:
         return None
 
-    candidates = Case.objects.filter(
-        vendor=vendor,
-        created_at__gte=timezone.now() - timedelta(days=SUBJECT_MATCH_WINDOW_DAYS),
-    )
-    for case in candidates.order_by('-created_at'):
-        first_email = case.emails.order_by('received_at').first()
-        if first_email is None:
-            continue
-        if email_parser.clean_subject(first_email.subject).lower() == cleaned:
-            return case
+    # 정리된 제목은 원 제목의 부분문자열이므로 icontains로 SQL 선필터
+    emails = (CaseEmail.objects
+              .filter(case__vendor=vendor,
+                      case__created_at__gte=(timezone.now()
+                                             - timedelta(days=SUBJECT_MATCH_WINDOW_DAYS)),
+                      subject__icontains=cleaned)
+              .select_related('case')
+              .order_by('-received_at')[:SUBJECT_MATCH_MAX_CANDIDATES])
+    for email in emails:
+        if email_parser.clean_subject(email.subject).lower() == cleaned:
+            return email.case
     return None
 
 
