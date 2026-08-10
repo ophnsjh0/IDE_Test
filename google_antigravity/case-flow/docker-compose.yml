@@ -7,10 +7,21 @@
 #   backend/report_templates/  — 사내 실물 템플릿
 #
 # 기동: docker compose up -d --build  (운영 VM은 ~/bin/caseflow-up.sh 사용)
+
+# 컨테이너 로그 상한 — docker 기본값은 무제한이라 json 로그가 계속 쌓여
+# 디스크를 조용히 잠식한다. 서비스당 최대 30MB(10MB x 3개)로 묶는다.
+# 컨테이너 재생성 시점부터 적용된다 (restart로는 반영되지 않음).
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *default-logging
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-caseflow}
       POSTGRES_USER: ${POSTGRES_USER:-caseflow}
@@ -29,6 +40,7 @@ services:
       context: .
       dockerfile: backend.Dockerfile
     restart: unless-stopped
+    logging: *default-logging
     # .env는 caseflow-up.sh가 기동 순간에만 복호화해 두므로 평시에는 없음 —
     # required: false로 cp/exec 등 다른 compose 명령이 막히지 않게 한다.
     # 단, up/recreate는 반드시 caseflow-up.sh로 (없이 돌리면 API 키가 빈 값으로 들어감)
@@ -61,6 +73,7 @@ services:
       # args:
       #   NEXT_PUBLIC_API_BASE: http://<VM_IP>:8000
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "3000:3000"
     depends_on:
