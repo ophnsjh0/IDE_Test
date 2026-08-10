@@ -29,7 +29,7 @@ import {
 } from '@tabler/icons-react';
 import ScrollToTopButton from '../../components/ScrollToTopButton';
 import AppHeader from '../../components/AppHeader';
-import { apiFetch } from '../../lib/api';
+import { apiFetch, apiUrl } from '../../lib/api';
 import { useMe } from '../../lib/useMe';
 
 // 케이스 상세와 동일한 본문 스타일 — 커맨드/로그의 줄바꿈 유지 + 긴 문자열 강제 줄바꿈
@@ -285,9 +285,22 @@ export default function KnowledgeDetailPage() {
                       <Stack gap="xs">
                         {item.references.map((ref, i) => (
                           <Paper key={i} withBorder p="sm" radius="md">
-                            <Text size="sm" fw={600}>
-                              {ref.document} <Text component="span" c="dimmed">({ref.pages})</Text>
-                            </Text>
+                            <Group justify="space-between" wrap="nowrap" align="flex-start">
+                              <Text size="sm" fw={600}>
+                                {ref.document} <Text component="span" c="dimmed">({ref.pages})</Text>
+                              </Text>
+                              <Button
+                                component="a"
+                                href={referenceFileUrl(ref)}
+                                target="_blank"
+                                size="compact-xs"
+                                variant="light"
+                                rightSection={<IconExternalLink size={12} />}
+                                style={{ flexShrink: 0 }}
+                              >
+                                원본 열기
+                              </Button>
+                            </Group>
                             <Text size="sm" c="dimmed">{ref.note}</Text>
                           </Paper>
                         ))}
@@ -342,6 +355,18 @@ export default function KnowledgeDetailPage() {
       </AppShell.Main>
     </AppShell>
   );
+}
+
+// 인용 원본을 브라우저에서 열어 출처를 직접 확인하는 링크.
+// PDF는 인용 시작 페이지로 바로 이동(#page=N), 엑셀은 브라우저 렌더링이
+// 안 되므로 다운로드로 전환한다.
+function referenceFileUrl(ref: KnowledgeReference) {
+  const isPdf = ref.document.toLowerCase().endsWith('.pdf');
+  const base = apiUrl(
+    `/api/references/file/?path=${encodeURIComponent(ref.document)}${isPdf ? '' : '&dl=1'}`
+  );
+  const page = isPdf ? ref.pages.match(/p\.(\d+)/) : null;
+  return page ? `${base}#page=${page[1]}` : base;
 }
 
 function getVendorColor(vendor: string) {

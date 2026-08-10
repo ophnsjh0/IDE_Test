@@ -8,15 +8,54 @@
 청크 수천 개 규모라 벡터 DB 없이 충분히 빠르며(수십 ms), SQLite/Postgres
 어느 쪽에서도 동일하게 동작한다. 문서가 수십만 청크로 커지면 pgvector 승격.
 """
+import fcntl
 import hashlib
 import logging
+import os
+from contextlib import contextmanager
 
 import numpy as np
 from django.conf import settings
 
-from api.models import Case, ReferenceChunk, ReferenceDocument
+from api.models import AppSetting, Case, ReferenceChunk, ReferenceDocument
 
 logger = logging.getLogger(__name__)
+
+# 업로드 시 즉시 임베딩할지 결정하는 스위치 (관리자가 Documents 페이지에서 제어).
+# 꺼져 있으면 업로드만 되고, 관리자가 수동 임베딩 버튼으로 처리한다.
+AUTO_EMBED_SETTING_KEY = 'reference_auto_embed'
+
+
+def is_auto_embed_enabled():
+    """미설정이면 켜짐 — 업로드 즉시 검색 가능한 것이 기본 기대 동작."""
+    return AppSetting.get(AUTO_EMBED_SETTING_KEY, '1') != '0'
+
+
+def set_auto_embed_enabled(enabled):
+    AppSetting.set(AUTO_EMBED_SETTING_KEY, '1' if enabled else '0')
+
+
+class EmbedInProgress(Exception):
+    """다른 임베딩이 이미 실행 중 — 웹 버튼 중복 클릭, 업로드 자동 임베딩 겹침."""
+
+
+_EMBED_LOCK_FILE = os.path.join(settings.BASE_DIR, '.reference_embed.lock')
+
+
+@contextmanager
+def embed_lock():
+    """임베딩 동시 실행 차단 (gmail_sync와 같은 파일 잠금 방식)."""
+    lock_file = open(_EMBED_LOCK_FILE, 'w')
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        raise EmbedInProgress('다른 문서 임베딩이 이미 진행 중입니다. 잠시 후 다시 시도하세요.')
+    try:
+        yield
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
 
 # 청크 크기(문자). 영문 기준 ~1,000토큰. 오버랩은 섹션 경계에서 문맥이
 # 끊기지 않게 하는 안전장치.
@@ -207,6 +246,12 @@ def ingest_file(vendor, doc_type, relative_path, path, force=False, log=lambda m
     ], batch_size=200)
     _invalidate_cache()
     return outcome
+
+
+def delete_document(relative_path):
+    """파일 삭제 후 남은 임베딩 데이터(문서+청크) 정리."""
+    ReferenceDocument.objects.filter(filename=relative_path).delete()
+    _invalidate_cache()
 
 
 # ---------------------------------------------------------------- 검색

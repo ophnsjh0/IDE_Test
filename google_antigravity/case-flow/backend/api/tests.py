@@ -2449,3 +2449,188 @@ class BackfillTranslationTests(TestCase):
         self.assertEqual(self.missing.body_ko, '')
         self.assertEqual(mocked.call_count, 2)  # 원 시도 + 재시도 1회
         self.assertIn('실패 1건', out)
+
+
+class ReferenceApiTests(TestCase):
+    """Documents API — 목록/다운로드/업로드/임베딩/삭제와 역할별 권한 경계."""
+
+    def setUp(self):
+        from django.conf import settings as dj_settings
+        from .permissions import set_user_role
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.docs_root = Path(self.tmp.name)
+        docs_override = override_settings(REFERENCE_DOCS_DIR=self.docs_root)
+        docs_override.enable()
+        self.addCleanup(docs_override.disable)
+        self.embedding_model = dj_settings.EMBEDDING_MODEL
+
+        self.viewer = User.objects.create_user('doc-viewer', password='x')
+        set_user_role(self.viewer, 'viewer')
+        self.engineer = User.objects.create_user('doc-eng', password='x')
+        set_user_role(self.engineer, 'engineer')
+        self.admin = User.objects.create_user('doc-admin', password='x')
+        set_user_role(self.admin, 'admin')
+
+    def _make_pdf(self, relative):
+        path = self.docs_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'%PDF-1.4 test content')
+        return path
+
+    def _upload(self, **extra):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        data = {
+            'file': SimpleUploadedFile('New Guide.pdf', b'%PDF-1.4 uploaded',
+                                       content_type='application/pdf'),
+            'vendor': 'A10',
+            'doc_type': 'config',
+        }
+        data.update(extra)
+        return self.client.post('/api/references/upload/', data)
+
+    def test_list_merges_files_and_embedding_state(self):
+        from .models import ReferenceDocument
+        self._make_pdf('A10/config/embedded.pdf')
+        self._make_pdf('Arista/release/raw.pdf')
+        ReferenceDocument.objects.create(
+            vendor='A10', filename='A10/config/embedded.pdf', doc_type='config',
+            title='ACOS Guide', sha256='x', page_count=10, chunk_count=3,
+            embedding_model=self.embedding_model)
+
+        self.client.force_login(self.viewer)  # 목록은 전 역할 공개
+        data = self.client.get('/api/references/').json()
+        self.assertEqual(len(data['items']), 2)
+        by_name = {i['filename']: i for i in data['items']}
+        self.assertTrue(by_name['A10/config/embedded.pdf']['embedded'])
+        self.assertEqual(by_name['A10/config/embedded.pdf']['title'], 'ACOS Guide')
+        self.assertFalse(by_name['Arista/release/raw.pdf']['embedded'])
+        self.assertEqual(data['pending'], 1)
+        self.assertTrue(data['auto_embed'])  # 미설정 기본값은 켜짐
+
+    def test_download_inline_and_attachment(self):
+        self._make_pdf('A10/config/guide.pdf')
+        self.client.force_login(self.viewer)
+        response = self.client.get('/api/references/file/',
+                                   {'path': 'A10/config/guide.pdf'})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('inline', response['Content-Disposition'])
+        response.close()
+        response = self.client.get('/api/references/file/',
+                                   {'path': 'A10/config/guide.pdf', 'dl': '1'})
+        self.assertIn('attachment', response['Content-Disposition'])
+        response.close()
+
+    def test_download_blocks_traversal_and_unknown(self):
+        self._make_pdf('A10/config/guide.pdf')
+        self.client.force_login(self.viewer)
+        for bad in ('../manage.py', '/etc/passwd', 'A10/../../manage.py', 'nope.pdf'):
+            self.assertEqual(
+                self.client.get('/api/references/file/', {'path': bad}).status_code,
+                404, msg=bad)
+
+    def test_upload_engineer_only_saves_and_conflicts(self):
+        self.client.force_login(self.viewer)
+        self.assertEqual(self._upload().status_code, 403)
+
+        self.client.force_login(self.engineer)
+        with patch('api.services.references.ingest_file',
+                   return_value='created') as ingest:
+            response = self._upload()
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertTrue((self.docs_root / 'A10/config/New Guide.pdf').is_file())
+        self.assertTrue(response.json()['embedded'])  # 자동 임베딩 기본 켜짐
+        ingest.assert_called_once()
+
+        # 같은 이름 재업로드는 409, overwrite 지정 시 통과
+        with patch('api.services.references.ingest_file', return_value='updated'):
+            self.assertEqual(self._upload().status_code, 409)
+            self.assertEqual(self._upload(overwrite='true').status_code, 201)
+
+    def test_upload_skips_embedding_when_disabled(self):
+        from .services import references
+        references.set_auto_embed_enabled(False)
+        self.client.force_login(self.engineer)
+        with patch('api.services.references.ingest_file') as ingest:
+            response = self._upload()
+        self.assertEqual(response.status_code, 201)
+        self.assertFalse(response.json()['embedded'])
+        ingest.assert_not_called()
+
+    def test_upload_validation(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        self.client.force_login(self.engineer)
+        bad_ext = SimpleUploadedFile('run.exe', b'MZ')
+        self.assertEqual(self._upload(file=bad_ext).status_code, 400)
+        self.assertEqual(self._upload(vendor='NoSuchVendor').status_code, 400)
+        with patch('api.services.references.ingest_file', return_value='created'):
+            self.assertEqual(self._upload(doc_type='../evil').status_code, 400)
+
+    def test_embed_admin_only(self):
+        self._make_pdf('A10/config/guide.pdf')
+        self.client.force_login(self.engineer)
+        self.assertEqual(self.client.post('/api/references/embed/', {},
+                                          content_type='application/json').status_code,
+                         403)
+
+        self.client.force_login(self.admin)
+        with patch('api.services.references.ingest_file',
+                   return_value='created') as ingest:
+            data = self.client.post('/api/references/embed/', {},
+                                    content_type='application/json').json()
+        self.assertEqual(data['created'], 1)
+        ingest.assert_called_once()
+
+        # 단일 파일은 강제 재임베딩
+        with patch('api.services.references.ingest_file',
+                   return_value='updated') as ingest:
+            response = self.client.post(
+                '/api/references/embed/', {'path': 'A10/config/guide.pdf'},
+                content_type='application/json')
+        self.assertEqual(response.json()['outcome'], 'updated')
+        self.assertTrue(ingest.call_args.kwargs['force'])
+
+        response = self.client.post('/api/references/embed/', {'path': 'ghost.pdf'},
+                                    content_type='application/json')
+        self.assertEqual(response.status_code, 404)
+
+    def test_delete_admin_only_removes_file_and_db(self):
+        from .models import ReferenceDocument
+        self._make_pdf('A10/config/guide.pdf')
+        ReferenceDocument.objects.create(
+            vendor='A10', filename='A10/config/guide.pdf', doc_type='config',
+            sha256='x', chunk_count=1, embedding_model=self.embedding_model)
+
+        self.client.force_login(self.engineer)
+        self.assertEqual(
+            self.client.delete('/api/references/file/?path=A10/config/guide.pdf')
+            .status_code, 403)
+
+        self.client.force_login(self.admin)
+        response = self.client.delete(
+            '/api/references/file/?path=A10/config/guide.pdf')
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse((self.docs_root / 'A10/config/guide.pdf').exists())
+        self.assertFalse(ReferenceDocument.objects.filter(
+            filename='A10/config/guide.pdf').exists())
+
+    def test_auto_embed_toggle_admin_only(self):
+        self.client.force_login(self.viewer)
+        self.assertTrue(self.client.get(
+            '/api/settings/reference-auto-embed/').json()['enabled'])
+        self.assertEqual(
+            self.client.put('/api/settings/reference-auto-embed/',
+                            json.dumps({'enabled': False}),
+                            content_type='application/json').status_code, 403)
+
+        self.client.force_login(self.admin)
+        response = self.client.put('/api/settings/reference-auto-embed/',
+                                   json.dumps({'enabled': False}),
+                                   content_type='application/json')
+        self.assertFalse(response.json()['enabled'])
+        # boolean이 아니면 거부
+        self.assertEqual(
+            self.client.put('/api/settings/reference-auto-embed/',
+                            json.dumps({'enabled': 'yes'}),
+                            content_type='application/json').status_code, 400)

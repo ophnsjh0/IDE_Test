@@ -6,6 +6,7 @@ import { usePathname, useRouter } from 'next/navigation';
 import { Group, Title, Button, Text } from '@mantine/core';
 import {
   IconBook2,
+  IconFileText,
   IconLayoutDashboard,
   IconList,
   IconLogout,
@@ -82,6 +83,15 @@ export default function AppHeader() {
           leftSection={<IconBook2 size={16} />}
         >
           지식 베이스
+        </Button>
+        <Button
+          component={Link}
+          href="/documents"
+          size="sm"
+          variant={pathname.startsWith('/documents') ? 'light' : 'subtle'}
+          leftSection={<IconFileText size={16} />}
+        >
+          Documents
         </Button>
         {isAdmin && (
           <Button

@@ -1,5 +1,5 @@
 from django.urls import path
-from . import auth_views, views
+from . import auth_views, reference_views, views
 
 urlpatterns = [
     path('health/', views.health_check, name='health_check'),
@@ -23,6 +23,17 @@ urlpatterns = [
     path('knowledge/sync/', views.KnowledgeSyncView.as_view(), name='knowledge-sync'),
     path('knowledge/<int:id>/', views.KnowledgeDetailView.as_view(),
          name='knowledge-detail'),
+    path('references/', reference_views.ReferenceListView.as_view(),
+         name='reference-list'),
+    path('references/file/', reference_views.ReferenceFileView.as_view(),
+         name='reference-file'),
+    path('references/upload/', reference_views.ReferenceUploadView.as_view(),
+         name='reference-upload'),
+    path('references/embed/', reference_views.ReferenceEmbedView.as_view(),
+         name='reference-embed'),
+    path('settings/reference-auto-embed/',
+         reference_views.ReferenceAutoEmbedView.as_view(),
+         name='reference-auto-embed'),
     path('gmail/sync/', views.GmailSyncView.as_view(), name='gmail-sync'),
     path('help-agent/chat/', views.HelpAgentChatView.as_view(), name='help-agent-chat'),
     path('help-agent/sessions/', views.ChatSessionListView.as_view(),
