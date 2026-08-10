@@ -146,6 +146,11 @@ cp 새템플릿.docx ~/IDE_Test/google_antigravity/case-flow/backend/report_temp
 
 ## 기타
 
+- 동시 처리 용량: gunicorn `workers x threads`가 동시 요청 슬롯 수다(기본 4x8=32).
+  AI 응답과 문서 임베딩이 슬롯을 오래 점유하므로, 슬롯이 마르면 단순 조회까지 느려진다.
+  조정은 이미지 재빌드 없이 `.env`에 `GUNICORN_WORKERS` / `GUNICORN_THREADS`를 넣고
+  `caseflow-up.sh backend`로 재생성하면 된다. 워커를 늘릴 때는 **워커마다 벡터 검색
+  행렬을 따로 캐시**한다는 점을 고려할 것(2026-08-10 실측 워커당 ~135MB, 문서가 늘면 증가).
 - VM 재부팅: 조치 불필요 (`restart: unless-stopped`, env는 컨테이너에 유지).
 - `NEXT_PUBLIC_API_BASE`는 프론트 빌드 시점에 번들에 박힘 — API 주소 고정이 필요하면 compose의 build args 주석 해제 후 frontend 리빌드.
 - DB 관리: Django admin(`:8000/admin/`, superuser는 `docker compose exec backend python manage.py createsuperuser`) 또는 `docker compose exec db psql -U caseflow caseflow`.
