@@ -16,6 +16,7 @@ from contextlib import contextmanager
 
 import numpy as np
 from django.conf import settings
+from django.db import transaction
 
 from api.models import AppSetting, Case, ReferenceChunk, ReferenceDocument
 
@@ -114,13 +115,24 @@ def scan_files():
     return files
 
 
+def sanitize(text):
+    """PostgreSQL이 text 컬럼에 절대 허용하지 않는 NUL(0x00)을 제거한다.
+
+    PDF 폰트 인코딩에 따라 pypdf 추출 결과에 NUL이 섞여 나오는 일이 있는데,
+    그대로 저장하면 insert 전체가 DataError로 실패한다 (SQLite는 허용해서
+    로컬에서는 드러나지 않고 운영 Postgres에서만 터진다). 추출 직후 한 번
+    걸러 제목·청크 등 DB로 가는 모든 텍스트를 안전하게 만든다.
+    """
+    return text.replace('\x00', '') if text else text
+
+
 def extract_pages(path):
     """PDF에서 페이지별 텍스트를 추출해 [(페이지번호, 텍스트)]로 반환."""
     from pypdf import PdfReader
     reader = PdfReader(path)
     pages = []
     for number, page in enumerate(reader.pages, start=1):
-        text = (page.extract_text() or '').strip()
+        text = sanitize(page.extract_text() or '').strip()
         if text:
             pages.append((number, text))
     return pages
@@ -184,7 +196,7 @@ def extract_xlsx_rows(path):
     for sheet in workbook.worksheets:
         header = None
         for row_number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
-            values = ['' if v is None else str(v).strip() for v in row]
+            values = ['' if v is None else sanitize(str(v)).strip() for v in row]
             if not any(values):
                 continue
             if header is None:
@@ -235,15 +247,19 @@ def ingest_file(vendor, doc_type, relative_path, path, force=False, log=lambda m
     doc.page_count = page_count
     doc.chunk_count = len(chunks)
     doc.embedding_model = model
-    doc.save()
 
-    doc.chunks.all().delete()
-    ReferenceChunk.objects.bulk_create([
-        ReferenceChunk(document=doc, seq=i, page_start=c['page_start'],
-                       page_end=c['page_end'], text=c['text'],
-                       embedding=vectors[i].tobytes(), embedding_model=model)
-        for i, c in enumerate(chunks)
-    ], batch_size=200)
+    # 문서 행 갱신과 청크 교체는 반드시 한 트랜잭션으로 — 중간에 실패하면
+    # ① 청크 없는 유령 문서 행이 남아 목록이 "임베딩됨"으로 거짓 표시되고
+    # ② 삭제가 삽입보다 먼저라 재임베딩 실패 시 멀쩡하던 기존 청크까지 잃는다.
+    with transaction.atomic():
+        doc.save()
+        doc.chunks.all().delete()
+        ReferenceChunk.objects.bulk_create([
+            ReferenceChunk(document=doc, seq=i, page_start=c['page_start'],
+                           page_end=c['page_end'], text=c['text'],
+                           embedding=vectors[i].tobytes(), embedding_model=model)
+            for i, c in enumerate(chunks)
+        ], batch_size=200)
     _invalidate_cache()
     return outcome
 

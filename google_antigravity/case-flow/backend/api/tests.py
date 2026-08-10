@@ -2491,19 +2491,27 @@ class ReferenceApiTests(TestCase):
         return self.client.post('/api/references/upload/', data)
 
     def test_list_merges_files_and_embedding_state(self):
-        from .models import ReferenceDocument
+        from .models import ReferenceChunk, ReferenceDocument
         self._make_pdf('A10/config/embedded.pdf')
         self._make_pdf('Arista/release/raw.pdf')
-        ReferenceDocument.objects.create(
+        doc = ReferenceDocument.objects.create(
             vendor='A10', filename='A10/config/embedded.pdf', doc_type='config',
             title='ACOS Guide', sha256='x', page_count=10, chunk_count=3,
             embedding_model=self.embedding_model)
+        # 임베딩 여부는 실제 청크 행으로 판정되므로 청크까지 만들어야 한다
+        ReferenceChunk.objects.bulk_create([
+            ReferenceChunk(document=doc, seq=i, page_start=i + 1, page_end=i + 1,
+                           text=f'본문 {i}', embedding=b'\x00' * 16,
+                           embedding_model=self.embedding_model)
+            for i in range(3)
+        ])
 
         self.client.force_login(self.viewer)  # 목록은 전 역할 공개
         data = self.client.get('/api/references/').json()
         self.assertEqual(len(data['items']), 2)
         by_name = {i['filename']: i for i in data['items']}
         self.assertTrue(by_name['A10/config/embedded.pdf']['embedded'])
+        self.assertEqual(by_name['A10/config/embedded.pdf']['chunk_count'], 3)
         self.assertEqual(by_name['A10/config/embedded.pdf']['title'], 'ACOS Guide')
         self.assertFalse(by_name['Arista/release/raw.pdf']['embedded'])
         self.assertEqual(data['pending'], 1)
@@ -2634,3 +2642,91 @@ class ReferenceApiTests(TestCase):
             self.client.put('/api/settings/reference-auto-embed/',
                             json.dumps({'enabled': 'yes'}),
                             content_type='application/json').status_code, 400)
+
+
+class ReferenceIngestIntegrityTests(TestCase):
+    """인제스트 중간 실패가 DB를 망가뜨리지 않는지 — 2026-08-10 실장애 회귀 테스트.
+
+    실장애: ClearPass 가이드 추출 텍스트에 NUL(0x00)이 섞여 bulk_create가
+    DataError로 실패했는데, 트랜잭션이 없어 문서 행만 남고 청크는 0개가 됐다.
+    목록은 chunk_count 필드를 믿어 "임베딩됨"으로 거짓 표시됐다.
+    """
+
+    def setUp(self):
+        from django.conf import settings as dj_settings
+        self.model = dj_settings.EMBEDDING_MODEL
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / 'guide.pdf'
+        self.path.write_bytes(b'%PDF-1.4 fake')
+
+    def _ingest(self, pages):
+        """extract_pages/embed_texts를 대역으로 두고 실제 저장 경로만 실행."""
+        import numpy as np
+        from .services import references
+        vectors = np.zeros((max(len(pages), 1), 4), dtype=np.float32)
+        with patch.object(references, 'extract_pages', return_value=pages), \
+             patch.object(references, 'embed_texts', return_value=vectors):
+            return references.ingest_file('A10', 'config', 'A10/config/guide.pdf',
+                                          self.path, force=True)
+
+    def test_nul_bytes_are_stripped_before_save(self):
+        from .models import ReferenceChunk
+        from .services import references
+        self.assertEqual(references.sanitize('a\x00b'), 'ab')
+        # 추출 단계에서 걸러지므로 저장되는 청크에는 NUL이 없다
+        self._ingest([(1, references.sanitize('로그\x00 확인'))])
+        text = ReferenceChunk.objects.get().text
+        self.assertNotIn('\x00', text)
+        self.assertEqual(text, '로그 확인')
+
+    def test_failed_ingest_leaves_no_ghost_document(self):
+        """저장 실패 시 문서 행도 남지 않아야 한다 (청크 0개 + 임베딩됨 표시 방지)."""
+        from .models import ReferenceChunk, ReferenceDocument
+        with patch.object(ReferenceChunk.objects, 'bulk_create',
+                          side_effect=Exception('DataError: NUL byte')):
+            with self.assertRaises(Exception):
+                self._ingest([(1, '본문')])
+        self.assertFalse(ReferenceDocument.objects.exists())
+        self.assertFalse(ReferenceChunk.objects.exists())
+
+    def test_failed_reingest_preserves_existing_chunks(self):
+        """재임베딩이 깨져도 기존 청크가 삭제되면 안 된다 (삭제→삽입 순서 함정)."""
+        from .models import ReferenceChunk, ReferenceDocument
+        self._ingest([(1, '원본 내용')])
+        self.assertEqual(ReferenceChunk.objects.count(), 1)
+
+        with patch.object(ReferenceChunk.objects, 'bulk_create',
+                          side_effect=Exception('DataError: NUL byte')):
+            with self.assertRaises(Exception):
+                self._ingest([(1, '새 내용')])
+
+        self.assertEqual(ReferenceDocument.objects.count(), 1)
+        chunks = ReferenceChunk.objects.all()
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].text, '원본 내용')  # 롤백되어 원본 유지
+
+    def test_list_reports_ghost_document_as_not_embedded(self):
+        """chunk_count 필드가 남아 있어도 실제 청크가 없으면 미임베딩으로 보여야 한다."""
+        from django.contrib.auth.models import User
+        from .models import ReferenceDocument
+        from .permissions import set_user_role
+
+        docs_root = Path(self.tmp.name) / 'refs'
+        (docs_root / 'A10' / 'config').mkdir(parents=True)
+        (docs_root / 'A10' / 'config' / 'ghost.pdf').write_bytes(b'%PDF-1.4')
+        ReferenceDocument.objects.create(
+            vendor='A10', filename='A10/config/ghost.pdf', doc_type='config',
+            sha256='x', page_count=253, chunk_count=97,  # 필드만 남은 유령 행
+            embedding_model=self.model)
+
+        admin = User.objects.create_user('ghost-admin', password='x')
+        set_user_role(admin, 'admin')
+        self.client.force_login(admin)
+        with override_settings(REFERENCE_DOCS_DIR=docs_root):
+            data = self.client.get('/api/references/').json()
+
+        item = data['items'][0]
+        self.assertFalse(item['embedded'])
+        self.assertEqual(item['chunk_count'], 0)
+        self.assertEqual(data['pending'], 1)

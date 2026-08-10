@@ -40,6 +40,14 @@ import ScrollToTopButton from '../components/ScrollToTopButton';
 import { apiFetch, apiUrl } from '../lib/api';
 import { useMe } from '../lib/useMe';
 
+// 서버가 JSON이 아닌 응답(예: Django HTML 500 페이지)을 줄 때도 원인을 잃지 않도록
+// 방어적으로 파싱한다. res.ok 확인 전에 res.json()을 부르면 파싱 예외가 catch로
+// 빠져 실제 원인이 "서버 연결 실패"로 둔갑한다 (2026-08-10 실장애).
+async function readError(res: Response): Promise<string> {
+  const data = await res.json().catch(() => null);
+  return data?.error || `서버 오류 (HTTP ${res.status})`;
+}
+
 interface DocumentItem {
   filename: string; // "A10/config/xxx.pdf" — API path 파라미터로 그대로 사용
   name: string;
@@ -133,12 +141,12 @@ export default function DocumentsPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled }),
       });
-      const result = await response.json();
       if (response.ok) {
+        const result = await response.json();
         setData((prev) => (prev ? { ...prev, auto_embed: result.enabled } : prev));
         setMessage(`업로드 자동 임베딩을 ${result.enabled ? '켰습니다' : '껐습니다'}.`);
       } else {
-        setMessage(`설정 변경 실패: ${result.error || response.statusText}`);
+        setMessage(`설정 변경 실패: ${await readError(response)}`);
       }
     } catch {
       setMessage('설정 변경 실패: 백엔드 서버에 연결할 수 없습니다.');
@@ -158,18 +166,19 @@ export default function DocumentsPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(path ? { path } : {}),
       });
-      const result = await response.json();
       if (response.ok) {
+        const result = await response.json();
         setMessage(
           path
             ? `임베딩 완료: ${path}`
             : `임베딩 완료 — 신규 ${result.created}, 갱신 ${result.updated}, 변경 없음 ${result.skipped}` +
-              (result.failed > 0 ? `, 실패 ${result.failed}` : '') +
+              (result.failed > 0 ? `, 실패 ${result.failed}건 (서버 로그 확인)` : '') +
               (result.removed > 0 ? `, 삭제 정리 ${result.removed}` : '')
         );
         fetchDocuments();
       } else {
-        setMessage(`임베딩 실패: ${result.error || response.statusText}`);
+        setMessage(`임베딩 실패: ${await readError(response)}`);
+        fetchDocuments();
       }
     } catch {
       setMessage('임베딩 실패: 백엔드 서버에 연결할 수 없습니다.');
@@ -196,8 +205,8 @@ export default function DocumentsPage() {
         method: 'POST',
         body: form,
       });
-      const result = await response.json();
       if (response.ok) {
+        const result = await response.json();
         setUploadOpen(false);
         setUploadFile(null);
         setUploadOverwrite(false);
@@ -211,7 +220,7 @@ export default function DocumentsPage() {
         );
         fetchDocuments();
       } else {
-        setUploadError(result.error || response.statusText);
+        setUploadError(await readError(response));
       }
     } catch {
       setUploadError('업로드 실패: 백엔드 서버에 연결할 수 없습니다.');
@@ -227,12 +236,11 @@ export default function DocumentsPage() {
         `/api/references/file/?path=${encodeURIComponent(doc.filename)}`,
         { method: 'DELETE' }
       );
-      const result = await response.json();
       if (response.ok) {
-        setMessage(result.message);
+        setMessage((await response.json()).message);
         fetchDocuments();
       } else {
-        setMessage(`삭제 실패: ${result.error || response.statusText}`);
+        setMessage(`삭제 실패: ${await readError(response)}`);
       }
     } catch {
       setMessage('삭제 실패: 백엔드 서버에 연결할 수 없습니다.');

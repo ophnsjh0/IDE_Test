@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from django.conf import settings
+from django.db.models import Count
 from django.http import FileResponse
 from rest_framework import status
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -63,13 +64,17 @@ class ReferenceListView(APIView):
     """
 
     def get(self, request):
-        docs = {d.filename: d for d in ReferenceDocument.objects.all()}
+        # 저장된 chunk_count 필드가 아니라 실제 청크 행 수로 판정한다 —
+        # 필드만 믿으면 인제스트가 중간에 깨졌을 때 청크 0개인 문서가
+        # "임베딩됨"으로 보인다 (2026-08-10 실장애).
+        docs = {d.filename: d for d in
+                ReferenceDocument.objects.annotate(n_chunks=Count('chunks'))}
         model = settings.EMBEDDING_MODEL
         items = []
         for vendor, doc_type, relative, path in references.scan_files():
             doc = docs.get(relative)
             stat = path.stat()
-            embedded = bool(doc and doc.chunk_count and doc.embedding_model == model)
+            embedded = bool(doc and doc.n_chunks and doc.embedding_model == model)
             items.append({
                 'filename': relative,
                 'name': path.name,
@@ -80,7 +85,7 @@ class ReferenceListView(APIView):
                     stat.st_mtime, tz=dt_timezone.utc).isoformat(),
                 'title': doc.title if doc else '',
                 'page_count': doc.page_count if doc else 0,
-                'chunk_count': doc.chunk_count if doc else 0,
+                'chunk_count': doc.n_chunks if doc else 0,
                 'embedded': embedded,
                 'embedded_at': doc.updated_at.isoformat() if embedded else None,
             })
@@ -230,6 +235,13 @@ class ReferenceEmbedView(APIView):
             return Response({'error': str(e)}, status=status.HTTP_409_CONFLICT)
         except references.EmbeddingUnavailable as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception:
+            # 여기서 잡지 않으면 Django가 HTML 500 페이지를 돌려주고, 프론트의
+            # JSON 파싱이 깨져 원인과 무관한 "서버 연결 실패"로 표시된다.
+            logger.exception('embed failed (%s)', raw or 'all')
+            return Response(
+                {'error': '임베딩 중 오류가 발생했습니다. 서버 로그를 확인하세요.'},
+                status=status.HTTP_502_BAD_GATEWAY)
         if 'error' in summary:
             return Response(summary, status=status.HTTP_404_NOT_FOUND)
         log_event(request.user, 'doc_embed',
