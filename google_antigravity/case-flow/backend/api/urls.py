@@ -15,6 +15,8 @@ urlpatterns = [
          name='auth-user-detail'),
     path('cases/', views.CaseListCreateView.as_view(), name='case-list-create'),
     path('cases/<int:id>/', views.CaseDetailView.as_view(), name='case-detail'),
+    path('cases/<int:id>/knowledge/', views.CaseKnowledgeExtractView.as_view(),
+         name='case-knowledge-extract'),
     path('cases/<int:id>/relations/', views.CaseRelationView.as_view(),
          name='case-relation-add'),
     path('cases/<int:id>/relations/<int:other_id>/', views.CaseRelationView.as_view(),

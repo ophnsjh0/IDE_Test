@@ -2918,3 +2918,92 @@ class HelpAgentDocumentAccessTests(TestCase):
             payload = json.loads(help_agent._search_references(query='ACOS-104904'))
         self.assertEqual(payload['count'], 0)
         self.assertIn('찾지 못했습니다', payload['notice'])
+
+
+class CaseKnowledgeExtractTests(TestCase):
+    """POST /api/cases/<id>/knowledge/ — 케이스 상세의 '지식으로 저장' 버튼.
+
+    벤더 확답은 케이스 종결 전에 나오는 일이 많아, Resolved만 스캔하는 자동
+    동기화로는 그동안 정보가 묶인다 (2026-08-11 C-1118 사례). 상태와 무관하게
+    엔지니어가 직접 뽑을 수 있어야 한다.
+    """
+
+    def setUp(self):
+        from .permissions import set_user_role
+        self.case = make_case(status='Pending', summary='진행 중 케이스')
+        viewer = User.objects.create_user('k-viewer', password='x')
+        set_user_role(viewer, 'viewer')
+        engineer = User.objects.create_user('k-eng', password='x')
+        set_user_role(engineer, 'engineer')
+        self.engineer = engineer
+
+    def post(self):
+        return self.client.post(f'/api/cases/{self.case.id}/knowledge/')
+
+    def test_viewer_is_blocked(self):
+        self.client.force_login(User.objects.get(username='k-viewer'))
+        self.assertEqual(self.post().status_code, 403)
+
+    def test_extracts_from_ongoing_case(self):
+        from .models import KnowledgeItem
+        self.client.force_login(self.engineer)
+        with patch('api.services.knowledge.generate_structured', return_value={
+            'has_knowledge': True, 'title': 'ACOS-104904 VRRP 타이머 버그',
+            'problem': 'VRRP advertisement 타이머 부정확',
+            'root_cause': 'ACOS 6.0.6-SP1~6.0.8 버그',
+            'resolution': '6.0.9 이상으로 업그레이드',
+            'device_model': 'TH1040-F', 'software_version': '6.0.8',
+        }), patch('api.services.knowledge.enrich_with_references'):
+            res = self.post()
+
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.json()['outcome'], 'created')
+        item = KnowledgeItem.objects.get()
+        self.assertEqual(item.status, 'draft')  # 확정은 사람이 한다
+        self.assertEqual(item.case, self.case)
+
+    def test_ongoing_case_is_not_marked_checked(self):
+        """진행 중 케이스를 '검토 완료'로 찍으면 해결된 뒤 자동 동기화가 영영 건너뛴다."""
+        self.client.force_login(self.engineer)
+        with patch('api.services.knowledge.generate_structured',
+                   return_value={'has_knowledge': False, 'resolution': ''}):
+            res = self.post()
+
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.json()['outcome'], 'no_knowledge')
+        self.case.refresh_from_db()
+        self.assertIsNone(self.case.knowledge_checked_at)
+
+    def test_resolved_case_is_marked_checked(self):
+        """해결된 케이스는 기존대로 검토 완료 표시 — 자동 동기화가 재검토하지 않게."""
+        self.case.status = 'Resolved'
+        self.case.save(update_fields=['status'])
+        self.client.force_login(self.engineer)
+        with patch('api.services.knowledge.generate_structured',
+                   return_value={'has_knowledge': False, 'resolution': ''}):
+            self.post()
+        self.case.refresh_from_db()
+        self.assertIsNotNone(self.case.knowledge_checked_at)
+
+    def test_second_press_returns_existing_item(self):
+        self.client.force_login(self.engineer)
+        payload = {
+            'has_knowledge': True, 'title': '제목', 'problem': '문제',
+            'root_cause': '원인', 'resolution': '해결',
+            'device_model': '', 'software_version': '',
+        }
+        with patch('api.services.knowledge.generate_structured', return_value=payload), \
+             patch('api.services.knowledge.enrich_with_references'):
+            first = self.post()
+            second = self.post()
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json()['outcome'], 'exists')
+        self.assertEqual(
+            first.json()['item']['knowledge_id'], second.json()['item']['knowledge_id'])
+
+    def test_missing_case_returns_404(self):
+        self.client.force_login(self.engineer)
+        self.assertEqual(
+            self.client.post('/api/cases/999999/knowledge/').status_code, 404)

@@ -87,13 +87,17 @@ def build_case_material(case):
     return "\n".join(parts)
 
 
-def extract_knowledge(case):
+def extract_knowledge(case, mark_checked=True):
     """케이스 1건에서 지식을 추출해 KnowledgeItem(draft)으로 저장한다.
 
     반환: ('created', item) | ('no_knowledge', None) | ('failed', None)
     이미 이 케이스에서 추출한 지식이 있으면 ('exists', 기존 item).
     검토가 끝난 케이스(created/no_knowledge)는 knowledge_checked_at을 찍어
     다음 동기화에서 건너뛴다 — failed는 남겨 재시도되게 한다.
+
+    mark_checked=False: 아직 진행 중인 케이스를 수동 추출할 때 쓴다. 지금
+    지식이 없다고 '검토 완료'로 찍어버리면, 나중에 케이스가 해결됐을 때
+    자동 동기화가 영영 건너뛰게 된다.
     """
     existing = case.knowledge_items.first()
     if existing:
@@ -103,7 +107,8 @@ def extract_knowledge(case):
     if result is None:
         return 'failed', None
     if not result.get('has_knowledge') or not (result.get('resolution') or '').strip():
-        _mark_checked(case)
+        if mark_checked:
+            _mark_checked(case)
         return 'no_knowledge', None
 
     item = KnowledgeItem.objects.create(
@@ -118,7 +123,8 @@ def extract_knowledge(case):
         analyzed_by=get_translation_model(),
     )
     logger.info("Knowledge extracted from %s -> %s", case.case_id, item.knowledge_id)
-    _mark_checked(case)
+    if mark_checked:
+        _mark_checked(case)
     # 공식 문서 근거는 부가 정보 — 실패해도 지식 생성 자체는 유지
     try:
         enrich_with_references(item)

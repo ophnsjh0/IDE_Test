@@ -566,6 +566,58 @@ class KnowledgeSyncView(APIView):
         return Response(summary)
 
 
+class CaseKnowledgeExtractView(APIView):
+    """POST /api/cases/<id>/knowledge/ — 이 케이스에서 지식 추출 (상태 무관).
+
+    관리자용 '지식 동기화'(Resolved 일괄)와 목적이 다르다. 벤더의 확답은
+    케이스가 종결되기 한참 전에 나오는 일이 많아, Resolved만 기다리면 그동안
+    정보가 묶여 있다 (2026-08-11: C-1118이 Pending인 채로 ACOS-104904 관련
+    벤더 확답을 43건의 메일 속에 묶어두고 있었다). 엔지니어가 "지금 이건
+    남길 가치가 있다"고 판단한 시점에 누르는 버튼.
+
+    AI 대화 → 지식 저장 버튼과 같은 규칙: 엔지니어 이상, 케이스당 1회,
+    이미 추출됐으면 기존 항목을 돌려준다.
+    """
+
+    permission_classes = [IsEngineerOrAbove]
+
+    ERROR_MESSAGES = {
+        'no_knowledge': '이 케이스에서는 재사용할 만한 지식(문제-해결, 설정 절차, '
+                        '벤더 확답)을 찾지 못했습니다. 해결책이나 벤더 답변이 오간 '
+                        '뒤에 다시 시도해주세요.',
+        'failed': 'AI 추출에 실패했습니다. 잠시 후 다시 시도해주세요.',
+    }
+
+    def post(self, request, id):
+        case = Case.objects.filter(id=id).first()
+        if case is None:
+            return Response({'error': '존재하지 않는 케이스입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        from .services.knowledge import extract_knowledge
+        try:
+            # 진행 중인 케이스를 '검토 완료'로 찍으면 나중에 해결됐을 때
+            # 자동 동기화가 건너뛴다 — Resolved일 때만 표시한다.
+            outcome, item = extract_knowledge(
+                case, mark_checked=(case.status == 'Resolved'))
+        except Exception:
+            logger.exception("case knowledge extraction failed (%s)", case.case_id)
+            return Response({'error': self.ERROR_MESSAGES['failed']},
+                            status=status.HTTP_502_BAD_GATEWAY)
+
+        if outcome in self.ERROR_MESSAGES:
+            return Response({'error': self.ERROR_MESSAGES[outcome], 'outcome': outcome},
+                            status=status.HTTP_502_BAD_GATEWAY
+                            if outcome == 'failed' else status.HTTP_400_BAD_REQUEST)
+
+        log_event(request.user, 'knowledge_extract',
+                  detail=f"{case.case_id} -> {item.knowledge_id} ({outcome})")
+        return Response({'outcome': outcome,
+                         'item': KnowledgeItemSerializer(item).data},
+                        status=status.HTTP_201_CREATED if outcome == 'created'
+                        else status.HTTP_200_OK)
+
+
 class ChatKnowledgeExtractView(APIView):
     """POST /api/help-agent/sessions/<id>/knowledge/ — 대화에서 지식 추출.
 

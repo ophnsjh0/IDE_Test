@@ -28,6 +28,7 @@ import {
   IconMailDown,
   IconMailUp,
   IconLanguage,
+  IconBulb,
   IconTrash,
 } from '@tabler/icons-react'; // IconDeviceFloppy for Save
 import ScrollToTopButton from '../../components/ScrollToTopButton';
@@ -92,6 +93,34 @@ export default function CaseDetailPage() {
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState('');
   const { canWrite, isAdmin } = useMe();
+  const [extracting, setExtracting] = useState(false);
+  const [extractResult, setExtractResult] = useState<{ ok: boolean; text: string } | null>(null);
+
+  // 케이스에서 재사용 지식을 뽑아 지식 베이스에 draft로 등록한다.
+  // 케이스가 해결되기 전이라도 벤더 확답 같은 건 남길 가치가 있어 상태와 무관하게 동작한다.
+  const extractKnowledge = async () => {
+    setExtracting(true);
+    setExtractResult(null);
+    try {
+      const res = await apiFetch(`/api/cases/${id}/knowledge/`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        const k = data.item;
+        setExtractResult({
+          ok: true,
+          text: data.outcome === 'exists'
+            ? `이미 지식으로 등록된 케이스입니다 (${k.knowledge_id}).`
+            : `${k.knowledge_id}로 등록했습니다 — "${k.title}"`,
+        });
+      } else {
+        setExtractResult({ ok: false, text: data.error || `등록 실패 (HTTP ${res.status})` });
+      }
+    } catch {
+      setExtractResult({ ok: false, text: '등록 실패: 백엔드 서버에 연결할 수 없습니다.' });
+    } finally {
+      setExtracting(false);
+    }
+  };
 
   const form = useForm({
     initialValues: {
@@ -253,6 +282,17 @@ export default function CaseDetailPage() {
                 <Group>
                     {canWrite && (
                     <Button
+                        variant="light"
+                        color="grape"
+                        leftSection={<IconBulb size={16} />}
+                        loading={extracting}
+                        onClick={extractKnowledge}
+                    >
+                        지식으로 저장
+                    </Button>
+                    )}
+                    {canWrite && (
+                    <Button
                         leftSection={<IconEdit size={16} />}
                         onClick={() => setIsEditing(true)}
                     >
@@ -283,6 +323,22 @@ export default function CaseDetailPage() {
                 </Group>
             )}
           </Group>
+
+          {extractResult && (
+            <Text size="sm" c={extractResult.ok ? 'teal' : 'red'} mb="sm">
+              {extractResult.text}
+              {extractResult.ok && (
+                <Button
+                  size="compact-xs"
+                  variant="subtle"
+                  ml="xs"
+                  onClick={() => router.push('/knowledge')}
+                >
+                  지식 베이스에서 보기
+                </Button>
+              )}
+            </Text>
+          )}
 
           <Paper shadow="xs" p="xl" withBorder>
             <Group justify="space-between" mb="md">
