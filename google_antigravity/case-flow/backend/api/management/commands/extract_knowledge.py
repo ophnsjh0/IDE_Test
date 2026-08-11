@@ -116,7 +116,10 @@ class Command(BaseCommand):
 
     def _extract(self, case, dry_run):
         if not dry_run:
-            outcome, item = knowledge.extract_knowledge(case)
+            # --case로 진행 중인 케이스를 뽑을 때 '지식 없음'을 검토 완료로 찍으면,
+            # 나중에 해결됐을 때 자동 동기화가 영영 건너뛴다 (웹 버튼과 동일 규칙).
+            outcome, item = knowledge.extract_knowledge(
+                case, mark_checked=(case.status == 'Resolved'))
             return outcome, item, None
         # dry-run: 저장 경로를 타지 않고 AI 결과만 확인
         if case.knowledge_items.exists():
