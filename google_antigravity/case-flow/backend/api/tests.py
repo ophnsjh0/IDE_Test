@@ -2730,3 +2730,157 @@ class ReferenceIngestIntegrityTests(TestCase):
         self.assertFalse(item['embedded'])
         self.assertEqual(item['chunk_count'], 0)
         self.assertEqual(data['pending'], 1)
+
+
+class HelpAgentProgressCallbackTests(TestCase):
+    """on_event 콜백이 진행 상황을 순서대로 흘리는지 (스트리밍의 원천).
+
+    콜백을 넘기지 않으면 기존과 완전히 동일하게 동작해야 한다 — 이 보장 덕분에
+    chat()을 호출하는 기존 테스트 21곳이 그대로 통과한다.
+    """
+
+    def _fake_client(self, tool_names):
+        """도구를 tool_names 순서로 한 번씩 호출한 뒤 최종 답변을 내는 가짜 클라이언트."""
+        calls = []
+
+        def create(**kwargs):
+            step = len(calls)
+            calls.append(kwargs)
+            if step < len(tool_names):
+                block = SimpleNamespace(type='tool_use', id=f'tu{step}',
+                                        name=tool_names[step], input={'query': '비밀검색어'})
+                return SimpleNamespace(stop_reason='tool_use', content=[block])
+            return SimpleNamespace(
+                stop_reason='end_turn',
+                content=[SimpleNamespace(type='text', text='최종 답변')])
+
+        return SimpleNamespace(messages=SimpleNamespace(create=create))
+
+    def test_events_follow_tool_order(self):
+        events = []
+        client = self._fake_client(['search_knowledge', 'search_references'])
+        with patch.object(help_agent, '_execute_tool', return_value=('결과', False)):
+            reply, trace, _, _ = help_agent._run_agent(
+                client, 'search', [{'role': 'user', 'content': '질문'}],
+                on_event=lambda kind, payload: events.append((kind, payload)))
+
+        self.assertEqual(reply, '최종 답변')
+        kinds = [k for k, _ in events]
+        self.assertEqual(kinds, ['step', 'tool', 'step', 'tool', 'step'])
+        tools = [p['name'] for k, p in events if k == 'tool']
+        self.assertEqual(tools, ['search_knowledge', 'search_references'])
+        # 반복 횟수를 함께 실어 UI가 진행감을 표시할 수 있어야 한다
+        self.assertEqual(events[1][1]['iteration'], 1)
+        self.assertEqual(events[3][1]['iteration'], 2)
+
+    def test_tool_input_is_never_leaked(self):
+        """도구 입력에는 고객사명·시리얼이 섞일 수 있어 이벤트로 내보내면 안 된다."""
+        events = []
+        client = self._fake_client(['web_search'])
+        with patch.object(help_agent, '_execute_tool', return_value=('결과', False)):
+            help_agent._run_agent(client, 'search', [{'role': 'user', 'content': 'q'}],
+                                  on_event=lambda kind, payload: events.append((kind, payload)))
+        payloads = json.dumps([p for _, p in events], ensure_ascii=False)
+        self.assertNotIn('비밀검색어', payloads)
+        self.assertNotIn('input', payloads)
+
+    def test_without_callback_behaves_as_before(self):
+        client = self._fake_client(['search_cases'])
+        with patch.object(help_agent, '_execute_tool', return_value=('결과', False)):
+            reply, trace, _, _ = help_agent._run_agent(
+                client, 'search', [{'role': 'user', 'content': '질문'}])
+        self.assertEqual(reply, '최종 답변')
+        self.assertEqual([t['name'] for t in trace], ['search_cases'])
+
+
+class HelpAgentChatStreamTests(TestCase):
+    """POST /api/help-agent/chat/stream/ — SSE 스트리밍 응답."""
+
+    FAKE_RESULT = {
+        'reply': '스트리밍 답변', 'tool_calls': [{'name': 'search_cases', 'input': {}}],
+        'model': 'claude-haiku-4-5', 'agent': 'search',
+    }
+
+    def setUp(self):
+        from .permissions import set_user_role
+        viewer = User.objects.create_user('s-viewer', password='pw123456')
+        set_user_role(viewer, 'viewer')
+        engineer = User.objects.create_user('s-eng', password='pw123456')
+        set_user_role(engineer, 'engineer')
+
+    def post(self, payload):
+        return self.client.post('/api/help-agent/chat/stream/', payload,
+                                content_type='application/json')
+
+    @staticmethod
+    def read_events(response):
+        body = b''.join(response.streaming_content).decode()
+        events = []
+        for block in body.split('\n\n'):
+            if not block.strip():
+                continue
+            kind = next(l[6:].strip() for l in block.split('\n') if l.startswith('event:'))
+            data = next(l[5:].strip() for l in block.split('\n') if l.startswith('data:'))
+            events.append((kind, json.loads(data)))
+        return events
+
+    def test_viewer_is_blocked(self):
+        self.client.force_login(User.objects.get(username='s-viewer'))
+        res = self.post({'messages': [{'role': 'user', 'content': '안녕'}]})
+        self.assertEqual(res.status_code, 403)
+
+    def test_validation_happens_before_stream_starts(self):
+        """검증 실패는 스트림이 아니라 상태 코드로 와야 한다 (이벤트 오류로 감추면 안 됨)."""
+        self.client.force_login(User.objects.get(username='s-eng'))
+        self.assertEqual(self.post({'messages': []}).status_code, 400)
+        res = self.post({'messages': [{'role': 'user', 'content': '안녕'}],
+                         'session_id': 99999})
+        self.assertEqual(res.status_code, 404)
+
+    def test_progress_events_then_done(self):
+        self.client.force_login(User.objects.get(username='s-eng'))
+
+        def fake_chat(messages, on_event=None):
+            on_event('step', {'phase': 'triage'})
+            on_event('tool', {'name': 'search_cases', 'iteration': 1, 'max': 6})
+            return dict(self.FAKE_RESULT)
+
+        # 저장은 워커 스레드가 별도 DB 커넥션으로 수행하므로 TestCase의 트랜잭션에서는
+        # 보이지 않는다. 저장 로직 자체는 비스트리밍 뷰 테스트가 이미 덮으므로,
+        # 여기서는 "스트림이 끝나기 전에 저장을 호출했는가"만 검증한다.
+        with patch('api.views.help_agent.chat', side_effect=fake_chat), \
+             patch('api.views.HelpAgentChatStreamView._save_turns',
+                   return_value=42) as save, \
+             patch('api.views.log_event') as logged:
+            res = self.post({'messages': [{'role': 'user', 'content': 'VRRP 사례'}]})
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(res['Content-Type'], 'text/event-stream')
+            events = self.read_events(res)
+
+        kinds = [k for k, _ in events]
+        self.assertEqual(kinds, ['step', 'tool', 'done'])
+        done = events[-1][1]
+        # done 페이로드는 비스트리밍 응답과 동일해야 한다 (프론트 렌더링 재사용)
+        self.assertEqual(done['reply'], '스트리밍 답변')
+        self.assertEqual(done['agent'], 'search')
+        self.assertEqual(done['session_id'], 42)
+        save.assert_called_once()
+        self.assertEqual(logged.call_args.args[1], 'agent_chat')
+
+    def test_runtime_failure_becomes_error_event(self):
+        import httpx
+        self.client.force_login(User.objects.get(username='s-eng'))
+        error = anthropic.RateLimitError(
+            'rate limited',
+            response=httpx.Response(429, request=httpx.Request('POST', 'https://x')),
+            body=None)
+        with patch('api.views.help_agent.chat', side_effect=error), \
+             patch('api.views.HelpAgentChatStreamView._save_turns') as save:
+            res = self.post({'messages': [{'role': 'user', 'content': '안녕'}]})
+            self.assertEqual(res.status_code, 200)  # 헤더는 이미 나갔다
+            events = self.read_events(res)
+
+        self.assertEqual([k for k, _ in events], ['error'])
+        self.assertEqual(events[0][1]['code'], 'rate_limit')
+        self.assertIn('사용량 한도', events[0][1]['message'])
+        save.assert_not_called()  # 실패한 응답은 저장하지 않는다

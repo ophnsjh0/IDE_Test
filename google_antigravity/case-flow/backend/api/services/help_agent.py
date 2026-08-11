@@ -909,9 +909,15 @@ def _describe_files(client, file_ids):
     return files
 
 
-def _run_agent(client, agent, messages):
+def _noop_event(*_args, **_kwargs):
+    """on_event 기본값 — 진행 상황을 아무 데도 흘리지 않는다(기존 동작)."""
+
+
+def _run_agent(client, agent, messages, on_event=_noop_event):
     """에이전트 하나의 도구 호출 루프 실행 (+ tech는 평가자 검수/수정).
 
+    on_event(type, payload): 진행 상황 콜백. 기본값은 no-op이라 넘기지 않으면
+    기존과 완전히 동일하게 동작한다 (스트리밍 뷰만 실제 콜백을 준다).
     반환: (reply, tool_trace, evaluation, files)
     """
     config = _agent_configs()[agent]
@@ -937,7 +943,10 @@ def _run_agent(client, agent, messages):
         create = client.messages.create
 
     response = None
-    for _ in range(config.get('max_iterations', MAX_TOOL_ITERATIONS)):
+    max_iterations = config.get('max_iterations', MAX_TOOL_ITERATIONS)
+    for iteration in range(1, max_iterations + 1):
+        on_event('step', {'phase': 'thinking',
+                          'iteration': iteration, 'max': max_iterations})
         response = create(
             model=config['model'],
             max_tokens=config.get('max_tokens', 4096),
@@ -961,6 +970,10 @@ def _run_agent(client, agent, messages):
         for block in response.content:
             if block.type != 'tool_use':
                 continue
+            # 도구 이름만 흘린다 — tool_input에는 고객사명·시리얼이 섞일 수 있고
+            # 검색어 정제(_sanitize_search_query)를 우회해 노출되면 안 된다.
+            on_event('tool', {'name': block.name,
+                              'iteration': iteration, 'max': max_iterations})
             output, is_error = _execute_tool(block.name, block.input)
             tool_trace.append({'name': block.name, 'input': block.input})
             if not is_error:
@@ -1004,8 +1017,10 @@ def _run_agent(client, agent, messages):
     evaluation = None
     if agent == 'tech' and reply and not RE_HANDOFF.search(reply):
         question = messages[-1]['content']
+        on_event('step', {'phase': 'evaluating'})
         evaluation = _evaluate_tech_reply(client, question, evidence, reply)
         if not evaluation.get('ok'):
+            on_event('step', {'phase': 'revising'})
             issues = '\n'.join(f'- {i}' for i in evaluation.get('issues', []))
             convo.append({'role': 'assistant', 'content': reply})
             convo.append({
@@ -1029,7 +1044,7 @@ def _run_agent(client, agent, messages):
     return reply, tool_trace, evaluation, files
 
 
-def chat(messages):
+def chat(messages, on_event=_noop_event):
     """user/assistant 텍스트 턴 목록을 받아 트리아지 후 에이전트 루프를 실행.
 
     에이전트가 [HANDOFF:담당] 마커를 출력하면(자기 범위지만 담당이 다른 질문 —
@@ -1044,7 +1059,11 @@ def chat(messages):
         raise RuntimeError('ANTHROPIC_API_KEY가 설정되지 않았습니다.')
 
     client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    on_event('step', {'phase': 'triage'})
     agent = _triage(client, messages)
+    on_event('start', {'agent': agent,
+                       'model': _agent_configs().get(agent, {}).get(
+                           'model', settings.HELP_AGENT_MODEL)})
 
     # 무관 질문은 에이전트 호출 없이 고정 안내로 종료 (트리아지 비용만 발생)
     if agent == 'off_topic':
@@ -1055,7 +1074,8 @@ def chat(messages):
             'agent': 'off_topic',
         }
 
-    reply, tool_trace, evaluation, files = _run_agent(client, agent, messages)
+    reply, tool_trace, evaluation, files = _run_agent(
+        client, agent, messages, on_event)
 
     # 핸드오프: 재배정은 1회만 (에이전트끼리 핑퐁하는 루프 방지)
     handoff = RE_HANDOFF.search(reply or '')
@@ -1064,7 +1084,10 @@ def chat(messages):
         if target != agent:
             logger.info('help agent handoff: %s -> %s', agent, target)
             agent = target
-            reply, extra_trace, evaluation, files = _run_agent(client, agent, messages)
+            on_event('start', {'agent': agent, 'handoff': True,
+                               'model': _agent_configs()[agent]['model']})
+            reply, extra_trace, evaluation, files = _run_agent(
+                client, agent, messages, on_event)
             tool_trace += extra_trace
 
     # 남은 마커는 사용자에게 노출하지 않는다

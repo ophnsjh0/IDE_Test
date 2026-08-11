@@ -36,6 +36,8 @@ urlpatterns = [
          name='reference-auto-embed'),
     path('gmail/sync/', views.GmailSyncView.as_view(), name='gmail-sync'),
     path('help-agent/chat/', views.HelpAgentChatView.as_view(), name='help-agent-chat'),
+    path('help-agent/chat/stream/', views.HelpAgentChatStreamView.as_view(),
+         name='help-agent-chat-stream'),
     path('help-agent/sessions/', views.ChatSessionListView.as_view(),
          name='help-agent-sessions'),
     path('help-agent/sessions/<int:session_id>/', views.ChatSessionDetailView.as_view(),

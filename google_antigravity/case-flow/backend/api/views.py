@@ -1,12 +1,15 @@
+import json
 import logging
+import queue
 import re
+import threading
 from datetime import timedelta
 from urllib.parse import quote
 
 import anthropic
-from django.db import transaction
+from django.db import connection, transaction
 from django.db.models import Count, F, Max, Q
-from django.http import HttpResponse
+from django.http import HttpResponse, StreamingHttpResponse
 from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
 from rest_framework import generics, status
@@ -403,6 +406,101 @@ class HelpAgentChatView(APIView):
         if messages[-1]['role'] != 'user':
             return '마지막 메시지는 사용자 질문이어야 합니다.'
         return None
+
+
+class HelpAgentChatStreamView(HelpAgentChatView):
+    """POST /api/help-agent/chat/stream/ — 채팅 + 진행 상황 SSE 스트리밍.
+
+    기존 /chat/과 입력·결과가 완전히 같고, 답변이 나오기까지 어떤 도구를 쓰는지
+    실시간으로 흘려보낸다는 점만 다르다 (사용자가 멈춘 것으로 오해하지 않도록).
+
+    이벤트: step(triage/thinking/evaluating/revising) · start(담당 배정) ·
+            tool(도구 이름만 — 입력값은 고객사명 등이 섞일 수 있어 보내지 않는다) ·
+            done(기존 /chat/ 응답 본문 그대로) · error
+
+    설계 요점:
+    - 검증(인증·형식·세션)은 첫 바이트 이전에 끝낸다. 스트림이 시작되면 상태
+      코드를 바꿀 수 없으므로, 이벤트로 전달할 오류를 AI 런타임 실패로 좁힌다.
+    - chat()은 동기 함수라 별도 스레드에서 돌리고 큐로 이벤트를 받는다.
+      큐는 무제한이라 클라이언트가 끊겨도 작업 스레드가 막히지 않는다.
+    - 대화 저장은 작업 스레드가 수행한다 — 창을 닫아도 이미 비용이 발생한
+      답변은 남는다.
+    """
+
+    @staticmethod
+    def _stream_error(exc):
+        """예외를 (code, 사용자 문구)로 변환. 문구는 비스트리밍 뷰와 동일하게 유지한다.
+
+        RateLimitError가 APIStatusError의 하위 클래스라 검사 순서가 중요하다.
+        """
+        if isinstance(exc, anthropic.RateLimitError):
+            return 'rate_limit', 'AI 사용량 한도에 걸렸습니다. 잠시 후 다시 시도해주세요.'
+        if isinstance(exc, anthropic.APIStatusError):
+            return 'upstream', 'AI 서비스 오류가 발생했습니다. 잠시 후 다시 시도해주세요.'
+        if isinstance(exc, (anthropic.APIConnectionError, RuntimeError)):
+            return 'unavailable', 'AI 서비스에 연결할 수 없습니다. 서버 설정을 확인하세요.'
+        return 'internal', 'AI 응답 생성 중 오류가 발생했습니다.'
+
+    def post(self, request):
+        messages = request.data.get('messages')
+        error = self._validate(messages)
+        if error:
+            return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
+
+        session = None
+        session_id = request.data.get('session_id')
+        if session_id is not None:
+            session = ChatSession.objects.filter(
+                id=session_id, user=request.user).first()
+            if session is None:
+                return Response({'error': '세션을 찾을 수 없습니다.'},
+                                status=status.HTTP_404_NOT_FOUND)
+
+        response = StreamingHttpResponse(
+            self._stream(request.user, session, messages),
+            content_type='text/event-stream')
+        # 중간 프록시가 생기더라도 버퍼링되지 않도록 (현재 구성엔 프록시 없음)
+        response['Cache-Control'] = 'no-cache'
+        response['X-Accel-Buffering'] = 'no'
+        return response
+
+    def _stream(self, user, session, messages):
+        events = queue.Queue()  # 무제한 — 소비자가 끊겨도 생산자가 막히지 않는다
+
+        def worker():
+            terminal = None
+            try:
+                result = help_agent.chat(
+                    messages,
+                    on_event=lambda kind, payload: events.put((kind, payload)))
+                # 저장·로깅은 클라이언트 연결 여부와 무관하게 여기서 끝낸다.
+                # 둘 다 내부에서 예외를 삼키므로 답변을 잃지 않는다.
+                log_event(user, 'agent_chat',
+                          detail=f"[{result.get('agent', '?')}] "
+                                 f"{messages[-1]['content'][:80]}")
+                result['session_id'] = self._save_turns(
+                    user, session, messages[-1]['content'], result)
+                terminal = ('done', result)
+            except Exception as exc:
+                code, message = self._stream_error(exc)
+                logger.warning('help agent stream failed (%s)', code, exc_info=True)
+                terminal = ('error', {'code': code, 'message': message})
+            finally:
+                # 어떤 경로로 끝나도 종료 이벤트를 정확히 하나 보낸다
+                # (없으면 소비자가 큐에서 영원히 대기한다)
+                events.put(terminal or ('error', {
+                    'code': 'internal',
+                    'message': 'AI 응답 생성 중 오류가 발생했습니다.'}))
+                # 스레드마다 별도 DB 커넥션이 열리므로 반드시 닫는다
+                connection.close()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            kind, payload = events.get()
+            yield f"event: {kind}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            if kind in ('done', 'error'):
+                break
 
 
 class ChatSessionListView(generics.ListAPIView):

@@ -80,6 +80,31 @@ const TOOL_LABELS: Record<string, string> = {
 const toolNoteOf = (toolCalls?: { name: string }[]) =>
   (toolCalls || []).map((t) => TOOL_LABELS[t.name] || t.name).join(' → ');
 
+// 진행 단계 문구 — 서버가 보내는 step.phase와 1:1 대응.
+// 도구 이름은 TOOL_LABELS를 그대로 재사용한다 (서버는 도구 '이름'만 보낸다).
+const PHASE_LABELS: Record<string, string> = {
+  triage: '질문을 분석하고 있습니다',
+  thinking: '답변을 구상하고 있습니다',
+  evaluating: '답변을 검토하고 있습니다',
+  revising: '답변을 다듬고 있습니다',
+};
+
+// SSE 한 덩어리("event: x\ndata: {...}")를 {kind, payload}로 파싱.
+function parseEvent(block: string): { kind: string; payload: Record<string, unknown> } | null {
+  let kind = '';
+  const dataLines: string[] = [];
+  for (const line of block.split('\n')) {
+    if (line.startsWith('event:')) kind = line.slice(6).trim();
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+  }
+  if (!kind || dataLines.length === 0) return null;
+  try {
+    return { kind, payload: JSON.parse(dataLines.join('\n')) };
+  } catch {
+    return null;
+  }
+}
+
 const SUGGESTIONS = [
   'VRRP failover 유사 사례 찾아줘',
   '최근 30일 케이스 리포트 작성해줘',
@@ -101,6 +126,7 @@ export default function HelpAgentWidget({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState(''); // 스트리밍으로 받은 현재 진행 단계
   const [drawerWidth, setDrawerWidth] = useState(DRAWER_DEFAULT_WIDTH);
   // 서버에 저장된 대화 세션 — 이어가기(sessionId)와 이전 대화 목록(view)
   const [sessionId, setSessionId] = useState<number | null>(null);
@@ -147,8 +173,9 @@ export default function HelpAgentWidget({
     setMessages(history);
     setInput('');
     setLoading(true);
+    setProgress('질문을 분석하고 있습니다');
     try {
-      const res = await apiFetch('/api/help-agent/chat/', {
+      const res = await apiFetch('/api/help-agent/chat/stream/', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -156,18 +183,57 @@ export default function HelpAgentWidget({
           session_id: sessionId,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      if (data.session_id) setSessionId(data.session_id);
-      const toolNote = toolNoteOf(data.tool_calls);
+      // 스트림 시작 전 실패(검증·권한)는 지금까지처럼 상태 코드로 온다
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let done: Record<string, unknown> | null = null;
+      let failure = '';
+
+      // 이벤트는 빈 줄로 구분된다. 마지막 조각은 다음 청크와 이어 붙인다.
+      while (!done && !failure) {
+        const { value, done: finished } = await reader.read();
+        if (finished) break;
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split('\n\n');
+        buffer = blocks.pop() ?? '';
+        for (const block of blocks) {
+          const event = parseEvent(block);
+          if (!event) continue;
+          const { kind, payload } = event;
+          if (kind === 'step') {
+            setProgress(PHASE_LABELS[String(payload.phase)] || '처리하고 있습니다');
+          } else if (kind === 'tool') {
+            const name = String(payload.name);
+            setProgress(`${TOOL_LABELS[name] || name} 중`);
+          } else if (kind === 'start') {
+            const agent = String(payload.agent);
+            if (AGENT_LABELS[agent]) setProgress(`${AGENT_LABELS[agent]} 담당이 처리 중입니다`);
+          } else if (kind === 'done') {
+            done = payload;
+          } else if (kind === 'error') {
+            failure = String(payload.message || 'AI 응답 생성에 실패했습니다.');
+          }
+        }
+      }
+
+      if (failure) throw new Error(failure);
+      if (!done) throw new Error('응답이 중간에 끊겼습니다. 다시 시도해주세요.');
+
+      if (done.session_id) setSessionId(done.session_id as number);
       setMessages((prev) => [
         ...prev,
         {
           role: 'assistant',
-          content: data.reply,
-          toolNote,
-          agent: data.agent,
-          files: data.files,
+          content: done.reply as string,
+          toolNote: toolNoteOf(done.tool_calls as { name: string }[]),
+          agent: done.agent as string,
+          files: done.files as GeneratedFile[],
         },
       ]);
     } catch (e) {
@@ -180,6 +246,7 @@ export default function HelpAgentWidget({
       ]);
     } finally {
       setLoading(false);
+      setProgress('');
     }
   };
 
@@ -506,8 +573,11 @@ export default function HelpAgentWidget({
                     <IconRobotFace size={12} />
                   </ThemeIcon>
                   <Loader size="xs" type="dots" />
+                  {/* 서버가 흘려보내는 실제 진행 단계. 아직 못 받았으면 기존 문구로 시작한다 */}
                   <Text size="xs" c="dimmed">
-                    답변을 준비하는 중... (리포트 문서 생성은 1~2분 걸릴 수 있어요)
+                    {progress
+                      ? `${progress}...`
+                      : '답변을 준비하는 중... (리포트 문서 생성은 1~2분 걸릴 수 있어요)'}
                   </Text>
                 </Group>
               )}
