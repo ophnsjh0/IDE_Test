@@ -8,12 +8,10 @@ import logging
 
 from django.conf import settings
 from django.contrib.auth import authenticate, login, logout
-from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
-from django.core import signing
 from django.core.exceptions import ValidationError
-from django.http import HttpResponse
+from django.core.validators import validate_email
 from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import ensure_csrf_cookie
@@ -28,8 +26,6 @@ from .services import gmail_client
 from .services.usage import log_event
 
 logger = logging.getLogger(__name__)
-
-SIGNUP_TOKEN_SALT = 'caseflow-signup-approval'
 
 VALID_ROLES = [choice[0] for choice in UserProfile.ROLE_CHOICES]
 REQUESTABLE_ROLES = [choice[0] for choice in SignupRequest.REQUESTABLE_ROLE_CHOICES]
@@ -98,6 +94,19 @@ def _account_payload(user):
                        if user.last_login else None),
         'date_joined': timezone.localtime(user.date_joined).strftime('%Y-%m-%d'),
     }
+
+
+def _validate_email(email):
+    """사내 연락처 검증. 형식만 확인하고 도메인은 막지 않는다 —
+    어차피 소유 확인(인증 메일)을 하지 않아 도메인 제한은 실효가 없고,
+    통제는 가입 알림을 받은 관리자의 사후 조치가 담당한다."""
+    if not email:
+        return '메일 주소를 입력하세요.'
+    try:
+        validate_email(email)
+    except ValidationError:
+        return '메일 주소 형식이 올바르지 않습니다.'
+    return None
 
 
 def _validate_new_password(password, user=None):
@@ -193,10 +202,16 @@ class UserDetailView(APIView):
 
 
 class SignupRequestView(APIView):
-    """POST /api/auth/signup-requests/ — 로그인 화면의 계정 발급 요청 (비로그인).
+    """POST /api/auth/signup-requests/ — 로그인 화면의 계정 발급 (비로그인).
 
-    요청 정보를 저장하고 승인자에게 서명된 승인 링크가 담긴 메일을 보낸다.
-    비밀번호는 해시로만 저장하며 메일에는 포함하지 않는다.
+    2026-08-11부터 신청 즉시 계정을 만들고 바로 로그인할 수 있게 한다.
+    승인 대기를 없앤 이유는 두 가지다. ① 승인자가 병목이 되어 파일럿 확산이
+    느려졌고 ② 승인 링크가 GET이라 메일 보안 스캐너가 사람보다 먼저 눌러
+    자동 승인되는 문제가 있었다(링크 자체를 없애 원인을 제거).
+
+    통제는 사전 승인 대신 사후 조치로 옮겼다 — 관리자에게 가입 알림 메일이
+    가고, 부적절한 가입은 계정 관리에서 역할 변경·비활성화로 처리한다.
+    사내망에서만 접근 가능한 파일럿이라는 전제에서의 선택.
     """
     permission_classes = [AllowAny]
 
@@ -204,6 +219,7 @@ class SignupRequestView(APIView):
         username = (request.data.get('username') or '').strip()
         password = request.data.get('password') or ''
         name = (request.data.get('name') or '').strip()
+        email = (request.data.get('email') or '').strip()
         reason = (request.data.get('reason') or '').strip()
         requested_role = request.data.get('requested_role') or 'viewer'
 
@@ -215,108 +231,57 @@ class SignupRequestView(APIView):
         if User.objects.filter(username__iexact=username).exists():
             return Response({'error': f'이미 존재하는 아이디입니다: {username}'},
                             status=status.HTTP_400_BAD_REQUEST)
-        if SignupRequest.objects.filter(username__iexact=username, status='pending').exists():
-            return Response({'error': '같은 아이디로 승인 대기 중인 요청이 있습니다.'},
-                            status=status.HTTP_400_BAD_REQUEST)
+        email_error = _validate_email(email)
+        if email_error:
+            return Response({'error': email_error}, status=status.HTTP_400_BAD_REQUEST)
         password_error = _validate_new_password(password)
         if password_error:
             return Response({'error': password_error}, status=status.HTTP_400_BAD_REQUEST)
 
+        user = User(username=username, first_name=name, email=email)
+        user.set_password(password)
+        user.save()
+        set_user_role(user, requested_role)
         signup = SignupRequest.objects.create(
-            username=username, name=name, reason=reason[:300],
-            password_hash=make_password(password), requested_role=requested_role,
+            username=username, name=name, email=email, reason=reason[:300],
+            requested_role=requested_role, status='approved',
+            approved_at=timezone.now(),
         )
+        logger.info("Signup: %s (%s) created", username, requested_role)
 
-        token = signing.dumps({'id': signup.id}, salt=SIGNUP_TOKEN_SALT)
-        approve_url = request.build_absolute_uri(f'/api/auth/signup-approve/?token={token}')
-        requested_at = timezone.localtime(signup.created_at).strftime('%Y-%m-%d %H:%M')
+        # 알림 실패가 가입을 막지 않는다 — 계정은 이미 정상 생성됐다.
+        self._notify_admin(signup)
+        return Response({'message': '계정이 생성되었습니다. 바로 로그인하실 수 있습니다.'},
+                        status=status.HTTP_201_CREATED)
+
+    @staticmethod
+    def _notify_admin(signup):
+        joined_at = timezone.localtime(signup.created_at).strftime('%Y-%m-%d %H:%M')
         html = f"""
         <div style="font-family:sans-serif;max-width:520px">
-          <h2>Case-Flow 계정 발급 요청</h2>
+          <h2>Case-Flow 새 사용자 가입</h2>
           <table cellpadding="6" style="border-collapse:collapse">
             <tr><td><b>아이디</b></td><td>{signup.username}</td></tr>
             <tr><td><b>이름</b></td><td>{signup.name or '-'}</td></tr>
-            <tr><td><b>요청 사유</b></td><td>{signup.reason or '-'}</td></tr>
-            <tr><td><b>요청 시각</b></td><td>{requested_at}</td></tr>
-            <tr><td><b>신청 역할</b></td><td>{ROLE_LABELS_KO[signup.requested_role]} (승인 후 계정 관리에서 변경 가능)</td></tr>
+            <tr><td><b>메일</b></td><td>{signup.email or '-'}</td></tr>
+            <tr><td><b>신청 사유</b></td><td>{signup.reason or '-'}</td></tr>
+            <tr><td><b>부여된 역할</b></td><td>{ROLE_LABELS_KO[signup.requested_role]}</td></tr>
+            <tr><td><b>가입 시각</b></td><td>{joined_at}</td></tr>
           </table>
-          <p style="margin-top:20px">
-            <a href="{approve_url}"
-               style="background:#228be6;color:#fff;padding:12px 24px;border-radius:6px;
-                      text-decoration:none;font-weight:bold">계정 생성 승인</a>
-          </p>
-          <p style="color:#868e96;font-size:13px">
-            링크는 7일간 유효합니다. 승인하지 않으려면 이 메일을 무시하세요.
-          </p>
+          <p style="margin-top:16px">이미 로그인 가능한 상태입니다. 모르는 사용자라면
+             계정 관리에서 역할을 낮추거나 비활성화하세요.</p>
+          <p><a href="{settings.APP_BASE_URL}/users"
+                style="background:#228be6;color:#fff;padding:10px 20px;border-radius:6px;
+                       text-decoration:none;font-weight:bold">계정 관리 열기</a></p>
         </div>
         """
         try:
             gmail_client.send_email(
                 settings.SIGNUP_APPROVER_EMAIL,
-                f'[Case-Flow] 계정 발급 요청: {signup.username}',
+                f'[Case-Flow] 새 사용자 가입: {signup.username}',
                 html,
             )
         except Exception:
-            logger.exception("Signup approval mail failed for %s", signup.username)
-            signup.delete()  # 재요청 가능하도록 대기 상태를 남기지 않음
-            return Response(
-                {'error': '승인 메일 발송에 실패했습니다. 관리자에게 직접 문의하세요.'},
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
-
-        return Response({'message': '요청이 접수되었습니다. 관리자 승인 후 로그인할 수 있습니다.'},
-                        status=status.HTTP_201_CREATED)
+            logger.exception("Signup notification mail failed for %s", signup.username)
 
 
-class SignupApproveView(APIView):
-    """GET /api/auth/signup-approve/?token=... — 승인 메일의 버튼 링크.
-
-    메일 클라이언트 브라우저에서 로그인 없이 열리므로 서명 토큰으로 검증하고,
-    사람이 읽을 HTML 페이지로 응답한다.
-    """
-    permission_classes = [AllowAny]
-
-    @staticmethod
-    def _page(title, body, ok=True):
-        color = '#2f9e44' if ok else '#e03131'
-        return HttpResponse(f"""
-        <html><head><meta charset="utf-8"><title>Case-Flow</title></head>
-        <body style="font-family:sans-serif;display:flex;justify-content:center;padding-top:80px">
-          <div style="max-width:480px;text-align:center">
-            <h2 style="color:{color}">{title}</h2>
-            <p style="color:#495057">{body}</p>
-          </div>
-        </body></html>
-        """)
-
-    def get(self, request):
-        token = request.query_params.get('token', '')
-        try:
-            payload = signing.loads(token, salt=SIGNUP_TOKEN_SALT,
-                                    max_age=settings.SIGNUP_APPROVAL_MAX_AGE)
-        except signing.SignatureExpired:
-            return self._page('링크가 만료되었습니다', '승인 링크는 7일간 유효합니다. 요청자에게 재요청을 안내하세요.', ok=False)
-        except signing.BadSignature:
-            return self._page('유효하지 않은 링크입니다', '링크가 손상되었거나 위조되었습니다.', ok=False)
-
-        signup = SignupRequest.objects.filter(id=payload.get('id')).first()
-        if signup is None:
-            return self._page('요청을 찾을 수 없습니다', '이미 삭제된 요청입니다.', ok=False)
-        if signup.status == 'approved':
-            return self._page('이미 처리된 요청입니다', f'{signup.username} 계정은 이미 생성되어 있습니다.')
-        if User.objects.filter(username__iexact=signup.username).exists():
-            return self._page('생성 불가', f'{signup.username} 아이디가 이미 사용 중입니다.', ok=False)
-
-        user = User(username=signup.username, first_name=signup.name,
-                    password=signup.password_hash)
-        user.save()
-        set_user_role(user, signup.requested_role)
-        signup.status = 'approved'
-        signup.approved_at = timezone.now()
-        signup.save()
-        logger.info("Signup approved: %s (%s)", signup.username, signup.requested_role)
-
-        role_label = ROLE_LABELS_KO[signup.requested_role]
-        return self._page('계정이 생성되었습니다',
-                          f'<b>{signup.username}</b> 계정이 {role_label} 역할로 생성되었습니다. '
-                          '요청자에게 로그인 가능함을 알려주시고, 필요하면 계정 관리에서 역할을 조정하세요.')

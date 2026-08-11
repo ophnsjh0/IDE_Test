@@ -19,12 +19,17 @@ class UserProfile(models.Model):
 
 
 class SignupRequest(models.Model):
-    """로그인 화면의 계정 발급 요청. 승인자가 메일의 승인 링크를 누르면 계정이 생성된다.
+    """로그인 화면의 계정 발급 신청 기록.
 
-    비밀번호는 요청 시점에 해시로만 저장되고(평문 미보관), 승인 시 그 해시가
-    그대로 User.password가 된다. requested_role은 신청자가 고른 희망 역할로,
-    승인 시 그대로 부여된다 — admin은 자율 신청 대상에서 제외(권한 상승 방지),
-    반드시 viewer/engineer 중 하나여야 한다.
+    2026-08-11부터 **신청 즉시 계정이 생성**된다(승인 대기 없음). 관리자에게는
+    "누가 가입했다"는 알림 메일만 나가고, 부적절한 가입은 계정 관리에서
+    역할 변경·비활성화로 사후 처리한다. 승인 링크 방식은 폐기했다 — 메일
+    보안 스캐너가 사람보다 먼저 링크를 눌러 자동 승인되는 문제가 있었다.
+
+    이 모델은 이제 신청 사유·연락처를 남기는 가입 로그다. 비밀번호는 User에만
+    저장되고 여기에는 보관하지 않는다(중복 보관 제거).
+    requested_role은 신청자가 고른 역할 — admin은 자율 신청 대상에서 제외
+    (권한 상승 방지), 반드시 viewer/engineer 중 하나여야 한다.
     """
     STATUS_CHOICES = [
         ('pending', 'Pending'),
@@ -37,8 +42,8 @@ class SignupRequest(models.Model):
 
     username = models.CharField(max_length=150)
     name = models.CharField(max_length=100, blank=True, default='')
+    email = models.EmailField(blank=True, default='')  # 사내 연락처 (공지·문의용)
     reason = models.CharField(max_length=300, blank=True, default='')
-    password_hash = models.CharField(max_length=128)
     requested_role = models.CharField(max_length=10, choices=REQUESTABLE_ROLE_CHOICES,
                                        default='viewer')
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')

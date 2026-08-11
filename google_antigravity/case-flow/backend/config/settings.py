@@ -105,7 +105,8 @@ SESSION_COOKIE_AGE = 12 * 3600
 SIGNUP_APPROVER_EMAIL = os.environ.get('CASEFLOW_SIGNUP_APPROVER_EMAIL',
                                        'jhshin@ubersys.co.kr')
 # 승인 링크 유효기간 (초)
-SIGNUP_APPROVAL_MAX_AGE = 7 * 24 * 3600
+# 가입 알림 메일의 '계정 관리 열기' 링크가 가리킬 프론트 주소
+APP_BASE_URL = os.environ.get('CASEFLOW_APP_BASE_URL', 'http://192.168.74.158:3000')
 
 
 # Application definition

@@ -891,105 +891,93 @@ class KnowledgeSyncTests(TestCase):
 
 
 class SignupRequestTests(TestCase):
-    """계정 발급 요청 -> 승인 메일 -> 링크 클릭으로 계정 생성."""
+    """계정 발급 — 신청 즉시 생성 + 관리자 알림 (2026-08-11 승인 방식 폐기).
+
+    승인 링크(GET)는 메일 보안 스캐너가 사람보다 먼저 눌러 자동 승인시키는
+    문제가 있어 제거했다. 통제는 사전 승인 대신 사후 조치(계정 관리)로 옮겼다.
+    """
 
     def request_signup(self, **overrides):
-        from unittest.mock import patch
         data = {'username': 'newbie', 'password': 'newbie-pass-77!',
-                'name': '신입', 'reason': '케이스 조회 필요'}
+                'name': '신입', 'email': 'newbie@ubersys.co.kr',
+                'reason': '케이스 조회 필요'}
         data.update(overrides)
         with patch('api.auth_views.gmail_client.send_email') as mock_send:
             response = self.client.post('/api/auth/signup-requests/', data,
                                         content_type='application/json')
         return response, mock_send
 
-    def extract_approve_url(self, mock_send):
-        import re
-        html = mock_send.call_args[0][2]
-        match = re.search(r'href="([^"]+)"', html)
-        return match.group(1)
-
-    def test_request_sends_approval_mail_without_password(self):
-        response, mock_send = self.request_signup()
-        self.assertEqual(response.status_code, 201)
-        mock_send.assert_called_once()
-        to, subject, html = mock_send.call_args[0]
-        self.assertEqual(to, 'jhshin@ubersys.co.kr')
-        self.assertIn('newbie', html)
-        self.assertNotIn('newbie-pass-77!', html)  # 비밀번호는 메일에 없음
-
-    def test_approve_link_creates_account_with_requested_password(self):
+    def test_account_is_usable_immediately(self):
         from django.contrib.auth.models import User
         from api.permissions import get_user_role
-        _, mock_send = self.request_signup()
-        url = self.extract_approve_url(mock_send)
-
-        response = self.client.get(url)
-        self.assertEqual(response.status_code, 200)
-        self.assertIn('계정이 생성되었습니다', response.content.decode())
+        response, _ = self.request_signup()
+        self.assertEqual(response.status_code, 201)
 
         user = User.objects.get(username='newbie')
         self.assertEqual(get_user_role(user), 'viewer')
-        # 요청 시 입력한 비밀번호로 로그인 가능
+        self.assertEqual(user.email, 'newbie@ubersys.co.kr')
+        # 승인 절차 없이 바로 로그인된다
         login = self.client.post('/api/auth/login/',
                                  {'username': 'newbie', 'password': 'newbie-pass-77!'},
                                  content_type='application/json')
         self.assertEqual(login.status_code, 200)
 
-    def test_approve_link_is_idempotent(self):
-        from django.contrib.auth.models import User
-        _, mock_send = self.request_signup()
-        url = self.extract_approve_url(mock_send)
-        self.client.get(url)
-        response = self.client.get(url)  # 두 번째 클릭
-        self.assertIn('이미 처리된', response.content.decode())
-        self.assertEqual(User.objects.filter(username='newbie').count(), 1)
+    def test_admin_is_notified_without_password(self):
+        response, mock_send = self.request_signup()
+        self.assertEqual(response.status_code, 201)
+        mock_send.assert_called_once()
+        to, subject, html = mock_send.call_args[0]
+        self.assertEqual(to, 'jhshin@ubersys.co.kr')
+        self.assertIn('새 사용자 가입', subject)
+        self.assertIn('newbie', html)
+        self.assertIn('newbie@ubersys.co.kr', html)
+        self.assertNotIn('newbie-pass-77!', html)  # 비밀번호는 메일에 없음
+        # 승인 링크가 더 이상 없어야 한다 (스캐너 자동 클릭 원인 제거)
+        self.assertNotIn('signup-approve', html)
 
-    def test_tampered_token_rejected(self):
+    def test_requested_role_engineer_is_granted(self):
         from django.contrib.auth.models import User
-        _, mock_send = self.request_signup()
-        url = self.extract_approve_url(mock_send)
-        response = self.client.get(url[:-4] + 'xxxx')
-        self.assertIn('유효하지 않은', response.content.decode())
+        from api.permissions import get_user_role
+        self.request_signup(requested_role='engineer')
+        self.assertEqual(get_user_role(User.objects.get(username='newbie')), 'engineer')
+
+    def test_requesting_admin_role_is_rejected(self):
+        from django.contrib.auth.models import User
+        response, mock_send = self.request_signup(requested_role='admin')
+        self.assertEqual(response.status_code, 400)
+        mock_send.assert_not_called()
         self.assertFalse(User.objects.filter(username='newbie').exists())
 
-    def test_duplicate_username_or_pending_rejected(self):
+    def test_duplicate_username_rejected(self):
         from django.contrib.auth.models import User
         User.objects.create_user('taken', password='x-pass-123!')
         response, _ = self.request_signup(username='taken')
         self.assertEqual(response.status_code, 400)
 
-        self.request_signup()  # pending 생성
-        response, _ = self.request_signup()  # 같은 아이디 재요청
+        self.request_signup()
+        response, _ = self.request_signup()  # 같은 아이디 재가입
         self.assertEqual(response.status_code, 400)
+        self.assertEqual(User.objects.filter(username='newbie').count(), 1)
 
-    def test_requested_role_engineer_is_granted_on_approval(self):
+    def test_email_is_required_and_validated(self):
         from django.contrib.auth.models import User
-        from api.permissions import get_user_role
-        _, mock_send = self.request_signup(requested_role='engineer')
-        url = self.extract_approve_url(mock_send)
+        for bad in ('', '골뱅이없음', 'a@b'):
+            response, _ = self.request_signup(email=bad)
+            self.assertEqual(response.status_code, 400, msg=bad)
+        self.assertFalse(User.objects.filter(username='newbie').exists())
 
-        response = self.client.get(url)
-        self.assertIn('엔지니어', response.content.decode())
-
-        user = User.objects.get(username='newbie')
-        self.assertEqual(get_user_role(user), 'engineer')
-
-    def test_requesting_admin_role_is_rejected(self):
-        response, mock_send = self.request_signup(requested_role='admin')
-        self.assertEqual(response.status_code, 400)
-        mock_send.assert_not_called()
-
-    def test_mail_failure_rolls_back_request(self):
-        from unittest.mock import patch
-        from api.models import SignupRequest
-        with patch('api.auth_views.gmail_client.send_email', side_effect=Exception('smtp down')):
+    def test_notification_failure_does_not_block_signup(self):
+        """알림은 부가 기능 — 메일이 실패해도 계정은 살아 있어야 한다."""
+        from django.contrib.auth.models import User
+        with patch('api.auth_views.gmail_client.send_email',
+                   side_effect=Exception('smtp down')):
             response = self.client.post(
                 '/api/auth/signup-requests/',
-                {'username': 'newbie', 'password': 'newbie-pass-77!'},
+                {'username': 'newbie', 'password': 'newbie-pass-77!',
+                 'email': 'newbie@ubersys.co.kr'},
                 content_type='application/json')
-        self.assertEqual(response.status_code, 502)
-        self.assertFalse(SignupRequest.objects.filter(username='newbie').exists())
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(User.objects.filter(username='newbie').exists())
 
 
 class CaseRelationTests(TestCase):

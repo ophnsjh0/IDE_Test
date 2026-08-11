@@ -9,8 +9,6 @@ urlpatterns = [
     path('auth/users/', auth_views.UserListCreateView.as_view(), name='auth-users'),
     path('auth/signup-requests/', auth_views.SignupRequestView.as_view(),
          name='auth-signup-request'),
-    path('auth/signup-approve/', auth_views.SignupApproveView.as_view(),
-         name='auth-signup-approve'),
     path('auth/users/<int:user_id>/', auth_views.UserDetailView.as_view(),
          name='auth-user-detail'),
     path('cases/', views.CaseListCreateView.as_view(), name='case-list-create'),

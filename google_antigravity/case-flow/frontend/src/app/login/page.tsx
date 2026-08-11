@@ -37,9 +37,10 @@ export default function LoginPage() {
   });
 
   const signupForm = useForm({
-    initialValues: { username: '', name: '', password: '', reason: '', requested_role: 'viewer' },
+    initialValues: { username: '', name: '', email: '', password: '', reason: '', requested_role: 'viewer' },
     validate: {
       username: (v) => (v.trim() ? null : '아이디를 입력하세요'),
+      email: (v) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim()) ? null : '메일 주소를 입력하세요'),
       password: (v) => (v.length < 8 ? '비밀번호는 8자 이상이어야 합니다' : null),
     },
   });
@@ -78,7 +79,7 @@ export default function LoginPage() {
       if (response.ok) {
         signupForm.reset();
         setSignupOpened(false);
-        setNotice('발급 요청이 접수되었습니다. 관리자 승인 후 요청한 아이디/비밀번호로 로그인할 수 있습니다.');
+        setNotice('계정이 생성되었습니다. 방금 입력한 아이디/비밀번호로 바로 로그인하세요.');
       } else {
         signupForm.setFieldError('username', data?.error || '요청 접수에 실패했습니다.');
       }
@@ -148,8 +149,8 @@ export default function LoginPage() {
         <form onSubmit={signupForm.onSubmit(handleSignup)}>
           <Stack>
             <Text size="sm" c="dimmed">
-              입력한 정보가 관리자에게 전달되고, 승인되면 아래 아이디/비밀번호로
-              바로 로그인할 수 있습니다.
+              입력하시면 계정이 바로 만들어져 곧장 로그인하실 수 있습니다.
+              가입 사실은 관리자에게 알림으로 전달됩니다.
             </Text>
             <TextInput
               required
@@ -161,6 +162,13 @@ export default function LoginPage() {
               label="이름"
               placeholder="홍길동"
               {...signupForm.getInputProps('name')}
+            />
+            <TextInput
+              required
+              label="사내 메일"
+              placeholder="hgildong@ubersys.co.kr"
+              description="공지나 문의 회신에만 사용합니다"
+              {...signupForm.getInputProps('email')}
             />
             <PasswordInput
               required
