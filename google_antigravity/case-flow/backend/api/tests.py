@@ -2884,3 +2884,37 @@ class HelpAgentChatStreamTests(TestCase):
         self.assertEqual(events[0][1]['code'], 'rate_limit')
         self.assertIn('사용량 한도', events[0][1]['message'])
         save.assert_not_called()  # 실패한 응답은 저장하지 않는다
+
+
+class HelpAgentDocumentAccessTests(TestCase):
+    """검색 에이전트가 벤더 문서를 조회할 수 있는지 — 2026-08-11 실사용 신고 회귀.
+
+    신고: "사내 문서 검색을 통해 확인해줘"에 검색 에이전트가 "저는 케이스 DB만
+    검색할 수 있다, SharePoint는 IT에 문의하라"고 거절. 실제로는 시스템에 벤더
+    문서 2만여 청크가 적재돼 있었고, 원인은 검색 에이전트에 search_references
+    도구가 없었던 것 + 프롬프트의 거절 지시가 SCOPE_GUARD의 핸드오프 규칙과
+    충돌한 것이었다.
+    """
+
+    def test_search_agent_can_search_documents(self):
+        tools = {t['name'] for t in help_agent._agent_configs()['search']['tools']}
+        self.assertIn('search_references', tools)
+        # 케이스 조회 능력은 그대로 유지
+        self.assertIn('search_cases', tools)
+        self.assertIn('search_knowledge', tools)
+
+    def test_search_prompt_does_not_instruct_refusal(self):
+        prompt = help_agent._agent_configs()['search']['system']
+        # 거절 대신 핸드오프가 원칙 (SCOPE_GUARD와 충돌하던 문장 제거됨)
+        self.assertNotIn('일반 기술 지원은 범위 밖', prompt)
+        self.assertIn('HANDOFF:tech', prompt)
+        # 외부 문서 시스템으로 떠넘기지 않도록 명시
+        self.assertIn('SharePoint', prompt)
+        self.assertIn('search_references', prompt)
+
+    def test_missing_document_returns_explicit_notice(self):
+        """문서에 없는 버그 번호는 빈 결과가 아니라 '못 찾았다'는 안내를 돌려준다."""
+        with patch('api.services.references.search', return_value=[]):
+            payload = json.loads(help_agent._search_references(query='ACOS-104904'))
+        self.assertEqual(payload['count'], 0)
+        self.assertIn('찾지 못했습니다', payload['notice'])
