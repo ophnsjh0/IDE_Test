@@ -2282,6 +2282,73 @@ class TechAgentFlowTests(TestCase):
     @override_settings(ANTHROPIC_API_KEY='test-key',
                        HELP_AGENT_MODEL='claude-haiku-4-5',
                        TECH_AGENT_MODEL='claude-sonnet-5')
+    def test_revision_preamble_does_not_replace_the_answer(self):
+        """수정 라운드가 "다시 확인하겠습니다" 예고문을 내놓으면 원본을 지킨다.
+
+        운영에서 후속 질문마다 40자짜리 예고문만 저장돼 답변이 사라진 것처럼
+        보였던 장애의 회귀 테스트.
+        """
+        answer = '## TACACS+ 설정\n' + 'ACOS 설정 절차 상세 설명. ' * 40
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            self._triage_resp('tech'),
+            self._text_resp(answer),
+            self._text_resp('{"ok": false, "issues": ["출처 인용 없음"]}'),
+            self._text_resp('피드백을 반영하여 문서를 직접 확인하겠습니다.'),
+        ]
+        with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
+            result = help_agent.chat(
+                [{'role': 'user', 'content': 'A10 TACACS 연동 가이드 알려줘'},
+                 {'role': 'assistant', 'content': answer},
+                 {'role': 'user', 'content': '진행해줘'}])
+
+        self.assertIn('TACACS+ 설정', result['reply'])
+        self.assertNotIn('확인하겠습니다', result['reply'])
+
+    @override_settings(ANTHROPIC_API_KEY='test-key',
+                       HELP_AGENT_MODEL='claude-haiku-4-5',
+                       TECH_AGENT_MODEL='claude-sonnet-5')
+    def test_revision_round_blocks_tool_use(self):
+        """수정 라운드는 도구를 못 쓰게 막아 예고문 유도 자체를 차단한다."""
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            self._triage_resp('tech'),
+            self._text_resp('근거 없는 초안'),
+            self._text_resp('{"ok": false, "issues": ["출처 인용 없음"]}'),
+            self._text_resp('수정된 답변 [출처](https://vendor.com/doc)'),
+        ]
+        with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
+            help_agent.chat([{'role': 'user', 'content': 'EOS 주의사항 알려줘'}])
+
+        revision_kwargs = fake_client.messages.create.call_args_list[3].kwargs
+        self.assertEqual(revision_kwargs['tool_choice'], {'type': 'none'})
+
+    @override_settings(ANTHROPIC_API_KEY='test-key',
+                       HELP_AGENT_MODEL='claude-haiku-4-5',
+                       TECH_AGENT_MODEL='claude-sonnet-5')
+    def test_evaluator_receives_previous_context(self):
+        """짧은 후속 지시("진행해줘")도 검수자가 주제를 알 수 있어야 한다."""
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            self._triage_resp('tech'),
+            self._text_resp('A10 TACACS 설정 [출처](https://a10.com/doc)'),
+            self._text_resp('{"ok": true}'),
+        ]
+        with patch.object(help_agent.anthropic, 'Anthropic', return_value=fake_client):
+            help_agent.chat(
+                [{'role': 'user', 'content': 'A10 TACACS 연동 가이드 알려줘'},
+                 {'role': 'assistant', 'content': 'TACACS+ 서버 등록 절차입니다'},
+                 {'role': 'user', 'content': '진행해줘'}])
+
+        evaluator_content = (fake_client.messages.create
+                             .call_args_list[2].kwargs['messages'][0]['content'])
+        self.assertIn('이전 대화 맥락', evaluator_content)
+        self.assertIn('TACACS 연동 가이드', evaluator_content)
+        self.assertIn('[현재 질문]\n진행해줘', evaluator_content)
+
+    @override_settings(ANTHROPIC_API_KEY='test-key',
+                       HELP_AGENT_MODEL='claude-haiku-4-5',
+                       TECH_AGENT_MODEL='claude-sonnet-5')
     def test_handoff_reroutes_to_target_agent_once(self):
         # 검색 에이전트에게 웹 검색 요청이 잘못 배정 → [HANDOFF:tech] → 재배정
         fake_client = MagicMock()

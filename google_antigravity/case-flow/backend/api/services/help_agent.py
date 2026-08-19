@@ -222,6 +222,10 @@ TECH_EVALUATOR_PROMPT = """기술 지원 답변의 검수자입니다. 질문, �
 2. 주장마다 출처 URL이 인용되어 있는가
 3. 근거 자료와 모순되는 서술이 없는가
 근거 없이 "일반적인 지식"임을 명시한 부분은 문제 삼지 않습니다.
+[현재 질문]은 "진행해줘"·"설정 위주로 정리해줘"처럼 앞선 대화를 이어받는 짧은
+지시일 수 있습니다. 그 경우 [이전 대화 맥락]에서 실제 주제를 파악해 검수하고,
+지시문과 근거 자료의 주제가 달라 보인다는 이유만으로 문제를 잡지 마세요 —
+검수 대상은 어디까지나 답변 초안의 주장과 근거의 일치 여부입니다.
 JSON만 출력하세요: {"ok": true} 또는 {"ok": false, "issues": ["문제 설명", ...]}"""
 
 # 트리아지: 명백한 리포트 요청은 규칙으로 즉시 분기 (LLM 호출 절약)
@@ -810,6 +814,18 @@ def _agent_configs():
     }
 
 
+def recent_context(messages, turns=4, limit=300):
+    """직전 대화 몇 턴을 한 덩어리 텍스트로. 마지막(현재) 메시지는 제외한다.
+
+    "진행해줘" 같은 후속 지시는 단독으로 의미가 없어, 트리아지와 검수자 모두
+    이 맥락을 함께 받아야 현재 질문의 실제 주제를 알 수 있다.
+    """
+    return '\n'.join(
+        f"[{m['role']}] {question_text(m)[:limit]}"
+        for m in messages[-(turns + 1):-1]
+    )
+
+
 def _triage(client, messages):
     """질문을 담당 에이전트로 분류. 명백한 패턴은 규칙, 애매하면 haiku 1회 호출.
 
@@ -822,9 +838,7 @@ def _triage(client, messages):
     if any(keyword in lowered for keyword in REPORT_KEYWORDS):
         return 'report'
 
-    context = '\n'.join(
-        f"[{m['role']}] {question_text(m)[:300]}" for m in messages[-5:-1]
-    )
+    context = recent_context(messages)
     content = (f'[이전 대화 맥락]\n{context}\n\n[현재 질문]\n{question[:1000]}'
                if context else question[:1000])
 
@@ -856,8 +870,14 @@ def _triage(client, messages):
 # 평가자에게 넘기는 근거 자료 길이 상한 (haiku 입력 비용 통제)
 MAX_EVIDENCE_CHARS = 8000
 
+# 수정 라운드 결과를 채택할 최소 조건. 검수 피드백을 받은 모델이 답변을 고치는
+# 대신 "다시 확인해 보겠습니다" 같은 예고문만 내놓는 일이 있는데, 그게 원본을
+# 덮으면 사용자에게는 답변이 통째로 사라진 것처럼 보인다(실제 장애 원인).
+MIN_REVISION_RATIO = 0.4
+RE_REVISION_PREAMBLE = re.compile(r'(하겠습니다|하겠음|보겠습니다)[.!]?$')
 
-def _evaluate_tech_reply(client, question, evidence, reply):
+
+def _evaluate_tech_reply(client, question, evidence, reply, context=''):
     """haiku 평가자: 기술 답변의 주장↔출처 일치 검수.
 
     검수 자체가 실패하면(파싱 불가·API 오류) 답변을 막지 않고 통과시킨다 —
@@ -871,7 +891,8 @@ def _evaluate_tech_reply(client, question, evidence, reply):
             system=TECH_EVALUATOR_PROMPT,
             messages=[{
                 'role': 'user',
-                'content': (f'[질문]\n{question}\n\n'
+                'content': ((f'[이전 대화 맥락]\n{context}\n\n' if context else '')
+                            + f'[현재 질문]\n{question}\n\n'
                             f'[근거 자료]\n{evidence_text or "(수집된 근거 없음)"}\n\n'
                             f'[답변 초안]\n{reply}'),
             }],
@@ -884,6 +905,15 @@ def _evaluate_tech_reply(client, question, evidence, reply):
     except (anthropic.APIError, ValueError):
         logger.warning('tech evaluator failed; skipping review', exc_info=True)
         return {'ok': True}
+
+
+def _is_revision_preamble(revised, original):
+    """수정본이 답변이 아니라 "이제 찾아보겠습니다"류 예고문인가."""
+    if len(revised) < len(original) * MIN_REVISION_RATIO:
+        return True
+    # 원본도 짧았던 경우 길이비로는 걸러지지 않으므로 문장 형태로 한 번 더 본다
+    return ('\n' not in revised.strip()
+            and bool(RE_REVISION_PREAMBLE.search(revised.strip())))
 
 
 class AttachmentRejected(ValueError):
@@ -1339,7 +1369,8 @@ def _run_agent(client, agent, messages, on_event=_noop_event):
     if agent == 'tech' and reply and not RE_HANDOFF.search(reply):
         question = question_text(messages[-1])
         on_event('step', {'phase': 'evaluating'})
-        evaluation = _evaluate_tech_reply(client, question, evidence, reply)
+        evaluation = _evaluate_tech_reply(client, question, evidence, reply,
+                                          context=recent_context(messages))
         if not evaluation.get('ok'):
             on_event('step', {'phase': 'revising'})
             issues = '\n'.join(f'- {i}' for i in evaluation.get('issues', []))
@@ -1357,12 +1388,21 @@ def _run_agent(client, agent, messages, on_event=_noop_event):
                 model=config['model'],
                 max_tokens=config.get('max_tokens', 4096),
                 system=config['system'],
+                # 도구를 막아 "이제 검증하러 가겠다"는 선택지를 없앤다 — 수정
+                # 라운드는 이미 모은 근거로 답변을 고쳐 쓰는 단계다.
+                tools=config['tools'],
+                tool_choice={'type': 'none'},
                 messages=convo,
             )
             revised = ''.join(b.text for b in revision.content
                               if b.type == 'text').strip()
-            if revised:
+            if revised and not _is_revision_preamble(revised, reply):
                 reply = revised
+            elif revised:
+                # 그래도 예고문이 나오면 원본을 지킨다 (빈 답변보다 낫다)
+                logger.warning('tech revision looked like a preamble; keeping '
+                               'the original reply (%d -> %d chars)',
+                               len(reply), len(revised))
 
     return reply, tool_trace, evaluation, files
 
