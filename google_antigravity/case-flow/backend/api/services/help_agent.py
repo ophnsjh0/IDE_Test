@@ -18,6 +18,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import os
 import re
 import socket
 from datetime import timedelta
@@ -38,6 +39,46 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_ITERATIONS = 6
 # 프론트가 보내는 대화 이력 상한 (오래된 턴은 잘라 토큰 낭비 방지)
 MAX_HISTORY_MESSAGES = 20
+
+# --- 사용자 첨부(스크린샷·설정 파일·벤더 PDF) ---
+# 원본은 Files API에 올리고 메시지에는 file_id만 싣는다 — 대화를 이어갈 때
+# 매 턴 원본을 다시 전송하지 않아도 되고, API 키가 브라우저로 나가지 않는다.
+FILES_BETA = 'files-api-2025-04-14'
+
+# 첨부 업로드 상한. Files API 자체는 훨씬 크지만 채팅 첨부는 스크린샷·설정
+# 파일·문서 수준이면 충분하고, 여기서 막아야 토큰 비용도 예측 가능해진다.
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+
+# 확장자 → (MIME, kind). kind가 모델에 보낼 블록 타입을 결정한다.
+# 목록에 없는 확장자는 거부 — 모델이 못 읽는 파일을 올려두고 기다리는 것보다
+# 업로드 시점에 알려주는 편이 낫다.
+# 워드·엑셀의 MIME이 text/plain인 것은 오타가 아니다 — 아래 OFFICE_EXTRACTORS로
+# 본문을 뽑아 평문으로 바꿔 올리기 때문에 업로드되는 실체가 텍스트다.
+ATTACHMENT_TYPES = {
+    '.png': ('image/png', 'image'),
+    '.jpg': ('image/jpeg', 'image'),
+    '.jpeg': ('image/jpeg', 'image'),
+    '.gif': ('image/gif', 'image'),
+    '.webp': ('image/webp', 'image'),
+    '.pdf': ('application/pdf', 'document'),
+    '.txt': ('text/plain', 'document'),
+    '.log': ('text/plain', 'document'),
+    '.cfg': ('text/plain', 'document'),
+    '.conf': ('text/plain', 'document'),
+    '.csv': ('text/plain', 'document'),
+    '.docx': ('text/plain', 'document'),
+    '.xlsx': ('text/plain', 'document'),
+}
+
+# 변환 텍스트 상한. 넘으면 잘라서 올린다 — 행이 수천 개인 이슈 시트를 통째로
+# 실으면 질문 한 번에 수만 토큰이 나간다. 그런 자료는 Documents(RAG)가 맞다.
+MAX_EXTRACTED_CHARS = 100_000
+
+# 첨부는 대화 이력에 남으면 매 턴 다시 과금된다(고해상도 이미지 1장이
+# 수천 토큰). 최근 N개 사용자 메시지의 첨부만 실제로 올리고 그보다 오래된
+# 것은 파일명 표시로 대체한다 — 직전 자료에 대한 후속 질문은 되면서
+# 이력이 길어져도 비용이 늘지 않는다.
+MAX_ATTACHMENT_MESSAGES = 2
 
 # 문서 생성 스킬 (리포팅 에이전트 전용) — Anthropic Agent Skills.
 # 코드 실행 샌드박스에서 .docx/.xlsx/.pptx를 만들고 file_id로 돌려받는다.
@@ -98,9 +139,12 @@ REPORT_SYSTEM_PROMPT = """당신은 Case-Flow(벤더 TAC 케이스 관리 시스
 바로 공유할 수 있는 한국어 보고서를 작성합니다.
 
 작성 규칙:
-- 반드시 get_case_stats와 list_recent_cases로 데이터를 먼저 수집하세요.
-  주요 케이스는 필요 시 get_case_detail로 내용을 확인하세요.
-- 모든 숫자는 도구 결과에 있는 값만 사용하세요. 추정하거나 지어내지 마세요.
+- 케이스 현황을 정리할 때는 get_case_stats와 list_recent_cases로 데이터를 먼저
+  수집하세요. 주요 케이스는 필요 시 get_case_detail로 내용을 확인하세요.
+- 사용자가 자료(엑셀·표 등)를 첨부했다면 그 첨부가 자료 출처입니다. 첨부 내용으로
+  문서를 만들라는 요청에 케이스 DB 도구를 호출해 무관한 케이스 수치를 섞지 마세요.
+  케이스 이력이 함께 필요할 때만 도구를 쓰고, 어느 쪽 수치인지 문서에 밝히세요.
+- 모든 숫자는 도구 결과나 첨부 자료에 있는 값만 사용하세요. 추정하거나 지어내지 마세요.
 - 케이스를 언급할 때는 항상 C-번호를 표기하세요.
 - 구성: ## 제목(기간 명시) → 요약(2-3문장) → 전체 지표 → 벤더별 현황(표)
   → 주요 케이스(진행 중/최근 해결, 각 1-2줄) → 조치 필요 사항.
@@ -110,7 +154,21 @@ REPORT_SYSTEM_PROMPT = """당신은 Case-Flow(벤더 TAC 케이스 관리 시스
 - 사용자가 워드/엑셀/PPT/파일 형태를 요청하면 문서 스킬(docx/xlsx/pptx)로
   실제 파일을 생성하세요. 파일명은 영문으로 (예: caseflow_report_2026-07.docx).
 - 파일을 요청하지 않았으면 코드 실행 없이 채팅 답변으로만 작성하세요.
-- 파일을 만들었으면 채팅 답변에는 핵심 요약만 간단히 쓰세요 (본문은 파일에)."""
+- 파일을 만들었으면 채팅 답변에는 핵심 요약만 간단히 쓰세요 (본문은 파일에).
+- 코드 실행 중간 과정을 채팅 답변에 남기지 마세요 (예: "이제 확인해 보겠습니다").
+  사용자에게는 완성된 결과만 보이면 됩니다.
+
+비용 규칙 (반드시 지킬 것):
+- 만든 문서를 **이미지로 변환해 눈으로 확인하지 마세요**. LibreOffice·soffice 변환,
+  PDF 렌더링, 슬라이드 스크린샷을 읽어 들이는 작업을 하지 마세요. 이미지는 한 번
+  컨텍스트에 들어오면 이후 코드 실행이 반복될 때마다 다시 계산돼, 요청 한 건이
+  수백만 토큰까지 갑니다 (실측: 이 단계 하나로 비용이 10배 이상 뛰었습니다).
+- 레이아웃 점검이 필요하면 이미지 대신 **코드로 값을 재세요** — 문자열 길이,
+  표의 행 수, 도형 크기를 python 코드로 출력해 확인하면 비용이 거의 들지 않습니다.
+- 애초에 넘치지 않게 만드세요 — 슬라이드당 항목 수를 보수적으로 잡고,
+  긴 표는 여러 장으로 나누고, 폰트 크기와 여백을 넉넉히 두세요.
+- 파일을 저장했고 값이 맞으면 거기서 끝내고 답변을 작성하세요. 완성도를 더 높이려
+  코드 실행을 반복하지 마세요."""
 
 # 템플릿이 첨부된 요청에만 시스템 프롬프트에 덧붙인다.
 # 필드명을 나열하지 않는 이유: 템플릿 파일만 교체해도 동작하도록 {{...}} 규약 하나로 처리.
@@ -168,17 +226,28 @@ JSON만 출력하세요: {"ok": true} 또는 {"ok": false, "issues": ["문제 �
 
 # 트리아지: 명백한 리포트 요청은 규칙으로 즉시 분기 (LLM 호출 절약)
 # '템플릿' 포함: "C-1122 PPT 템플릿으로 만들어줘"처럼 보고서 단어가 없는 템플릿 요청 대비
+# 산출물 단어(파워포인트·슬라이드 등)도 포함 — 파일을 만들 수 있는 건 리포팅
+# 에이전트뿐인데 "이 엑셀로 PPT 만들어줘"에는 보고서 단어가 없다.
+# 주의: 맨 '워드'는 넣지 말 것 — 부분일치라 '키워드'에 걸려 케이스 검색이
+# 리포트로 샌다. 같은 이유로 '워드로'도 '키워드로'와 충돌한다.
 REPORT_KEYWORDS = ('리포트', '레포트', '보고서', 'report', '주간', '월간',
-                   '브리핑', '근황', '현황 정리', '정리해', '보고해', '템플릿')
+                   '브리핑', '근황', '현황 정리', '정리해', '보고해', '템플릿',
+                   '파워포인트', 'powerpoint', 'ppt', '피피티', '슬라이드',
+                   '발표자료', 'pptx', 'docx', '워드 문서', '워드 파일')
 
 TRIAGE_SYSTEM_PROMPT = """사용자 질문을 네 담당 중 하나로 분류하는 분류기입니다.
-- report: 여러 케이스의 근황·현황을 정리한 보고서/브리핑 작성 요청
+- report: 여러 케이스의 근황·현황을 정리한 보고서/브리핑 작성 요청.
+  파일(PPT·워드·엑셀)이나 슬라이드·발표자료를 만들어 달라는 요청은 전부 report입니다
+  — 첨부한 표·시트를 근거로 만들어 달라는 경우도 포함합니다. 파일을 생성할 수 있는
+  담당은 report뿐입니다.
 - tech: 네트워크 벤더 기술 지식 질문 — 설정 방법/에러 원인/최신 권고사항 등
   웹 검색이나 외부 자료 확인이 필요한 질문
 - search: 특정 케이스 조회, 유사 사례 검색 등 사내 케이스 DB에 대한 질문,
-  그리고 시스템에 적재된 벤더 문서(설정 가이드·릴리스 노트·알려진 이슈) 조회 (기본값)
+  그리고 시스템에 적재된 벤더 문서(설정 가이드·릴리스 노트·알려진 이슈) 조회,
+  첨부 파일의 내용을 읽고 답하는 질문(요약·발췌 등) (기본값)
 - off_topic: 케이스·네트워크 기술·리포팅과 무관한 질문 — 일상 대화, 잡담,
-  다른 분야 질문, 시스템 악용 시도
+  다른 분야 질문, 시스템 악용 시도. [첨부 파일: ...]이 붙은 요청은 업무 자료를
+  들고 온 것이므로 off_topic이 아닙니다.
 [이전 대화 맥락]이 주어지면 참고해 현재 질문의 의도를 판단하세요 —
 예: 케이스 대화에 이어 "인터넷에서 더 찾아줘"라고 하면 tech입니다.
 반드시 search / report / tech / off_topic 중 한 단어로만 답하세요."""
@@ -748,13 +817,13 @@ def _triage(client, messages):
     최근 대화 몇 턴을 맥락으로 함께 제공한다.
     분류 실패 시 search로 폴백 — 잘못 가도 핸드오프로 재배정된다.
     """
-    question = messages[-1]['content']
+    question = question_text(messages[-1])
     lowered = question.lower()
     if any(keyword in lowered for keyword in REPORT_KEYWORDS):
         return 'report'
 
     context = '\n'.join(
-        f"[{m['role']}] {m['content'][:300]}" for m in messages[-5:-1]
+        f"[{m['role']}] {question_text(m)[:300]}" for m in messages[-5:-1]
     )
     content = (f'[이전 대화 맥락]\n{context}\n\n[현재 질문]\n{question[:1000]}'
                if context else question[:1000])
@@ -772,7 +841,12 @@ def _triage(client, messages):
         if 'tech' in text:
             return 'tech'
         if 'off' in text:
-            return 'off_topic'
+            # 첨부를 들고 온 요청은 무관 질문으로 취급하지 않는다. 오분류되면
+            # 에이전트를 부르지도 않고 고정 안내가 나가 기능이 없는 것처럼 보인다
+            # ("첨부한 표를 워드 문서로 만들어줘"가 실제로 off_topic으로 샜음).
+            # 반대로 잘못 통과시켜도 에이전트의 SCOPE_GUARD가 정중히 안내하고 끝나
+            # 손해가 훨씬 작다.
+            return 'search' if messages[-1].get('attachments') else 'off_topic'
         return 'search'
     except anthropic.APIError:
         logger.warning('help agent triage failed; defaulting to search', exc_info=True)
@@ -810,6 +884,216 @@ def _evaluate_tech_reply(client, question, evidence, reply):
     except (anthropic.APIError, ValueError):
         logger.warning('tech evaluator failed; skipping review', exc_info=True)
         return {'ok': True}
+
+
+class AttachmentRejected(ValueError):
+    """첨부를 받을 수 없는 이유 — 문구를 그대로 사용자에게 보여준다."""
+
+
+def _extract_docx(data):
+    """워드에서 문단·표 텍스트를 문서에 나온 순서대로 뽑는다.
+
+    python-docx의 paragraphs/tables 목록을 따로 훑으면 표가 전부 뒤로 몰려
+    맥락이 끊기므로, body 자식을 직접 순회해 원래 순서를 지킨다.
+    """
+    from docx import Document
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    document = Document(BytesIO(data))
+    parts = []
+    for child in document.element.body.iterchildren():
+        if child.tag.endswith('}p'):
+            text = Paragraph(child, document).text.strip()
+            if text:
+                parts.append(text)
+        elif child.tag.endswith('}tbl'):
+            for row in Table(child, document).rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                if any(cells):
+                    parts.append(' | '.join(cells))
+    return '\n'.join(parts)
+
+
+def _extract_xlsx(data):
+    """엑셀에서 시트별로 값이 있는 행만 뽑는다.
+
+    data_only=True는 수식 대신 계산된 값을 준다 — 엔지니어가 읽고 싶은 건
+    수식이 아니라 결과값이다. 다만 엑셀로 한 번도 연 적 없는 파일은 캐시된
+    값이 없어 빈 칸으로 나올 수 있다.
+    """
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(BytesIO(data), read_only=True, data_only=True)
+    try:
+        parts = []
+        for sheet in workbook.worksheets:
+            rows = []
+            for row in sheet.iter_rows(values_only=True):
+                cells = ['' if v is None else str(v).strip() for v in row]
+                if any(cells):
+                    rows.append(' | '.join(cells).rstrip(' |'))
+            if rows:
+                parts.append(f'[시트: {sheet.title}]')
+                parts.extend(rows)
+        return '\n'.join(parts)
+    finally:
+        workbook.close()
+
+
+# 오피스 문서는 document 블록이 거부한다(API: "Only PDF and plaintext documents
+# are supported"). 코드 실행 컨테이너로 읽히기는 하지만 파일 하나에 2만 토큰쯤
+# 들어서, 서버에서 본문만 뽑아 평문으로 올린다 — 서식·이미지는 잃는 대신
+# 비용이 1/20 수준이고 채팅으로 묻는 용도에는 내용이면 충분하다.
+OFFICE_EXTRACTORS = {'.docx': _extract_docx, '.xlsx': _extract_xlsx}
+
+
+def _office_to_text(extension, name, data):
+    """오피스 문서를 평문 bytes로 변환. 실패·빈 결과는 AttachmentRejected."""
+    try:
+        text = OFFICE_EXTRACTORS[extension](data)
+    except Exception:
+        logger.warning('office attachment parse failed: %s', name, exc_info=True)
+        raise AttachmentRejected(
+            '파일을 읽을 수 없습니다. 손상되었거나 암호가 걸린 문서일 수 있습니다.')
+
+    text = text.replace('\x00', '').strip()  # NUL은 일부 저장 경로에서 터진다
+    if not text:
+        raise AttachmentRejected(
+            '문서에서 텍스트를 찾지 못했습니다. 이미지로만 된 문서라면 '
+            '화면을 캡처해 이미지로 첨부해주세요.')
+    if len(text) > MAX_EXTRACTED_CHARS:
+        text = (text[:MAX_EXTRACTED_CHARS]
+                + f'\n\n[이하 생략 — 전체 {len(text):,}자 중 앞 '
+                  f'{MAX_EXTRACTED_CHARS:,}자만 첨부했습니다]')
+    # 모델이 원본이 무엇이었는지 알도록 출처를 머리말로 남긴다
+    return f'[{name}에서 추출한 텍스트]\n\n{text}'.encode('utf-8')
+
+
+def upload_attachment(filename, data):
+    """사용자 첨부를 Files API에 올리고 메시지에 실을 메타데이터를 반환한다.
+
+    워드·엑셀은 여기서 평문으로 변환해 올린다(converted=True) — 사용자에게는
+    원래 파일명·크기를 그대로 돌려주고, 모델에는 추출한 텍스트가 간다.
+    반환: {'file_id', 'filename', 'kind', 'size_bytes', 'converted'}
+    거부 사유(형식·크기·빈 파일·해독 실패)는 AttachmentRejected로 알린다.
+    """
+    if not settings.ANTHROPIC_API_KEY:
+        raise RuntimeError('ANTHROPIC_API_KEY가 설정되지 않았습니다.')
+
+    name = (filename or '').strip() or 'attachment'
+    extension = os.path.splitext(name)[1].lower()
+    if extension not in ATTACHMENT_TYPES:
+        allowed = ', '.join(sorted(ATTACHMENT_TYPES))
+        raise AttachmentRejected(f'지원하지 않는 형식입니다. 가능한 형식: {allowed}')
+    if not data:
+        raise AttachmentRejected('빈 파일은 첨부할 수 없습니다.')
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        limit_mb = MAX_ATTACHMENT_BYTES // (1024 * 1024)
+        raise AttachmentRejected(f'파일이 너무 큽니다. {limit_mb}MB 이하만 첨부할 수 있습니다.')
+
+    mime, kind = ATTACHMENT_TYPES[extension]
+    original_size = len(data)
+    converted = extension in OFFICE_EXTRACTORS
+    upload_name = name
+    if converted:
+        data = _office_to_text(extension, name, data)
+        upload_name = f'{name}.txt'  # 올라가는 실체가 텍스트임을 이름에도 남긴다
+
+    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    uploaded = client.beta.files.upload(file=(upload_name, BytesIO(data), mime))
+    logger.info('chat attachment uploaded: %s (%s, %d bytes%s) -> %s',
+                name, kind, original_size,
+                f', 텍스트 {len(data)} bytes로 변환' if converted else '',
+                uploaded.id)
+    return {'file_id': uploaded.id, 'filename': name, 'kind': kind,
+            'size_bytes': original_size, 'converted': converted}
+
+
+def delete_files(file_ids):
+    """Files API에서 파일을 지운다. 실패는 로그만 남긴다 — 정리 작업이므로
+    호출자(세션 삭제 등)의 성공 여부를 좌우해선 안 된다."""
+    if not settings.ANTHROPIC_API_KEY:
+        return
+    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    for file_id in dict.fromkeys(file_ids):  # 순서 유지 중복 제거
+        try:
+            client.beta.files.delete(file_id)
+        except anthropic.APIError:
+            logger.warning('chat attachment delete failed: %s', file_id, exc_info=True)
+
+
+def message_text(message):
+    """메시지에서 텍스트만 뽑는다. content는 문자열일 수도, 블록 배열일 수도 있다."""
+    content = message.get('content')
+    if isinstance(content, str):
+        return content
+    return ' '.join(
+        block.get('text', '') for block in content or []
+        if isinstance(block, dict) and block.get('type') == 'text'
+    ).strip()
+
+
+def question_text(message):
+    """트리아지·사용 로그·세션 제목에 쓸 질문 문구.
+
+    첨부만 올리고 본문을 비워도(스크린샷 한 장 던지는 흔한 사용) 분류와
+    제목이 비지 않도록 파일명 표시를 대신 쓴다.
+    """
+    text = message_text(message)
+    attachments = message.get('attachments') or []
+    if not attachments:
+        return text
+    note = _attachment_note(attachments)
+    return f'{text}\n{note}' if text else note
+
+
+def _attachment_note(attachments):
+    """첨부 파일명을 텍스트로. 모델이 무엇이 붙었는지 알게 하고, 오래된 턴에서는
+    실제 파일 대신 이 표시만 남긴다."""
+    names = ', '.join(a.get('filename') or '?' for a in attachments)
+    return f'[첨부 파일: {names}]'
+
+
+def _attachment_block(attachment):
+    """첨부 1개를 content 블록으로. kind나 file_id가 없으면 None (건너뛴다)."""
+    kind = attachment.get('kind')
+    file_id = attachment.get('file_id')
+    if kind not in ('image', 'document') or not file_id:
+        return None
+    return {'type': kind, 'source': {'type': 'file', 'file_id': file_id}}
+
+
+def _expand_attachments(messages):
+    """첨부가 달린 메시지를 content 블록 배열로 바꾼 새 목록을 반환.
+
+    최근 MAX_ATTACHMENT_MESSAGES개 사용자 메시지의 첨부만 실제 파일로 싣고,
+    그보다 오래된 첨부는 파일명 표시만 남겨 재과금을 막는다.
+    반환: (변환된 메시지 목록, 실제 파일을 실었는지 여부)
+    """
+    attached_at = [i for i, m in enumerate(messages)
+                   if m.get('role') == 'user' and m.get('attachments')]
+    live = set(attached_at[-MAX_ATTACHMENT_MESSAGES:])
+
+    expanded = []
+    has_files = False
+    for index, message in enumerate(messages):
+        attachments = (message.get('attachments') or []
+                       if message.get('role') == 'user' else [])
+        if not attachments:
+            expanded.append({'role': message['role'], 'content': message['content']})
+            continue
+
+        text = f"{message_text(message)}\n\n{_attachment_note(attachments)}".strip()
+        blocks = ([b for b in map(_attachment_block, attachments) if b]
+                  if index in live else [])
+        if not blocks:  # 오래된 턴이거나 해석할 수 없는 첨부 → 파일명 표시만
+            expanded.append({'role': 'user', 'content': text})
+            continue
+        has_files = True
+        expanded.append({'role': 'user',
+                         'content': blocks + [{'type': 'text', 'text': text}]})
+    return expanded, has_files
 
 
 def _match_template(question):
@@ -861,8 +1145,7 @@ def _attach_template(client, convo):
     반환: 시스템 프롬프트에 덧붙일 템플릿 규칙 ('' 이면 템플릿 미사용).
     업로드 실패 시 템플릿 없이 일반 리포트로 진행한다 (500 대신 품질 저하 선택).
     """
-    question = convo[-1]['content']
-    template_key = _match_template(question) if isinstance(question, str) else None
+    template_key = _match_template(message_text(convo[-1]))
     if not template_key:
         return ''
     try:
@@ -870,12 +1153,13 @@ def _attach_template(client, convo):
     except (anthropic.APIError, OSError):
         logger.exception('report template attach failed: %s', template_key)
         return ''
+    # 사용자 첨부가 이미 블록으로 들어와 있을 수 있으므로 덮어쓰지 않고 앞에 붙인다
+    existing = convo[-1]['content']
+    blocks = (list(existing) if isinstance(existing, list)
+              else [{'type': 'text', 'text': existing}])
     convo[-1] = {
         'role': 'user',
-        'content': [
-            {'type': 'container_upload', 'file_id': file_id},
-            {'type': 'text', 'text': question},
-        ],
+        'content': [{'type': 'container_upload', 'file_id': file_id}] + blocks,
     }
     return TEMPLATE_SYSTEM_ADDENDUM
 
@@ -921,6 +1205,24 @@ def _describe_files(client, file_ids):
     return files
 
 
+def _final_text(content):
+    """응답에서 최종 답변만 뽑는다 — 마지막 도구 결과 이후의 텍스트.
+
+    코드 실행 중간에 모델이 남기는 진행 메모("Now visual QA...")가 앞쪽 텍스트
+    블록으로 섞여 나오는데, 전부 이어 붙이면 답변 머리에 영어 작업 로그가 붙는다
+    (실측 확인, 프롬프트로 막으려 했으나 계속 새어 나옴).
+    텍스트가 도구 결과보다 앞에만 있으면 그것이 답변이므로 전부 사용한다.
+    """
+    tail = []
+    for block in reversed(content):
+        if block.type != 'text':
+            break
+        tail.append(block.text)
+    if not tail:
+        return ''.join(b.text for b in content if b.type == 'text').strip()
+    return ''.join(reversed(tail)).strip()
+
+
 def _noop_event(*_args, **_kwargs):
     """on_event 기본값 — 진행 상황을 아무 데도 흘리지 않는다(기존 동작)."""
 
@@ -933,7 +1235,8 @@ def _run_agent(client, agent, messages, on_event=_noop_event):
     반환: (reply, tool_trace, evaluation, files)
     """
     config = _agent_configs()[agent]
-    convo = list(messages[-MAX_HISTORY_MESSAGES:])
+    # 첨부가 있으면 content가 블록 배열이 되고 Files API 베타가 필요해진다
+    convo, has_attachments = _expand_attachments(messages[-MAX_HISTORY_MESSAGES:])
     tool_trace = []
     evidence = []  # 도구가 수집한 근거 (tech 평가자 입력)
     file_ids = []  # 코드 실행이 생성한 파일 (리포팅 문서 스킬)
@@ -945,13 +1248,19 @@ def _run_agent(client, agent, messages, on_event=_noop_event):
         # 사용자가 워딩으로 사내 템플릿을 지목한 요청만 템플릿 파일을 첨부
         system_prompt += _attach_template(client, convo)
 
+    betas = (DOCUMENT_BETAS if use_skills else []) + ([FILES_BETA] if has_attachments else [])
+    if use_skills:
         def create(**kwargs):
             return client.beta.messages.create(
-                betas=DOCUMENT_BETAS,
+                betas=betas,
                 container={'skills': DOCUMENT_SKILLS},
                 **kwargs,
             )
+    elif betas:
+        def create(**kwargs):
+            return client.beta.messages.create(betas=betas, **kwargs)
     else:
+        # 첨부도 스킬도 없으면 기존 그대로 정식 엔드포인트를 쓴다
         create = client.messages.create
 
     response = None
@@ -1021,14 +1330,14 @@ def _run_agent(client, agent, messages, on_event=_noop_event):
             # 마무리 호출까지 실패하면 기존 폴백 문구 경로로 둔다
             logger.warning('help agent wrap-up call failed', exc_info=True)
 
-    reply = ''.join(b.text for b in response.content if b.type == 'text').strip()
+    reply = _final_text(response.content)
     files = _describe_files(client, file_ids) if file_ids else []
 
     # ② 기술지원만 평가자 검수 — 미흡하면 1회 수정 라운드 (비용 상한 고정).
     # 핸드오프 마커가 나온 답변은 재배정될 것이므로 검수하지 않는다.
     evaluation = None
     if agent == 'tech' and reply and not RE_HANDOFF.search(reply):
-        question = messages[-1]['content']
+        question = question_text(messages[-1])
         on_event('step', {'phase': 'evaluating'})
         evaluation = _evaluate_tech_reply(client, question, evidence, reply)
         if not evaluation.get('ok'):
@@ -1042,7 +1351,9 @@ def _run_agent(client, agent, messages, on_event=_noop_event):
                             '근거 없는 주장은 제거하거나 일반 지식임을 명시하고, '
                             '기술적 주장에는 출처 URL을 인용하세요.'),
             })
-            revision = client.messages.create(
+            # convo에 첨부 블록이 남아 있을 수 있으므로 같은 create를 쓴다
+            # (베타 헤더 없이 file 참조를 보내면 거부된다)
+            revision = create(
                 model=config['model'],
                 max_tokens=config.get('max_tokens', 4096),
                 system=config['system'],
@@ -1057,7 +1368,10 @@ def _run_agent(client, agent, messages, on_event=_noop_event):
 
 
 def chat(messages, on_event=_noop_event):
-    """user/assistant 텍스트 턴 목록을 받아 트리아지 후 에이전트 루프를 실행.
+    """user/assistant 턴 목록을 받아 트리아지 후 에이전트 루프를 실행.
+
+    user 턴에는 attachments([{'file_id','filename','kind',...}])가 붙을 수 있고,
+    최근 턴의 첨부만 실제 파일로 모델에 전달된다 (_expand_attachments).
 
     에이전트가 [HANDOFF:담당] 마커를 출력하면(자기 범위지만 담당이 다른 질문 —
     예: 검색 에이전트에게 온 웹 검색 요청) 해당 에이전트로 1회 재배정한다.

@@ -38,6 +38,8 @@ urlpatterns = [
     path('help-agent/chat/', views.HelpAgentChatView.as_view(), name='help-agent-chat'),
     path('help-agent/chat/stream/', views.HelpAgentChatStreamView.as_view(),
          name='help-agent-chat-stream'),
+    path('help-agent/attachments/', views.HelpAgentAttachmentView.as_view(),
+         name='help-agent-attachments'),
     path('help-agent/sessions/', views.ChatSessionListView.as_view(),
          name='help-agent-sessions'),
     path('help-agent/sessions/<int:session_id>/', views.ChatSessionDetailView.as_view(),

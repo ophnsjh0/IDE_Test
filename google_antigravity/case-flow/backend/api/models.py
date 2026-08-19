@@ -233,6 +233,10 @@ class ChatTurn(models.Model):
     model = models.CharField(max_length=100, blank=True, default='')
     tool_calls = models.JSONField(default=list, blank=True)  # [{'name', 'input'}]
     files = models.JSONField(default=list, blank=True)  # 리포트 문서 메타
+    # 사용자가 붙인 첨부 [{'file_id', 'filename', 'kind', 'size_bytes'}].
+    # 원본은 Anthropic Files API에 있고 여기엔 참조만 남는다 — 세션을 지우면
+    # 원본도 함께 지운다 (views.ChatSessionDetailView.delete).
+    attachments = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

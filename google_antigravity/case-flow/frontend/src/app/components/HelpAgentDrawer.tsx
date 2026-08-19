@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import {
   ActionIcon,
   Affix,
+  Badge,
   Box,
   Button,
   Drawer,
@@ -26,7 +27,11 @@ import {
   IconCheck,
   IconHistory,
   IconMessagePlus,
+  IconPaperclip,
+  IconPhoto,
+  IconFileText,
   IconTrash,
+  IconX,
 } from '@tabler/icons-react';
 import { apiFetch } from '../lib/api';
 import classes from './HelpAgentWidget.module.css';
@@ -37,12 +42,23 @@ interface GeneratedFile {
   size_bytes: number;
 }
 
+// 사용자가 질문에 붙인 파일 (스크린샷·설정 파일·벤더 PDF).
+// 원본은 서버가 Anthropic Files API에 올려두고 여기엔 참조만 오간다.
+interface Attachment {
+  file_id: string;
+  filename: string;
+  kind: 'image' | 'document';
+  size_bytes: number;
+  converted?: boolean; // 워드·엑셀은 서버가 본문 텍스트만 뽑아 전달한다
+}
+
 interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   toolNote?: string; // 답변 근거로 사용한 도구 호출 표시
   agent?: string; // 트리아지가 배정한 담당 에이전트 (search | report)
   files?: GeneratedFile[]; // 리포팅 에이전트가 생성한 문서 (워드/엑셀/PPT)
+  attachments?: Attachment[]; // 사용자가 이 질문에 붙인 파일
 }
 
 interface SessionSummary {
@@ -58,6 +74,7 @@ interface SessionTurn {
   agent?: string;
   tool_calls?: { name: string }[];
   files?: GeneratedFile[];
+  attachments?: Attachment[];
 }
 
 const AGENT_LABELS: Record<string, string> = {
@@ -114,6 +131,13 @@ const SUGGESTIONS = [
 // Drawer 기본 너비(px) — Mantine size="md"와 동일. 드래그 시 이 값 미만으로는 줄지 않는다.
 const DRAWER_DEFAULT_WIDTH = 440;
 
+// 첨부 가능한 확장자·개수는 서버(help_agent.ATTACHMENT_TYPES,
+// HelpAgentChatView.MAX_ATTACHMENTS)와 맞춰야 한다. 여기 값은 파일 선택
+// 대화상자를 좁혀주는 힌트일 뿐이고, 실제 거부는 서버가 한다.
+const ATTACHMENT_ACCEPT =
+  '.png,.jpg,.jpeg,.gif,.webp,.pdf,.txt,.log,.cfg,.conf,.csv,.docx,.xlsx';
+const MAX_ATTACHMENTS = 5;
+
 // AI 도우미 런처 + 채팅 Drawer를 묶은 위젯.
 // variant='inline'  : 페이지 레이아웃 안에 일반 버튼으로 배치 (리스트 페이지)
 // variant='floating': 화면 우측 하단 고정 네모 버튼 (그 외 페이지)
@@ -135,6 +159,11 @@ export default function HelpAgentWidget({
   // 지식 추출: 세션당 1회 — 성공하면 K-번호를 기억해 버튼을 완료 표시로 바꾼다
   const [extracting, setExtracting] = useState(false);
   const [extractedId, setExtractedId] = useState<string | null>(null);
+  // 다음 질문에 함께 보낼 첨부 — 선택 즉시 업로드해 file_id를 받아둔다
+  const [pendingFiles, setPendingFiles] = useState<Attachment[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
 
   // 좌측 가장자리 드래그로 너비 조절 — 표 등 긴 내용을 볼 때 넓혀 쓴다
@@ -166,12 +195,57 @@ export default function HelpAgentWidget({
     });
   }, [messages, loading]);
 
+  // 파일을 고르면 곧바로 서버에 올려 file_id를 받아둔다. 질문을 보낼 때
+  // 업로드를 시작하면 대기 시간이 답변 지연처럼 보이기 때문.
+  const uploadFiles = async (selected: FileList | null) => {
+    if (!selected || selected.length === 0) return;
+    setUploadError('');
+    const room = MAX_ATTACHMENTS - pendingFiles.length;
+    if (room <= 0) {
+      setUploadError(`첨부는 질문당 ${MAX_ATTACHMENTS}개까지 올릴 수 있어요.`);
+      return;
+    }
+    setUploading(true);
+    try {
+      for (const file of Array.from(selected).slice(0, room)) {
+        const form = new FormData();
+        form.append('file', file);
+        // Content-Type은 지정하지 않는다 — 브라우저가 multipart 경계를 붙여야 한다
+        const res = await apiFetch('/api/help-agent/attachments/', {
+          method: 'POST',
+          body: form,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        setPendingFiles((prev) => [...prev, data as Attachment]);
+      }
+    } catch (e) {
+      setUploadError(`첨부 실패: ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const removePendingFile = (fileId: string) =>
+    setPendingFiles((prev) => prev.filter((f) => f.file_id !== fileId));
+
   const send = async (text?: string) => {
     const question = (text ?? input).trim();
-    if (!question || loading) return;
-    const history = [...messages, { role: 'user' as const, content: question }];
+    // 제안 버튼으로 보내는 질문에는 첨부를 싣지 않는다 (사용자가 의도한 조합이 아님)
+    const attached = text ? [] : pendingFiles;
+    if ((!question && attached.length === 0) || loading || uploading) return;
+    const history = [
+      ...messages,
+      {
+        role: 'user' as const,
+        content: question,
+        ...(attached.length ? { attachments: attached } : {}),
+      },
+    ];
     setMessages(history);
     setInput('');
+    setPendingFiles([]);
+    setUploadError('');
     setLoading(true);
     setProgress('질문을 분석하고 있습니다');
     try {
@@ -179,7 +253,11 @@ export default function HelpAgentWidget({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          messages: history.map(({ role, content }) => ({ role, content })),
+          messages: history.map((m) => ({
+            role: m.role,
+            content: m.content,
+            ...(m.attachments?.length ? { attachments: m.attachments } : {}),
+          })),
           session_id: sessionId,
         }),
       });
@@ -280,6 +358,8 @@ export default function HelpAgentWidget({
     setMessages([]);
     setSessionId(null);
     setExtractedId(null);
+    setPendingFiles([]);
+    setUploadError('');
     setView('chat');
   };
 
@@ -341,10 +421,13 @@ export default function HelpAgentWidget({
           agent: t.agent || undefined,
           toolNote: toolNoteOf(t.tool_calls),
           files: t.files?.length ? t.files : undefined,
+          attachments: t.attachments?.length ? t.attachments : undefined,
         })),
       );
       setSessionId(id);
       setExtractedId(null);
+      setPendingFiles([]);
+      setUploadError('');
       setView('chat');
     } catch {
       setView('chat');
@@ -488,6 +571,7 @@ export default function HelpAgentWidget({
                 <Text size="sm" fw={600} mb={4}>무엇을 도와드릴까요?</Text>
                 <Text size="xs" c="dimmed" mb="sm">
                   케이스 이력·유사 사례·현황을 DB에서 찾아 근거와 함께 답해드려요.
+                  장비 화면 캡처, 설정 파일, PDF·워드·엑셀을 첨부해 물어보셔도 됩니다.
                 </Text>
                 <Group gap={6}>
                   {SUGGESTIONS.map((s) => (
@@ -529,14 +613,33 @@ export default function HelpAgentWidget({
                       </Text>
                     </Group>
                   )}
-                  <div className={m.role === 'user' ? classes.bubbleUser : classes.bubbleAssistant}>
-                    <Text
-                      size="sm"
-                      style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', color: 'inherit' }}
-                    >
-                      {m.content}
-                    </Text>
-                  </div>
+                  {m.content && (
+                    <div className={m.role === 'user' ? classes.bubbleUser : classes.bubbleAssistant}>
+                      <Text
+                        size="sm"
+                        style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', color: 'inherit' }}
+                      >
+                        {m.content}
+                      </Text>
+                    </div>
+                  )}
+                  {m.attachments && m.attachments.length > 0 && (
+                    <Group gap={6} mt={6} justify="flex-end">
+                      {m.attachments.map((a) => (
+                        <Badge
+                          key={a.file_id}
+                          size="sm"
+                          variant="light"
+                          color="gray"
+                          leftSection={
+                            a.kind === 'image' ? <IconPhoto size={11} /> : <IconFileText size={11} />
+                          }
+                        >
+                          {a.filename}
+                        </Badge>
+                      ))}
+                    </Group>
+                  )}
                   {m.files && m.files.length > 0 && (
                     <Stack gap={6} mt={8}>
                       {m.files.map((f) => (
@@ -601,12 +704,78 @@ export default function HelpAgentWidget({
             </Button>
           )}
 
+          {/* 첨부 대기 목록 — 보내기 전까지 여기서 확인·제거할 수 있다 */}
+          {(pendingFiles.length > 0 || uploading || uploadError) && (
+            <Group gap={6} px={4}>
+              {pendingFiles.map((f) => (
+                <Badge
+                  key={f.file_id}
+                  size="sm"
+                  variant="light"
+                  leftSection={
+                    f.kind === 'image' ? <IconPhoto size={11} /> : <IconFileText size={11} />
+                  }
+                  rightSection={
+                    <ActionIcon
+                      size={14}
+                      variant="transparent"
+                      color="gray"
+                      onClick={() => removePendingFile(f.file_id)}
+                      aria-label={`${f.filename} 첨부 제거`}
+                    >
+                      <IconX size={11} />
+                    </ActionIcon>
+                  }
+                >
+                  {f.filename}
+                </Badge>
+              ))}
+              {uploading && (
+                <Group gap={4}>
+                  <Loader size={12} />
+                  <Text size="xs" c="dimmed">첨부 올리는 중...</Text>
+                </Group>
+              )}
+              {/* 워드·엑셀은 본문만 전달되므로 표 서식·이미지가 빠진다는 걸 미리 알린다 */}
+              {pendingFiles.some((f) => f.converted) && (
+                <Text size="xs" c="dimmed" w="100%">
+                  워드·엑셀은 본문 텍스트만 전달됩니다 (서식·이미지 제외).
+                </Text>
+              )}
+              {uploadError && <Text size="xs" c="red">{uploadError}</Text>}
+            </Group>
+          )}
+
           <div className={classes.inputWrap}>
             <Group gap="xs" align="flex-end">
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept={ATTACHMENT_ACCEPT}
+                style={{ display: 'none' }}
+                onChange={(e) => {
+                  uploadFiles(e.currentTarget.files);
+                  e.currentTarget.value = ''; // 같은 파일을 다시 골라도 이벤트가 오게
+                }}
+              />
+              <Tooltip label="스크린샷·설정 파일·PDF 첨부" position="top">
+                <ActionIcon
+                  size="lg"
+                  radius="md"
+                  variant="subtle"
+                  color="gray"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={loading || uploading || pendingFiles.length >= MAX_ATTACHMENTS}
+                  aria-label="파일 첨부"
+                >
+                  <IconPaperclip size={18} />
+                </ActionIcon>
+              </Tooltip>
               <Textarea
                 style={{ flex: 1 }}
                 variant="unstyled"
-                placeholder="케이스에 대해 물어보세요"
+                placeholder="케이스에 대해 물어보세요 (스크린샷·문서 첨부 가능)"
                 autosize
                 minRows={1}
                 maxRows={4}
@@ -625,7 +794,7 @@ export default function HelpAgentWidget({
                 variant="gradient"
                 gradient={{ from: 'blue', to: 'violet', deg: 135 }}
                 onClick={() => send()}
-                disabled={!input.trim() || loading}
+                disabled={(!input.trim() && pendingFiles.length === 0) || loading || uploading}
                 aria-label="질문 보내기"
               >
                 <IconSend size={18} />

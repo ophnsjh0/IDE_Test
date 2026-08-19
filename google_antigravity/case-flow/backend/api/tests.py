@@ -1,7 +1,7 @@
 import json
 import tempfile
 from datetime import timedelta
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import anthropic
 
 from django.contrib.auth.models import User
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
@@ -665,6 +666,440 @@ class HelpAgentToolLoopTests(TestCase):
         reply, _, _, _ = help_agent._run_agent(
             client, 'search', [{'role': 'user', 'content': '질문'}])
         self.assertEqual(reply, '')  # chat()에서 안내 문구로 대체된다
+
+
+class ChatAttachmentTests(TestCase):
+    """첨부(멀티모달): 블록 변환·업로드 검증·저장·삭제."""
+
+    IMAGE = {'file_id': 'file_img1', 'filename': 'err.png',
+             'kind': 'image', 'size_bytes': 1024}
+    PDF = {'file_id': 'file_doc1', 'filename': 'guide.pdf',
+           'kind': 'document', 'size_bytes': 2048}
+
+    def test_recent_attachment_becomes_file_block(self):
+        messages = [{'role': 'user', 'content': '이 에러 뭔가요',
+                     'attachments': [self.IMAGE]}]
+        expanded, has_files = help_agent._expand_attachments(messages)
+
+        self.assertTrue(has_files)
+        blocks = expanded[0]['content']
+        self.assertEqual(blocks[0], {'type': 'image',
+                                     'source': {'type': 'file', 'file_id': 'file_img1'}})
+        self.assertEqual(blocks[1]['type'], 'text')
+        self.assertIn('err.png', blocks[1]['text'])
+
+    def test_pdf_uses_document_block(self):
+        expanded, _ = help_agent._expand_attachments(
+            [{'role': 'user', 'content': '요약해줘', 'attachments': [self.PDF]}])
+        self.assertEqual(expanded[0]['content'][0]['type'], 'document')
+
+    def test_old_attachments_degrade_to_filename_note(self):
+        """오래된 첨부는 파일을 다시 올리지 않는다 — 이력이 길어져도 재과금 없음."""
+        messages = [
+            {'role': 'user', 'content': f'질문{i}', 'attachments': [dict(
+                self.IMAGE, file_id=f'file_{i}', filename=f'shot{i}.png')]}
+            for i in range(help_agent.MAX_ATTACHMENT_MESSAGES + 2)
+        ]
+        expanded, _ = help_agent._expand_attachments(messages)
+
+        live = [m for m in expanded if isinstance(m['content'], list)]
+        self.assertEqual(len(live), help_agent.MAX_ATTACHMENT_MESSAGES)
+        # 잘려나간 오래된 턴은 파일명 표시만 텍스트로 남는다
+        self.assertIsInstance(expanded[0]['content'], str)
+        self.assertIn('shot0.png', expanded[0]['content'])
+
+    def test_messages_without_attachments_are_untouched(self):
+        messages = [{'role': 'user', 'content': '평범한 질문'}]
+        expanded, has_files = help_agent._expand_attachments(messages)
+        self.assertFalse(has_files)
+        self.assertEqual(expanded, messages)
+
+    def test_question_text_falls_back_to_filenames(self):
+        """본문 없이 스크린샷만 올려도 분류·제목이 비지 않아야 한다."""
+        text = help_agent.question_text(
+            {'role': 'user', 'content': '', 'attachments': [self.IMAGE]})
+        self.assertIn('err.png', text)
+
+    def test_upload_rejects_unsupported_extension(self):
+        with self.assertRaises(help_agent.AttachmentRejected):
+            help_agent.upload_attachment('config.exe', b'data')
+
+    def test_upload_rejects_oversized_file(self):
+        oversized = b'x' * (help_agent.MAX_ATTACHMENT_BYTES + 1)
+        with self.assertRaises(help_agent.AttachmentRejected):
+            help_agent.upload_attachment('shot.png', oversized)
+
+    @override_settings(ANTHROPIC_API_KEY='test-key')
+    def test_upload_returns_metadata(self):
+        client = MagicMock()
+        client.beta.files.upload.return_value = SimpleNamespace(id='file_new')
+        with patch('api.services.help_agent.anthropic.Anthropic', return_value=client):
+            meta = help_agent.upload_attachment('shot.PNG', b'binary')
+
+        self.assertEqual(meta, {'file_id': 'file_new', 'filename': 'shot.PNG',
+                                'kind': 'image', 'size_bytes': 6,
+                                'converted': False})
+
+    def test_attachment_beta_header_only_when_files_present(self):
+        """첨부가 없으면 기존처럼 정식 엔드포인트를 쓴다 (베타 의존 최소화)."""
+        beta_calls, plain_calls = [], []
+        answer = SimpleNamespace(
+            stop_reason='end_turn',
+            content=[SimpleNamespace(type='text', text='답변')])
+        client = SimpleNamespace(
+            messages=SimpleNamespace(
+                create=lambda **kw: (plain_calls.append(kw), answer)[1]),
+            beta=SimpleNamespace(messages=SimpleNamespace(
+                create=lambda **kw: (beta_calls.append(kw), answer)[1])))
+
+        help_agent._run_agent(client, 'search', [{'role': 'user', 'content': '질문'}])
+        self.assertEqual((len(plain_calls), len(beta_calls)), (1, 0))
+
+        help_agent._run_agent(client, 'search', [
+            {'role': 'user', 'content': '이 화면 봐줘', 'attachments': [self.IMAGE]}])
+        self.assertEqual(len(beta_calls), 1)
+        self.assertEqual(beta_calls[0]['betas'], [help_agent.FILES_BETA])
+
+
+class ChatAttachmentApiTests(TestCase):
+    """첨부가 붙은 채팅 요청의 검증·저장·정리."""
+
+    FAKE_RESULT = {'reply': '답변', 'tool_calls': [], 'model': 'm', 'agent': 'search'}
+    IMAGE = {'file_id': 'file_img1', 'filename': 'err.png',
+             'kind': 'image', 'size_bytes': 1024}
+
+    def setUp(self):
+        from .permissions import set_user_role
+        user = User.objects.create_user('e1', password='role-pass-123!')
+        set_user_role(user, 'engineer')
+        self.client.post('/api/auth/login/',
+                         {'username': 'e1', 'password': 'role-pass-123!'},
+                         content_type='application/json')
+
+    def chat(self, message):
+        with patch('api.views.help_agent.chat', return_value=dict(self.FAKE_RESULT)):
+            return self.client.post('/api/help-agent/chat/',
+                                    {'messages': [message]},
+                                    content_type='application/json')
+
+    def test_attachment_only_message_is_accepted_and_stored(self):
+        from .models import ChatTurn
+        response = self.chat({'role': 'user', 'content': '',
+                              'attachments': [self.IMAGE]})
+        self.assertEqual(response.status_code, 200)
+
+        turn = ChatTurn.objects.get(session_id=response.json()['session_id'],
+                                    role='user')
+        self.assertEqual(turn.attachments, [self.IMAGE])
+
+    def test_empty_message_without_attachment_is_rejected(self):
+        response = self.chat({'role': 'user', 'content': '   '})
+        self.assertEqual(response.status_code, 400)
+
+    def test_malformed_attachment_is_rejected(self):
+        response = self.chat({'role': 'user', 'content': '질문',
+                              'attachments': [{'file_id': 'file_x', 'kind': 'video'}]})
+        self.assertEqual(response.status_code, 400)
+
+    def test_session_title_uses_filename_when_body_empty(self):
+        from .models import ChatSession
+        response = self.chat({'role': 'user', 'content': '',
+                              'attachments': [self.IMAGE]})
+        session = ChatSession.objects.get(id=response.json()['session_id'])
+        self.assertIn('err.png', session.title)
+
+    def test_deleting_session_removes_uploaded_files(self):
+        session_id = self.chat({'role': 'user', 'content': '봐줘',
+                                'attachments': [self.IMAGE]}).json()['session_id']
+
+        with patch('api.views.help_agent.delete_files') as delete_files:
+            response = self.client.delete(f'/api/help-agent/sessions/{session_id}/')
+
+        self.assertEqual(response.status_code, 204)
+        delete_files.assert_called_once_with(['file_img1'])
+
+    def test_upload_endpoint_rejects_unsupported_type(self):
+        upload = SimpleUploadedFile('payload.exe', b'binary')
+        response = self.client.post('/api/help-agent/attachments/', {'file': upload})
+        self.assertEqual(response.status_code, 400)
+
+    def test_upload_endpoint_returns_file_id(self):
+        upload = SimpleUploadedFile('shot.png', b'binary', content_type='image/png')
+        with patch('api.views.help_agent.upload_attachment',
+                   return_value=dict(self.IMAGE)) as uploader:
+            response = self.client.post('/api/help-agent/attachments/', {'file': upload})
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()['file_id'], 'file_img1')
+        self.assertEqual(uploader.call_args[0][0], 'shot.png')
+
+
+class TriageRoutingTests(TestCase):
+    """파일 생성 요청 라우팅 — 파일을 만들 수 있는 담당은 report뿐이다."""
+
+    ATTACH = [{'file_id': 'file_x', 'filename': 'incidents.xlsx',
+               'kind': 'document', 'size_bytes': 500}]
+
+    @staticmethod
+    def _client(verdict):
+        """haiku 분류기가 verdict를 돌려주는 가짜 클라이언트."""
+        response = SimpleNamespace(
+            content=[SimpleNamespace(type='text', text=verdict)])
+        return SimpleNamespace(
+            messages=SimpleNamespace(create=lambda **kw: response))
+
+    def triage(self, text, verdict='search', attachments=None):
+        message = {'role': 'user', 'content': text}
+        if attachments:
+            message['attachments'] = attachments
+        return help_agent._triage(self._client(verdict), [message])
+
+    def test_file_output_requests_route_to_report_by_rule(self):
+        """보고서 단어가 없어도 산출물 단어만으로 report여야 한다."""
+        for text in ('이 엑셀 내용으로 PPT 만들어줘',
+                     '첨부 시트를 슬라이드로 정리해줘',
+                     '파워포인트로 바꿔줘',
+                     '이거 발표자료로 만들어줘',
+                     '첨부한 표를 워드 문서로 만들어줘'):
+            # 분류기가 off_topic이라 답해도 규칙이 먼저 report로 잡아야 한다
+            self.assertEqual(self.triage(text, verdict='off_topic'), 'report', text)
+
+    def test_keyword_search_is_not_hijacked_by_word_substring(self):
+        """'키워드'가 '워드'에 부분일치해 케이스 검색이 리포트로 새면 안 된다."""
+        self.assertEqual(self.triage('이 키워드로 케이스 찾아줘'), 'search')
+        self.assertEqual(self.triage('키워드 검색해줘'), 'search')
+
+    def test_attachment_request_is_never_off_topic(self):
+        """오분류로 고정 안내가 나가면 기능이 없는 것처럼 보인다."""
+        self.assertEqual(
+            self.triage('이거 좀 봐줘', verdict='off_topic', attachments=self.ATTACH),
+            'search')
+
+    def test_off_topic_still_works_without_attachment(self):
+        """첨부가 없으면 기존대로 비용 가드가 동작해야 한다."""
+        self.assertEqual(self.triage('오늘 점심 뭐 먹지', verdict='off_topic'),
+                         'off_topic')
+
+    def test_reading_an_attachment_stays_on_search(self):
+        """파일 생성 요청이 아니면 굳이 리포팅으로 보내지 않는다."""
+        self.assertEqual(
+            self.triage('엑셀 내용 요약해줘', verdict='search', attachments=self.ATTACH),
+            'search')
+
+
+class FinalTextTests(TestCase):
+    """코드 실행 중간 메모가 답변 앞에 붙지 않아야 한다 (실측: 영어 작업 로그 노출)."""
+
+    @staticmethod
+    def blocks(*specs):
+        return [SimpleNamespace(type=t, text=v) for t, v in specs]
+
+    def test_narration_before_tool_result_is_dropped(self):
+        content = self.blocks(
+            ('text', 'Content confirmed correct. Now visual QA.'),
+            ('bash_code_execution_tool_result', None),
+            ('text', '보고자료를 생성했습니다.'))
+        self.assertEqual(help_agent._final_text(content), '보고자료를 생성했습니다.')
+
+    def test_plain_answer_is_unchanged(self):
+        content = self.blocks(('text', 'VRRP 유사 사례는 C-1122입니다.'))
+        self.assertEqual(help_agent._final_text(content),
+                         'VRRP 유사 사례는 C-1122입니다.')
+
+    def test_consecutive_trailing_blocks_are_joined(self):
+        content = self.blocks(
+            ('bash_code_execution_tool_result', None),
+            ('text', '앞부분 '), ('text', '뒷부분'))
+        self.assertEqual(help_agent._final_text(content), '앞부분 뒷부분')
+
+    def test_text_only_before_tool_result_is_kept_as_fallback(self):
+        """도구 결과로 끝나면 앞의 텍스트라도 답변으로 살린다 (빈 답변 방지)."""
+        content = self.blocks(('text', '설명만 있고 끝'),
+                              ('bash_code_execution_tool_result', None))
+        self.assertEqual(help_agent._final_text(content), '설명만 있고 끝')
+
+
+class ReportPromptCostTests(TestCase):
+    """리포팅 프롬프트가 비용·출처 규칙을 담고 있는지 (실측 $9.03 → $0.77 근거)."""
+
+    def test_image_rendering_is_forbidden(self):
+        """'한 번만'식 완화 지시로는 비용이 안 잡혔다 ($2.34~$12.18 편차) —
+        이미지 변환 자체를 금지해야 한다."""
+        prompt = help_agent.REPORT_SYSTEM_PROMPT
+        self.assertIn('이미지로 변환해 눈으로 확인하지 마세요', prompt)
+        self.assertIn('코드로 값을 재세요', prompt)
+
+    def test_attachment_is_declared_as_the_data_source(self):
+        """첨부로 문서를 만들 때 케이스 DB 수치가 섞이면 틀린 문서가 나간다."""
+        prompt = help_agent.REPORT_SYSTEM_PROMPT
+        self.assertIn('첨부', prompt)
+        self.assertNotIn('반드시 get_case_stats', prompt)
+
+
+class OfficeAttachmentTests(TestCase):
+    """워드·엑셀 첨부: 서버에서 본문 텍스트로 변환해 올린다.
+
+    Anthropic document 블록이 오피스 형식을 거부하고(400), 코드 실행 컨테이너로
+    읽히기는 하나 파일당 ~2만 토큰이 들어서 택한 방식.
+    """
+
+    @staticmethod
+    def make_docx(paragraphs=(), table_rows=()):
+        from docx import Document
+        document = Document()
+        for text in paragraphs:
+            document.add_paragraph(text)
+        if table_rows:
+            table = document.add_table(rows=0, cols=len(table_rows[0]))
+            for values in table_rows:
+                cells = table.add_row().cells
+                for cell, value in zip(cells, values):
+                    cell.text = value
+        buffer = BytesIO()
+        document.save(buffer)
+        return buffer.getvalue()
+
+    @staticmethod
+    def make_xlsx(sheets):
+        from openpyxl import Workbook
+        workbook = Workbook()
+        workbook.remove(workbook.active)
+        for title, rows in sheets.items():
+            sheet = workbook.create_sheet(title)
+            for row in rows:
+                sheet.append(row)
+        buffer = BytesIO()
+        workbook.save(buffer)
+        return buffer.getvalue()
+
+    def test_docx_keeps_document_order_of_paragraphs_and_tables(self):
+        """표를 뒤로 몰아버리면 맥락이 끊긴다 — 원래 순서를 지켜야 한다."""
+        data = self.make_docx(paragraphs=['머리말', '꼬리말'],
+                              table_rows=[['Bug', 'Fixed'], ['ACOS-104904', '6.0.9']])
+        text = help_agent._extract_docx(data)
+
+        self.assertIn('머리말', text)
+        self.assertIn('ACOS-104904 | 6.0.9', text)
+        # add_table은 문단 뒤에 붙으므로 꼬리말보다 표가 뒤에 와야 정상
+        self.assertLess(text.index('머리말'), text.index('ACOS-104904'))
+
+    def test_xlsx_labels_each_sheet_and_skips_empty_rows(self):
+        data = self.make_xlsx({
+            'Issues': [['Bug ID', 'Fixed In'], [], ['ACOS-104904', '6.0.9']],
+            'Notes': [['비고', '없음']],
+        })
+        text = help_agent._extract_xlsx(data)
+
+        self.assertIn('[시트: Issues]', text)
+        self.assertIn('[시트: Notes]', text)
+        self.assertIn('ACOS-104904 | 6.0.9', text)
+        self.assertNotIn('\n\n', text)  # 빈 행이 그대로 실리지 않는다
+
+    def test_conversion_adds_source_header(self):
+        """모델이 원본이 무엇이었는지 알아야 한다."""
+        data = help_agent._office_to_text(
+            '.docx', 'report.docx', self.make_docx(paragraphs=['본문']))
+        self.assertTrue(data.decode().startswith('[report.docx에서 추출한 텍스트]'))
+
+    def test_text_only_document_is_rejected_with_guidance(self):
+        """이미지로만 된 문서는 캡처해서 올리라고 안내해야 한다."""
+        with self.assertRaises(help_agent.AttachmentRejected) as caught:
+            help_agent._office_to_text('.docx', 'empty.docx', self.make_docx())
+        self.assertIn('캡처', str(caught.exception))
+
+    def test_corrupt_file_is_rejected_not_crashed(self):
+        with self.assertRaises(help_agent.AttachmentRejected) as caught:
+            help_agent._office_to_text('.xlsx', 'broken.xlsx', b'not a zip')
+        self.assertIn('읽을 수 없습니다', str(caught.exception))
+
+    def test_oversized_extraction_is_truncated_with_notice(self):
+        """행이 수천 개인 시트를 통째로 실으면 질문 한 번에 수만 토큰이 나간다."""
+        rows = [[f'row-{i}' * 20] for i in range(3000)]
+        data = help_agent._office_to_text(
+            '.xlsx', 'big.xlsx', self.make_xlsx({'Sheet': rows}))
+        text = data.decode()
+
+        self.assertIn('이하 생략', text)
+        self.assertLess(len(text), help_agent.MAX_EXTRACTED_CHARS + 500)
+
+    @override_settings(ANTHROPIC_API_KEY='test-key')
+    def test_upload_sends_text_but_reports_original_file(self):
+        """사용자에겐 원래 파일명·크기를, 모델에겐 추출 텍스트를 준다."""
+        original = self.make_docx(paragraphs=['VRRP failover 원인 분석'])
+        client = MagicMock()
+        client.beta.files.upload.return_value = SimpleNamespace(id='file_conv')
+        with patch('api.services.help_agent.anthropic.Anthropic', return_value=client):
+            meta = help_agent.upload_attachment('report.docx', original)
+
+        self.assertEqual(meta, {'file_id': 'file_conv', 'filename': 'report.docx',
+                                'kind': 'document', 'size_bytes': len(original),
+                                'converted': True})
+        name, stream, mime = client.beta.files.upload.call_args.kwargs['file']
+        self.assertEqual((name, mime), ('report.docx.txt', 'text/plain'))
+        self.assertIn('VRRP failover 원인 분석', stream.getvalue().decode())
+
+    @override_settings(ANTHROPIC_API_KEY='test-key')
+    def test_non_office_upload_is_not_converted(self):
+        client = MagicMock()
+        client.beta.files.upload.return_value = SimpleNamespace(id='file_raw')
+        with patch('api.services.help_agent.anthropic.Anthropic', return_value=client):
+            meta = help_agent.upload_attachment('shot.png', b'binary')
+
+        self.assertFalse(meta['converted'])
+        name, stream, mime = client.beta.files.upload.call_args.kwargs['file']
+        self.assertEqual((name, mime, stream.getvalue()), ('shot.png', 'image/png', b'binary'))
+
+
+class PurgeChatAttachmentsTests(TestCase):
+    """고아 첨부 정리: 참조된 파일(템플릿·생성 문서·대화 첨부)은 절대 지우지 않는다."""
+
+    def setUp(self):
+        from .models import AppSetting, ChatSession, ChatTurn
+        session = ChatSession.objects.create(title='대화')
+        ChatTurn.objects.create(
+            session=session, role='user', content='봐줘',
+            attachments=[{'file_id': 'file_attached', 'filename': 'a.png',
+                          'kind': 'image', 'size_bytes': 1}])
+        ChatTurn.objects.create(
+            session=session, role='assistant', content='답변',
+            files=[{'file_id': 'file_report', 'filename': 'r.docx', 'size_bytes': 2}])
+        AppSetting.set('report_template_docx', 'abc123:file_template')
+
+    @staticmethod
+    def _file(file_id, days_old):
+        return SimpleNamespace(id=file_id, filename=f'{file_id}.png',
+                               created_at=timezone.now() - timedelta(days=days_old))
+
+    def run_command(self, files, **options):
+        client = MagicMock()
+        client.beta.files.list.return_value = files
+        out = StringIO()
+        with override_settings(ANTHROPIC_API_KEY='test-key'), \
+                patch('anthropic.Anthropic', return_value=client):
+            call_command('purge_chat_attachments', stdout=out, **options)
+        return client, out.getvalue()
+
+    def test_referenced_files_are_never_listed(self):
+        client, output = self.run_command([
+            self._file('file_attached', 30),
+            self._file('file_report', 30),
+            self._file('file_template', 30),
+            self._file('file_orphan', 30),
+        ], apply=True)
+
+        client.beta.files.delete.assert_called_once_with('file_orphan')
+        self.assertNotIn('file_template', output)
+
+    def test_recent_orphans_are_kept_during_grace_period(self):
+        """업로드만 하고 아직 질문을 안 보낸 파일을 지워버리면 안 된다."""
+        client, _ = self.run_command([self._file('file_fresh', 0)], apply=True)
+        client.beta.files.delete.assert_not_called()
+
+    def test_dry_run_is_the_default(self):
+        client, output = self.run_command([self._file('file_orphan', 30)])
+        client.beta.files.delete.assert_not_called()
+        self.assertIn('file_orphan', output)
+        self.assertIn('--apply', output)
 
 
 class FetchUrlToolTests(TestCase):

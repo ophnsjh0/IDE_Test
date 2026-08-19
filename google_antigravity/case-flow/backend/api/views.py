@@ -322,6 +322,7 @@ class HelpAgentChatView(APIView):
     permission_classes = [IsEngineerOrAbove]
 
     MAX_CONTENT_LENGTH = 20000
+    MAX_ATTACHMENTS = 5
 
     def post(self, request):
         messages = request.data.get('messages')
@@ -358,26 +359,29 @@ class HelpAgentChatView(APIView):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
         # 어떤 에이전트가 어떤 질문을 받았는지 파일럿 지표로 남긴다 (질문은 앞 80자만)
+        question = help_agent.question_text(messages[-1])
         log_event(request.user, 'agent_chat',
-                  detail=f"[{result.get('agent', '?')}] {messages[-1]['content'][:80]}")
+                  detail=f"[{result.get('agent', '?')}] {question[:80]}")
         result['session_id'] = self._save_turns(
-            request.user, session, messages[-1]['content'], result)
+            request.user, session, messages[-1], result)
         return Response(result)
 
     @staticmethod
-    def _save_turns(user, session, question, result):
+    def _save_turns(user, session, message, result):
         """질문·답변 턴을 세션에 저장하고 세션 id를 반환.
 
         저장은 부가 기능 — 이미 비용이 발생한 답변을 저장 실패로 잃지
         않도록 예외를 전파하지 않는다 (session_id: null로 응답).
         """
+        question = help_agent.question_text(message)
         try:
             with transaction.atomic():
                 if session is None:
                     session = ChatSession.objects.create(
                         user=user, title=question[:200])
                 ChatTurn.objects.create(
-                    session=session, role='user', content=question)
+                    session=session, role='user', content=message['content'],
+                    attachments=message.get('attachments') or [])
                 ChatTurn.objects.create(
                     session=session, role='assistant',
                     content=result.get('reply', ''),
@@ -398,13 +402,35 @@ class HelpAgentChatView(APIView):
         for m in messages:
             if (not isinstance(m, dict)
                     or m.get('role') not in ('user', 'assistant')
-                    or not isinstance(m.get('content'), str)
-                    or not m['content'].strip()):
+                    or not isinstance(m.get('content'), str)):
                 return '각 메시지는 {role: user|assistant, content: 문자열} 형식이어야 합니다.'
             if len(m['content']) > self.MAX_CONTENT_LENGTH:
                 return f'메시지는 {self.MAX_CONTENT_LENGTH}자를 넘을 수 없습니다.'
+            error = self._validate_attachments(m)
+            if error:
+                return error
+            # 첨부만 올리고 본문을 비우는 사용(스크린샷 한 장)은 허용한다
+            if not m['content'].strip() and not m.get('attachments'):
+                return '빈 메시지는 보낼 수 없습니다.'
         if messages[-1]['role'] != 'user':
             return '마지막 메시지는 사용자 질문이어야 합니다.'
+        return None
+
+    def _validate_attachments(self, message):
+        """첨부 메타 형식 검사. 실제 파일은 업로드 시점에 이미 검증됐고,
+        여기서는 모델에 넘길 수 있는 모양인지만 본다."""
+        attachments = message.get('attachments')
+        if attachments is None:
+            return None
+        if not isinstance(attachments, list) or len(attachments) > self.MAX_ATTACHMENTS:
+            return f'첨부는 메시지당 {self.MAX_ATTACHMENTS}개까지 목록으로 보낼 수 있습니다.'
+        for a in attachments:
+            if (not isinstance(a, dict)
+                    or not isinstance(a.get('file_id'), str) or not a['file_id']
+                    or a.get('kind') not in ('image', 'document')):
+                return '첨부 형식이 올바르지 않습니다. 파일을 다시 첨부해주세요.'
+        if message.get('role') != 'user' and attachments:
+            return '첨부는 사용자 메시지에만 붙일 수 있습니다.'
         return None
 
 
@@ -475,11 +501,11 @@ class HelpAgentChatStreamView(HelpAgentChatView):
                     on_event=lambda kind, payload: events.put((kind, payload)))
                 # 저장·로깅은 클라이언트 연결 여부와 무관하게 여기서 끝낸다.
                 # 둘 다 내부에서 예외를 삼키므로 답변을 잃지 않는다.
+                question = help_agent.question_text(messages[-1])
                 log_event(user, 'agent_chat',
-                          detail=f"[{result.get('agent', '?')}] "
-                                 f"{messages[-1]['content'][:80]}")
+                          detail=f"[{result.get('agent', '?')}] {question[:80]}")
                 result['session_id'] = self._save_turns(
-                    user, session, messages[-1]['content'], result)
+                    user, session, messages[-1], result)
                 terminal = ('done', result)
             except Exception as exc:
                 code, message = self._stream_error(exc)
@@ -501,6 +527,39 @@ class HelpAgentChatStreamView(HelpAgentChatView):
             yield f"event: {kind}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
             if kind in ('done', 'error'):
                 break
+
+
+class HelpAgentAttachmentView(APIView):
+    """POST /api/help-agent/attachments/ — 채팅에 붙일 파일(스크린샷·설정 파일·
+    벤더 PDF)을 Anthropic Files API에 올리고 file_id를 돌려준다.
+
+    프론트가 직접 올리지 않고 서버가 중계하는 이유: API 키가 브라우저로 나가지
+    않고, 형식·크기 검증을 한 곳에서 강제할 수 있다. 반환된 file_id는 이후
+    채팅 요청의 messages[].attachments에 실려 온다.
+    """
+
+    permission_classes = [IsEngineerOrAbove]
+
+    def post(self, request):
+        upload = request.FILES.get('file')
+        if upload is None:
+            return Response({'error': '파일이 필요합니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if upload.size > help_agent.MAX_ATTACHMENT_BYTES:
+            limit_mb = help_agent.MAX_ATTACHMENT_BYTES // (1024 * 1024)
+            return Response(
+                {'error': f'파일이 너무 큽니다. {limit_mb}MB 이하만 첨부할 수 있습니다.'},
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
+
+        try:
+            attachment = help_agent.upload_attachment(upload.name, upload.read())
+        except help_agent.AttachmentRejected as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except (anthropic.APIError, RuntimeError):
+            logger.exception("chat attachment upload failed (%s)", upload.name)
+            return Response({'error': '파일 업로드 중 오류가 발생했습니다.'},
+                            status=status.HTTP_502_BAD_GATEWAY)
+        return Response(attachment, status=status.HTTP_201_CREATED)
 
 
 class ChatSessionListView(generics.ListAPIView):
@@ -537,7 +596,19 @@ class ChatSessionDetailView(APIView):
         if session is None:
             return Response({'error': '세션을 찾을 수 없습니다.'},
                             status=status.HTTP_404_NOT_FOUND)
+        # 대화를 지우면 첨부 원본도 Anthropic 스토리지에서 지운다 —
+        # 고객사 자료가 올라올 수 있어 참조만 지우고 남겨두면 안 된다.
+        file_ids = [a['file_id']
+                    for turn in session.turns.all()
+                    for a in (turn.attachments or [])
+                    if isinstance(a, dict) and a.get('file_id')]
         session.delete()
+        if file_ids:
+            try:
+                help_agent.delete_files(file_ids)
+            except Exception:  # 정리 실패가 삭제 응답을 막지 않게
+                logger.warning("chat attachment cleanup failed (session %s)",
+                               session_id, exc_info=True)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 

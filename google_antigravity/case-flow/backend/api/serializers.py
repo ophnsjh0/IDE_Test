@@ -61,7 +61,7 @@ class ChatTurnSerializer(serializers.ModelSerializer):
     class Meta:
         model = ChatTurn
         fields = ['id', 'role', 'content', 'agent', 'model', 'tool_calls',
-                  'files', 'created_at']
+                  'files', 'attachments', 'created_at']
 
 
 class ChatSessionSerializer(serializers.ModelSerializer):

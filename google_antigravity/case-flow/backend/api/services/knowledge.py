@@ -240,7 +240,12 @@ def build_chat_material(session):
         speaker = '엔지니어' if turn.role == 'user' else 'AI'
         tools = ', '.join(t.get('name', '') for t in (turn.tool_calls or []))
         header = f"[{speaker}]" + (f" (사용 도구: {tools})" if tools else '')
-        entry = f"{header}\n{turn.content[:6000]}"
+        body = turn.content[:6000]
+        if turn.attachments:
+            # 첨부만 올린 턴은 본문이 비어 있어, 파일명이라도 없으면 맥락이 끊긴다
+            names = ', '.join(a.get('filename') or '?' for a in turn.attachments)
+            body = f"{body}\n[첨부 파일: {names}]".strip()
+        entry = f"{header}\n{body}"
         if remaining - len(entry) < 0:
             break
         remaining -= len(entry)
