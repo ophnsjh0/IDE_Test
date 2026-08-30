@@ -24,7 +24,8 @@ from .models import AppSetting, Case, ChatSession, ChatTurn, KnowledgeItem, Usag
 from .permissions import IsAdminRole, IsEngineerOrAbove
 from .serializers import (CaseSerializer, CaseDetailSerializer,
                           ChatSessionDetailSerializer, ChatSessionSerializer,
-                          KnowledgeItemSerializer)
+                          KnowledgeItemSerializer, LabDetailSerializer,
+                          LabSerializer)
 from .services.usage import log_event
 from .services.analyzer import (
     AVAILABLE_MODELS,
@@ -37,7 +38,7 @@ from .services.analyzer import (
     get_translation_model,
     provider_api_key,
 )
-from .services import help_agent
+from .services import eveng, help_agent
 from .services.gmail_client import GmailAuthError
 from .services.gmail_sync import (LAST_RUN_SETTING_KEY, SyncInProgress,
                                   is_cron_enabled, set_cron_enabled, sync_gmail)
@@ -905,3 +906,196 @@ class LabConfigView(APIView):
             # 주소는 "어느 랩 서버를 보고 있나"를 확인하는 용도라 계정 없이 노출한다
             'server': settings.EVENG_URL,
         })
+
+
+# ------------------------------------------------------------------ Lab Tests
+
+def _lab_server():
+    """.env가 가리키는 EVE-NG 서버 행을 얻는다(없으면 만든다).
+
+    서버는 지금 하나뿐이지만 랩이 서버를 참조하게 해두면, 나중에 Pro 서버로
+    옮길 때 전부 한 번에 넘기는 대신 랩 단위로 옮겨가며 검증할 수 있다.
+    """
+    from .models import LabServer
+    if not eveng.is_configured():
+        # 설정 없이 등록하면 base_url이 빈 서버 행이 생겨 나중에 랩이 붕 뜬다
+        raise eveng.EvengNotConfigured(
+            'EVE-NG 접속 정보가 없습니다. .env의 CASEFLOW_EVENG_URL / _USER / _PASSWORD를 확인하세요.')
+    server, _ = LabServer.objects.get_or_create(base_url=settings.EVENG_URL)
+    return server
+
+
+def _eveng_error_response(exc):
+    if isinstance(exc, eveng.EvengNotConfigured):
+        return Response({'error': str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    logger.warning('EVE-NG 요청 실패: %s', exc)
+    return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+
+class LabListView(generics.ListAPIView):
+    """GET /api/labs/ — Case-Flow에 등록된 랩 목록 (엔지니어 이상)."""
+    permission_classes = [IsEngineerOrAbove]
+    serializer_class = LabSerializer
+
+    def get_queryset(self):
+        from .models import Lab
+        return Lab.objects.select_related('server').prefetch_related('nodes')
+
+
+class LabAvailableView(APIView):
+    """GET /api/labs/available/ — EVE-NG에 있지만 아직 등록되지 않은 랩 (관리자).
+
+    EVE-NG의 랩을 전부 노출하지 않는 이유: 다른 사람 작업용 랩이 섞여 있다.
+    등록 화면에서 고르기 위한 후보 목록이다.
+    """
+    permission_classes = [IsAdminRole]
+
+    def get(self, request):
+        from .models import Lab
+        try:
+            server = _lab_server()
+            client = eveng.EvengClient()
+            labs = client.list_labs()
+            version = client.server_version()
+        except eveng.EvengError as e:
+            return _eveng_error_response(e)
+
+        if version and server.version != version:
+            server.version = version
+            server.checked_at = timezone.now()
+            server.save(update_fields=['version', 'checked_at'])
+
+        registered = set(Lab.objects.filter(server=server).values_list('path', flat=True))
+        return Response({
+            'server': server.base_url,
+            'version': server.version,
+            'labs': [
+                {**lab, 'registered': lab['path'] in registered}
+                for lab in sorted(labs, key=lambda x: x['path'])
+            ],
+        })
+
+
+class LabRegisterView(APIView):
+    """POST/DELETE /api/labs/register/ — 랩 등록·해제 (관리자).
+
+    등록은 EVE-NG의 랩을 Case-Flow 메뉴에 올리는 것일 뿐, EVE-NG에는 아무
+    영향을 주지 않는다. 해제도 마찬가지로 우리 쪽 기록만 지운다.
+    """
+    permission_classes = [IsAdminRole]
+
+    def post(self, request):
+        from .models import Lab
+        path = (request.data.get('path') or '').strip()
+        if not path:
+            return Response({'error': '랩 경로가 필요합니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        name = (request.data.get('name') or '').strip()
+        if not name:  # 파일명에서 확장자만 떼어 기본 이름으로
+            name = path.rsplit('/', 1)[-1].removesuffix('.unl')
+
+        try:
+            server = _lab_server()
+        except eveng.EvengError as e:
+            return _eveng_error_response(e)
+
+        lab, created = Lab.objects.get_or_create(
+            server=server, path=path,
+            defaults={
+                'name': name[:200],
+                'vendor': (request.data.get('vendor') or '').strip()[:50],
+                'description': (request.data.get('description') or '').strip()[:300],
+            },
+        )
+        if not created:
+            return Response({'error': '이미 등록된 랩입니다.', 'id': lab.id},
+                            status=status.HTTP_409_CONFLICT)
+        return Response(LabSerializer(lab).data, status=status.HTTP_201_CREATED)
+
+    def delete(self, request):
+        from .models import Lab
+        lab = Lab.objects.filter(id=request.data.get('id')).first()
+        if lab is None:
+            return Response({'error': '등록되지 않은 랩입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        name = lab.name
+        lab.delete()  # 스냅샷은 CASCADE로 함께 삭제. EVE-NG는 건드리지 않는다.
+        return Response({'message': f'{name} 등록을 해제했습니다.'})
+
+
+class LabTopologyView(APIView):
+    """GET /api/labs/<id>/ — 저장된 토폴로지 스냅샷 (엔지니어 이상)."""
+    permission_classes = [IsEngineerOrAbove]
+
+    def get(self, request, id):
+        from .models import Lab
+        lab = (Lab.objects.select_related('server')
+               .prefetch_related('nodes', 'networks', 'links').filter(id=id).first())
+        if lab is None:
+            return Response({'error': '등록되지 않은 랩입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        return Response(LabDetailSerializer(lab).data)
+
+
+class LabRefreshView(APIView):
+    """POST /api/labs/<id>/refresh/ — EVE-NG에서 토폴로지를 다시 가져온다.
+
+    EVE-NG 쪽은 읽기만 한다. 스냅샷은 통째로 갈아끼우되, 이름을 키로 삼아
+    노드 행을 재사용한다 — eve_id·console 포트는 서버를 옮기면 재부여되므로
+    갱신되는 값으로만 다룬다.
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    def post(self, request, id):
+        from .models import Lab, LabLink, LabNetwork, LabNode
+        lab = Lab.objects.filter(id=id).first()
+        if lab is None:
+            return Response({'error': '등록되지 않은 랩입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        try:
+            data = eveng.EvengClient().topology(lab.path)
+        except eveng.EvengError as e:
+            return _eveng_error_response(e)
+
+        with transaction.atomic():
+            seen = []
+            for node in data['nodes']:
+                LabNode.objects.update_or_create(
+                    lab=lab, name=node['name'],
+                    defaults={k: v for k, v in node.items() if k != 'name'})
+                seen.append(node['name'])
+            # EVE-NG에서 사라진 노드는 스냅샷에서도 지운다
+            lab.nodes.exclude(name__in=seen).delete()
+
+            # 네트워크·링크는 자체 식별자가 없어 통째로 다시 만든다
+            lab.networks.all().delete()
+            LabNetwork.objects.bulk_create(
+                [LabNetwork(lab=lab, **net) for net in data['networks']])
+            lab.links.all().delete()
+            LabLink.objects.bulk_create(
+                [LabLink(lab=lab, **link) for link in data['links']])
+
+            lab.topology_synced_at = timezone.now()
+            lab.save(update_fields=['topology_synced_at'])
+
+        lab = (Lab.objects.select_related('server')
+               .prefetch_related('nodes', 'networks', 'links').get(id=lab.id))
+        return Response(LabDetailSerializer(lab).data)
+
+
+class LabIconView(APIView):
+    """GET /api/labs/icons/<filename> — EVE-NG 노드 아이콘 중계.
+
+    브라우저가 EVE-NG에 직접 붙지 않게 한다(자격증명 비노출 + 사내망에서
+    EVE-NG에 못 닿는 자리에서도 화면이 뜬다).
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    def get(self, request, filename):
+        try:
+            content, content_type = eveng.EvengClient().icon(filename)
+        except eveng.EvengError as e:
+            return _eveng_error_response(e)
+        response = HttpResponse(content, content_type=content_type)
+        response['Cache-Control'] = 'private, max-age=86400'  # 아이콘은 잘 안 바뀐다
+        return response

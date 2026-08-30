@@ -325,3 +325,104 @@ class CaseEmail(models.Model):
 
     def __str__(self):
         return f"{self.case.case_id} - {self.subject}"
+
+
+class LabServer(models.Model):
+    """EVE-NG 서버 한 대.
+
+    지금은 .env의 서버 하나뿐이고 자격증명도 .env에서 읽는다. 그런데도 랩이
+    서버를 참조하게 해두는 이유: 나중에 Pro 서버로 옮길 때 전부 한 번에
+    넘기는 컷오버가 아니라, 랩 단위로 옮겨가며 검증할 수 있다.
+    """
+    base_url = models.CharField(max_length=200, unique=True)
+    version = models.CharField(max_length=50, blank=True, default='')  # /api/status
+    checked_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.base_url} ({self.version or 'unknown'})"
+
+
+class Lab(models.Model):
+    """Case-Flow에 등록된 랩. EVE-NG에 있는 모든 랩이 아니라 관리자가 고른 것만.
+
+    EVE-NG에는 다른 사람 작업용 랩이 섞여 있어서 전부 노출하지 않는다.
+    """
+    server = models.ForeignKey(LabServer, on_delete=models.CASCADE, related_name='labs')
+    # 파일명이 아니라 경로 전체를 쓴다 — Pro는 사용자별 폴더를 쓸 수 있다.
+    path = models.CharField(max_length=300)          # '/AI-LAB-A10-OneArm.unl'
+    name = models.CharField(max_length=200)          # 화면 표시 이름
+    vendor = models.CharField(max_length=50, blank=True, default='')
+    description = models.CharField(max_length=300, blank=True, default='')
+    topology_synced_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['vendor', 'name']
+        unique_together = [('server', 'path')]
+
+    def __str__(self):
+        return f"{self.name} ({self.path})"
+
+
+class LabNode(models.Model):
+    """토폴로지 스냅샷의 노드.
+
+    키는 eve_id가 아니라 **이름**이다. eve_id와 console 포트는 랩을 다른
+    서버로 옮기면 재부여되므로, 이름을 키로 잡아야 랩 등록 정보(MGMT IP·역할
+    매핑 등)가 그대로 붙는다.
+    """
+    lab = models.ForeignKey(Lab, on_delete=models.CASCADE, related_name='nodes')
+    name = models.CharField(max_length=100)
+    eve_id = models.IntegerField()                   # 갱신되는 값
+    template = models.CharField(max_length=50, blank=True, default='')
+    image = models.CharField(max_length=120, blank=True, default='')
+    icon = models.CharField(max_length=120, blank=True, default='')
+    left = models.IntegerField(default=0)            # EVE-NG 캔버스 좌표 그대로
+    top = models.IntegerField(default=0)
+    ram = models.IntegerField(default=0)             # MB
+    cpu = models.IntegerField(default=0)
+    ethernet = models.IntegerField(default=0)
+    console_url = models.CharField(max_length=200, blank=True, default='')
+    # EVE-NG status != 0. 프로세스가 떠 있다는 뜻이지 부팅 완료가 아니다.
+    running = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ['name']
+        unique_together = [('lab', 'name')]
+
+    def __str__(self):
+        return f"{self.lab.name}/{self.name}"
+
+
+class LabNetwork(models.Model):
+    """토폴로지의 네트워크(브리지·pnet0). 관리망 연결을 표현하는 데 필요하다."""
+    lab = models.ForeignKey(Lab, on_delete=models.CASCADE, related_name='networks')
+    name = models.CharField(max_length=100)
+    eve_id = models.IntegerField()
+    net_type = models.CharField(max_length=30, blank=True, default='')  # bridge, pnet0
+    left = models.IntegerField(default=0)
+    top = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return f"{self.lab.name}/{self.name} ({self.net_type})"
+
+
+class LabLink(models.Model):
+    """노드 간 배선. 양 끝은 id가 아니라 이름으로 적는다(노드 키와 같은 이유).
+
+    한쪽이 네트워크인 링크(관리망 연결)도 함께 담는다 — 준비 판정이 관리망을
+    통해 이뤄지므로 빠뜨리면 나중에 다시 수집해야 한다.
+    """
+    lab = models.ForeignKey(Lab, on_delete=models.CASCADE, related_name='links')
+    source = models.CharField(max_length=100)
+    source_port = models.CharField(max_length=50, blank=True, default='')
+    source_is_network = models.BooleanField(default=False)
+    target = models.CharField(max_length=100)
+    target_port = models.CharField(max_length=50, blank=True, default='')
+    target_is_network = models.BooleanField(default=False)
+
+    def __str__(self):
+        return f"{self.source}:{self.source_port} <-> {self.target}:{self.target_port}"

@@ -56,6 +56,12 @@ urlpatterns = [
     path('settings/knowledge-model/', views.KnowledgeModelView.as_view(),
          name='knowledge-model'),
     path('labs/config/', views.LabConfigView.as_view(), name='lab-config'),
+    path('labs/', views.LabListView.as_view(), name='lab-list'),
+    path('labs/available/', views.LabAvailableView.as_view(), name='lab-available'),
+    path('labs/register/', views.LabRegisterView.as_view(), name='lab-register'),
+    path('labs/icons/<str:filename>', views.LabIconView.as_view(), name='lab-icon'),
+    path('labs/<int:id>/', views.LabTopologyView.as_view(), name='lab-topology'),
+    path('labs/<int:id>/refresh/', views.LabRefreshView.as_view(), name='lab-refresh'),
     path('settings/gmail-sync/', views.GmailSyncScheduleView.as_view(),
          name='gmail-sync-schedule'),
 ]

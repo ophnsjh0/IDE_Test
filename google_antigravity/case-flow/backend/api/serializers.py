@@ -1,7 +1,8 @@
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import Case, CaseEmail, ChatSession, ChatTurn, KnowledgeItem
+from .models import (Case, CaseEmail, ChatSession, ChatTurn, KnowledgeItem,
+                     Lab, LabLink, LabNetwork, LabNode)
 
 
 class CaseEmailSerializer(serializers.ModelSerializer):
@@ -94,3 +95,46 @@ class CaseDetailSerializer(CaseSerializer):
 
     class Meta(CaseSerializer.Meta):
         fields = CaseSerializer.Meta.fields + ['emails', 'related_cases']
+
+
+class LabNodeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LabNode
+        fields = ['name', 'eve_id', 'template', 'image', 'icon', 'left', 'top',
+                  'ram', 'cpu', 'ethernet', 'console_url', 'running']
+
+
+class LabNetworkSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LabNetwork
+        fields = ['name', 'eve_id', 'net_type', 'left', 'top']
+
+
+class LabLinkSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LabLink
+        fields = ['source', 'source_port', 'source_is_network',
+                  'target', 'target_port', 'target_is_network']
+
+
+class LabSerializer(serializers.ModelSerializer):
+    """목록용 — 토폴로지는 싣지 않는다(랩이 늘어나면 목록이 무거워진다)."""
+    node_count = serializers.SerializerMethodField()
+    server = serializers.CharField(source='server.base_url', read_only=True)
+
+    def get_node_count(self, obj):
+        return obj.nodes.count()
+
+    class Meta:
+        model = Lab
+        fields = ['id', 'path', 'name', 'vendor', 'description', 'server',
+                  'node_count', 'topology_synced_at']
+
+
+class LabDetailSerializer(LabSerializer):
+    nodes = LabNodeSerializer(many=True, read_only=True)
+    networks = LabNetworkSerializer(many=True, read_only=True)
+    links = LabLinkSerializer(many=True, read_only=True)
+
+    class Meta(LabSerializer.Meta):
+        fields = LabSerializer.Meta.fields + ['nodes', 'networks', 'links']

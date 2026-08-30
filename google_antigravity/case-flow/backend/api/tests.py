@@ -16,7 +16,7 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from .models import AppSetting, Case, CaseEmail
-from .services import analyzer, gmail_sync, help_agent
+from .services import analyzer, eveng, gmail_sync, help_agent
 from .services.email_parser import (build_gmail_query, clean_subject,
                                     detect_vendor_and_direction,
                                     extract_device_info, find_ignore_reason,
@@ -2673,6 +2673,204 @@ class KnowledgeFieldsTests(TestCase):
         self.assertEqual(results['count'], 1)
         results = json.loads(help_agent._search_knowledge(query='ACOS-104904'))
         self.assertEqual(results['count'], 1)
+
+
+# EVE-NG가 돌려주는 원본 모양 — 클라이언트가 이걸 우리 용어로 번역하는지 본다.
+EVE_NODES = {
+    '3': {'name': 'A10_1', 'template': 'a10', 'image': 'a10-vThunder-6.0.8',
+          'icon': 'F5_LB.png', 'left': 150, 'top': 243, 'ram': 8192, 'cpu': 4,
+          'ethernet': 3, 'url': 'telnet://eve:32771', 'status': 0},
+    '1': {'name': 'Arista_1', 'template': 'veos', 'image': 'veos', 'icon': 'sw.svg',
+          'left': 330, 'top': 381, 'ram': 4096, 'cpu': 1, 'ethernet': 9,
+          'url': 'telnet://eve:32769', 'status': 2},
+}
+EVE_NETWORKS = {'5': {'name': 'Net', 'type': 'pnet0', 'left': 10, 'top': 20}}
+EVE_TOPOLOGY = [
+    {'type': 'ethernet', 'source': 'node3', 'source_type': 'node', 'source_label': 'E1',
+     'destination': 'node1', 'destination_type': 'node', 'destination_label': 'Eth1'},
+    {'type': 'ethernet', 'source': 'node1', 'source_type': 'node', 'source_label': 'Mgmt1',
+     'destination': 'network5', 'destination_type': 'network', 'destination_label': ''},
+]
+
+
+def fake_eveng(**overrides):
+    """EvengClient를 대신할 목. 실제 EVE-NG를 부르지 않는다."""
+    client = MagicMock()
+    client.server_version.return_value = overrides.get('version', '6.2.0-4')
+    client.list_labs.return_value = overrides.get('labs', [
+        {'path': '/AI-LAB-A10-OneArm.unl', 'file': 'AI-LAB-A10-OneArm.unl'},
+        {'path': '/LAB_Other.unl', 'file': 'LAB_Other.unl'},
+    ])
+    real = eveng.EvengClient.topology
+    client.topology.side_effect = lambda path: real(
+        SimpleNamespace(get=lambda p: (EVE_NODES if p.endswith('/nodes')
+                                       else EVE_NETWORKS if p.endswith('/networks')
+                                       else EVE_TOPOLOGY)),
+        path)
+    return client
+
+
+class EvengClientTests(TestCase):
+    """EVE-NG 응답을 우리 용어로 번역하는 부분 — 원본 스키마가 밖으로 새지 않아야 한다."""
+
+    def topology(self):
+        return fake_eveng().topology('/x.unl')
+
+    def test_translates_nodes_keyed_by_name(self):
+        """이름이 키다. eve_id·console 포트는 서버를 옮기면 재부여되는 값이다."""
+        nodes = {n['name']: n for n in self.topology()['nodes']}
+
+        self.assertEqual(set(nodes), {'A10_1', 'Arista_1'})
+        self.assertEqual(nodes['A10_1']['eve_id'], 3)
+        self.assertEqual((nodes['A10_1']['left'], nodes['A10_1']['top']), (150, 243))
+        # EVE-NG 원본 키(status, url)는 우리 이름으로 바뀌어 나간다
+        self.assertNotIn('status', nodes['A10_1'])
+        self.assertNotIn('url', nodes['A10_1'])
+
+    def test_status_becomes_running_not_ready(self):
+        """EVE-NG status는 프로세스가 떴다는 뜻일 뿐 부팅 완료가 아니다."""
+        nodes = {n['name']: n for n in self.topology()['nodes']}
+        self.assertFalse(nodes['A10_1']['running'])   # status 0
+        self.assertTrue(nodes['Arista_1']['running'])  # status 2
+
+    def test_links_use_names_and_keep_network_links(self):
+        links = self.topology()['links']
+        node_links = [l for l in links
+                      if not l['source_is_network'] and not l['target_is_network']]
+
+        self.assertEqual(len(links), 2)
+        self.assertEqual(len(node_links), 1)
+        self.assertEqual((node_links[0]['source'], node_links[0]['source_port']),
+                         ('A10_1', 'E1'))
+        self.assertEqual((node_links[0]['target'], node_links[0]['target_port']),
+                         ('Arista_1', 'Eth1'))
+        # 관리망 연결도 버리지 않는다 — 준비 판정이 관리망을 통해 이뤄진다
+        net_link = [l for l in links if l['target_is_network']][0]
+        self.assertEqual(net_link['target'], 'Net')
+
+    @override_settings(EVENG_URL='', EVENG_USER='', EVENG_PASSWORD='')
+    def test_missing_settings_raise_not_configured(self):
+        with self.assertRaises(eveng.EvengNotConfigured):
+            eveng.EvengClient()
+
+
+@override_settings(EVENG_URL='http://eve.test', EVENG_USER='admin', EVENG_PASSWORD='pw')
+class LabRegistryTests(TestCase):
+    """랩 등록·조회·토폴로지 갱신."""
+
+    def setUp(self):
+        from .permissions import set_user_role
+        for username, role in (('lr-v', 'viewer'), ('lr-e', 'engineer'), ('lr-a', 'admin')):
+            user = User.objects.create_user(username, password='lr-pass-1!')
+            set_user_role(user, role)
+
+    def login(self, username):
+        self.client.post('/api/auth/login/',
+                         {'username': username, 'password': 'lr-pass-1!'},
+                         content_type='application/json')
+
+    def register(self, path='/AI-LAB-A10-OneArm.unl', **extra):
+        return self.client.post('/api/labs/register/',
+                                {'path': path, 'name': 'One-Arm', **extra},
+                                content_type='application/json')
+
+    def test_available_marks_already_registered(self):
+        self.login('lr-a')
+        with patch('api.views.eveng.EvengClient', return_value=fake_eveng()):
+            self.register()
+            body = self.client.get('/api/labs/available/').json()
+
+        by_path = {l['path']: l for l in body['labs']}
+        self.assertTrue(by_path['/AI-LAB-A10-OneArm.unl']['registered'])
+        self.assertFalse(by_path['/LAB_Other.unl']['registered'])
+        self.assertEqual(body['version'], '6.2.0-4')  # 서버 버전을 기록해둔다
+
+    def test_only_registered_labs_appear_in_the_menu(self):
+        """EVE-NG에는 다른 사람 작업용 랩이 섞여 있어 전부 노출하지 않는다."""
+        self.login('lr-a')
+        with patch('api.views.eveng.EvengClient', return_value=fake_eveng()):
+            self.register()
+        self.login('lr-e')
+        labs = self.client.get('/api/labs/').json()
+
+        self.assertEqual([l['path'] for l in labs], ['/AI-LAB-A10-OneArm.unl'])
+
+    def test_refresh_stores_snapshot(self):
+        self.login('lr-a')
+        with patch('api.views.eveng.EvengClient', return_value=fake_eveng()):
+            lab_id = self.register().json()['id']
+            body = self.client.post(f'/api/labs/{lab_id}/refresh/').json()
+
+        self.assertEqual({n['name'] for n in body['nodes']}, {'A10_1', 'Arista_1'})
+        self.assertEqual(len(body['links']), 2)
+        self.assertEqual(len(body['networks']), 1)
+        self.assertIsNotNone(body['topology_synced_at'])
+
+    def test_refresh_drops_nodes_removed_from_eveng(self):
+        """랩에서 노드를 지우면 스냅샷에서도 사라져야 한다."""
+        from .models import Lab
+        self.login('lr-a')
+        with patch('api.views.eveng.EvengClient', return_value=fake_eveng()):
+            lab_id = self.register().json()['id']
+            self.client.post(f'/api/labs/{lab_id}/refresh/')
+
+        smaller = fake_eveng()
+        smaller.topology.side_effect = None
+        smaller.topology.return_value = {
+            'nodes': [{'name': 'A10_1', 'eve_id': 3, 'template': 'a10', 'image': '',
+                       'icon': '', 'left': 1, 'top': 2, 'ram': 0, 'cpu': 0,
+                       'ethernet': 0, 'console_url': '', 'running': False}],
+            'networks': [], 'links': [],
+        }
+        with patch('api.views.eveng.EvengClient', return_value=smaller):
+            body = self.client.post(f'/api/labs/{lab_id}/refresh/').json()
+
+        self.assertEqual([n['name'] for n in body['nodes']], ['A10_1'])
+        self.assertEqual(Lab.objects.get(id=lab_id).nodes.count(), 1)
+
+    def test_unregister_keeps_eveng_untouched(self):
+        """등록 해제는 우리 기록만 지운다 — EVE-NG 삭제 API를 부르지 않는다."""
+        from .models import Lab
+        self.login('lr-a')
+        client = fake_eveng()
+        with patch('api.views.eveng.EvengClient', return_value=client):
+            lab_id = self.register().json()['id']
+            res = self.client.delete('/api/labs/register/', {'id': lab_id},
+                                     content_type='application/json')
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(Lab.objects.count(), 0)
+        client.delete_lab.assert_not_called()
+
+    def test_duplicate_registration_is_rejected(self):
+        self.login('lr-a')
+        with patch('api.views.eveng.EvengClient', return_value=fake_eveng()):
+            self.register()
+            self.assertEqual(self.register().status_code, 409)
+
+    def test_engineer_cannot_register_but_can_view(self):
+        """등록은 관리자, 조회·갱신은 엔지니어."""
+        self.login('lr-e')
+        self.assertEqual(self.register().status_code, 403)
+        self.assertEqual(self.client.get('/api/labs/').status_code, 200)
+
+    def test_viewer_is_blocked_everywhere(self):
+        self.login('lr-v')
+        self.assertEqual(self.client.get('/api/labs/').status_code, 403)
+        self.assertEqual(self.client.get('/api/labs/available/').status_code, 403)
+
+    @override_settings(EVENG_URL='', EVENG_USER='', EVENG_PASSWORD='')
+    def test_unconfigured_server_returns_503_not_500(self):
+        """랩 서버가 없어도 앱은 살아 있어야 한다 — 화면이 안내를 띄울 수 있게."""
+        from .models import LabServer
+        self.login('lr-a')
+        res = self.client.get('/api/labs/available/')
+        self.assertEqual(res.status_code, 503)
+        self.assertIn('CASEFLOW_EVENG_URL', res.json()['error'])
+
+        # 등록도 막는다 — 안 막으면 base_url이 빈 서버 행이 생겨 랩이 붕 뜬다
+        self.assertEqual(self.register().status_code, 503)
+        self.assertEqual(LabServer.objects.count(), 0)
 
 
 class LabConfigTests(TestCase):
