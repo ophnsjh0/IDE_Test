@@ -53,7 +53,8 @@ interface Section {
   label: string;
   hint: string;
   rows: number;
-  mono?: boolean;   // 명령어·식별자가 들어가는 칸은 고정폭 박스로
+  mono?: boolean;   // 명령어·식별자가 들어가는 칸은 고정폭으로
+  cards?: boolean;  // 한 줄에 하나씩인 항목은 보기 화면에서 카드로 (공식 문서 근거와 동일)
   tone?: 'warn';    // 주의사항은 경고 색 강조
 }
 
@@ -65,7 +66,7 @@ const SECTIONS: Section[] = [
   { key: 'resolution', label: '해결 조치', hint: 'CLI 명령어·설정 라인·패치 버전을 그대로', rows: 6, mono: true },
   { key: 'verification', label: '검증 방법', hint: '조치 후 어떤 명령의 어떤 출력을 확인하는지', rows: 3, mono: true },
   { key: 'caveats', label: '주의사항', hint: '부작용, 재발 조건, 적용 범위 밖인 상황', rows: 3, tone: 'warn' },
-  { key: 'related_refs', label: '관련 참조', hint: '벤더 버그 ID·케이스 번호·문서명 (한 줄에 하나)', rows: 2, mono: true },
+  { key: 'related_refs', label: '관련 참조', hint: '벤더 버그 ID·케이스 번호·문서명 (한 줄에 하나)', rows: 2, mono: true, cards: true },
 ];
 
 const monoStyle = {
@@ -331,7 +332,18 @@ export default function KnowledgeDetailPage() {
                             style={{ letterSpacing: '0.04em' }}>
                         {s.label}
                       </Text>
-                      {s.mono ? (
+                      {s.cards ? (
+                        <Stack gap="xs">
+                          {item[s.key].split('\n')
+                            .map((line) => line.trim())
+                            .filter(Boolean)
+                            .map((line, i) => (
+                              <Paper key={i} withBorder p="sm" radius="md">
+                                <Text size="sm" fw={500} style={monoStyle}>{line}</Text>
+                              </Paper>
+                            ))}
+                        </Stack>
+                      ) : s.mono ? (
                         <Paper bg="gray.0" p="md" radius="md">
                           <Text size="sm" style={monoStyle}>{item[s.key]}</Text>
                         </Paper>
