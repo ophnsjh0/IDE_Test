@@ -426,3 +426,43 @@ class LabLink(models.Model):
 
     def __str__(self):
         return f"{self.source}:{self.source_port} <-> {self.target}:{self.target_port}"
+
+
+class LabNodeAccess(models.Model):
+    """랩 노드의 관리 접속 정보 — 사람이 적는 값.
+
+    EVE-NG는 이걸 모른다(장비 설정 안에 있다). 그래서 토폴로지 스냅샷(LabNode)과
+    분리한다: 스냅샷은 갱신할 때마다 EVE-NG 값으로 덮이지만, 이 표는 사람이
+    적은 것이라 살아남아야 한다. 키는 노드 이름이라 랩을 다른 서버로 옮겨도
+    이름이 같으면 그대로 붙는다.
+    """
+    DRIVER_CHOICES = [
+        ('a10_axapi', 'A10 aXAPI'),
+        ('arista_eapi', 'Arista eAPI'),
+        ('linux_ssh', 'Linux (SSH 포트)'),
+        ('none', '확인 안 함'),
+    ]
+
+    lab = models.ForeignKey(Lab, on_delete=models.CASCADE, related_name='accesses')
+    node_name = models.CharField(max_length=100)     # LabNode.name과 같은 키
+    # 블루프린트가 포트·장비명을 하드코딩하지 않고 이 역할을 참조한다
+    # (랩이 늘어나도 시나리오를 재사용하기 위해). Step 4에서 쓴다.
+    role = models.CharField(max_length=50, blank=True, default='')
+    mgmt_ip = models.CharField(max_length=100, blank=True, default='')
+    driver = models.CharField(max_length=20, choices=DRIVER_CHOICES, default='none')
+    username = models.CharField(max_length=100, blank=True, default='')
+    # 실습 장비 비밀번호. API 응답에는 절대 싣지 않는다(시리얼라이저 write_only).
+    # DB 백업은 age로 암호화되지만 DB 자체에는 평문으로 들어간다 — 운영 장비
+    # 계정을 여기 넣으면 안 된다.
+    password = models.CharField(max_length=200, blank=True, default='')
+
+    class Meta:
+        ordering = ['node_name']
+        unique_together = [('lab', 'node_name')]
+
+    def __str__(self):
+        return f"{self.lab.name}/{self.node_name} ({self.driver})"
+
+    @property
+    def probeable(self):
+        return bool(self.mgmt_ip) and self.driver != 'none'

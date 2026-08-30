@@ -3,6 +3,7 @@ import logging
 import queue
 import re
 import threading
+import time
 from datetime import timedelta
 from urllib.parse import quote
 
@@ -25,7 +26,7 @@ from .permissions import IsAdminRole, IsEngineerOrAbove
 from .serializers import (CaseSerializer, CaseDetailSerializer,
                           ChatSessionDetailSerializer, ChatSessionSerializer,
                           KnowledgeItemSerializer, LabDetailSerializer,
-                          LabSerializer)
+                          LabNodeAccessSerializer, LabSerializer)
 from .services.usage import log_event
 from .services.analyzer import (
     AVAILABLE_MODELS,
@@ -38,7 +39,7 @@ from .services.analyzer import (
     get_translation_model,
     provider_api_key,
 )
-from .services import eveng, help_agent
+from .services import eveng, help_agent, lab_probe
 from .services.gmail_client import GmailAuthError
 from .services.gmail_sync import (LAST_RUN_SETTING_KEY, SyncInProgress,
                                   is_cron_enabled, set_cron_enabled, sync_gmail)
@@ -1099,3 +1100,162 @@ class LabIconView(APIView):
         response = HttpResponse(content, content_type=content_type)
         response['Cache-Control'] = 'private, max-age=86400'  # 아이콘은 잘 안 바뀐다
         return response
+
+
+class LabAccessView(APIView):
+    """GET/PUT /api/labs/<id>/access/ — 노드별 관리 접속 정보 (엔지니어 이상).
+
+    EVE-NG가 모르는 값이라 사람이 적는다. 토폴로지 스냅샷과 분리돼 있어
+    "토폴로지 갱신"으로 덮이지 않는다. 비밀번호는 저장만 하고 돌려주지 않는다.
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    def get(self, request, id):
+        from .models import Lab
+        lab = Lab.objects.filter(id=id).first()
+        if lab is None:
+            return Response({'error': '등록되지 않은 랩입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        return Response(LabNodeAccessSerializer(lab.accesses.all(), many=True).data)
+
+    def put(self, request, id):
+        from .models import Lab, LabNodeAccess
+        lab = Lab.objects.filter(id=id).first()
+        if lab is None:
+            return Response({'error': '등록되지 않은 랩입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        rows = request.data if isinstance(request.data, list) else request.data.get('rows')
+        if not isinstance(rows, list):
+            return Response({'error': '노드 목록이 필요합니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        known = set(lab.nodes.values_list('name', flat=True))
+        with transaction.atomic():
+            for row in rows:
+                name = (row.get('node_name') or '').strip()
+                # 토폴로지에 없는 이름은 받지 않는다 — 오타로 만든 유령 행이
+                # 남으면 나중에 어느 노드 얘기인지 알 수 없다
+                if not name or (known and name not in known):
+                    continue
+                access, _ = LabNodeAccess.objects.get_or_create(lab=lab, node_name=name)
+                access.role = (row.get('role') or '').strip()[:50]
+                access.mgmt_ip = (row.get('mgmt_ip') or '').strip()[:100]
+                access.driver = row.get('driver') or 'none'
+                access.username = (row.get('username') or '').strip()[:100]
+                # 빈 문자열로 덮어써서 저장된 비밀번호를 날리지 않는다 —
+                # 화면은 비밀번호를 안 받아오므로 매번 빈 값으로 올라온다
+                if row.get('password'):
+                    access.password = row['password'][:200]
+                access.save()
+        return Response(LabNodeAccessSerializer(lab.accesses.all(), many=True).data)
+
+
+class LabStatusView(APIView):
+    """GET /api/labs/<id>/status/ — 노드별 실제 상태 (엔지니어 이상).
+
+    EVE-NG의 running과 장비 관리 API 프로브를 합쳐 꺼짐/기동 중/준비됨/확인 불가로
+    돌려준다. 화면이 주기적으로 부르는 자리라 프로브를 병렬로 돌리고 짧게 끊는다.
+
+    SSE 대신 폴링인 이유: 부팅은 분 단위로 진행되고 백엔드도 결국 EVE-NG를
+    폴링해야 한다. 긴 연결을 유지하는 값이 크지 않고, 취소·재시도가 단순하다.
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    def get(self, request, id):
+        from .models import Lab
+        lab = Lab.objects.prefetch_related('accesses').filter(id=id).first()
+        if lab is None:
+            return Response({'error': '등록되지 않은 랩입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        try:
+            running = eveng.EvengClient().node_states(lab.path)
+        except eveng.EvengError as e:
+            return _eveng_error_response(e)
+
+        states = lab_probe.node_states(running, list(lab.accesses.all()))
+        counts = {}
+        for state in states.values():
+            counts[state] = counts.get(state, 0) + 1
+        return Response({
+            'states': states,
+            'counts': counts,
+            'total': len(states),
+            # 접속 정보가 없어 판정할 수 없는 노드 — 화면이 "채워주세요"를 띄운다
+            'unprobeable': sorted(n for n, s in states.items() if s == lab_probe.UNKNOWN),
+        })
+
+
+def _power_worker(lab_id, action, node_names):
+    """전원 조작을 백그라운드에서 순차 실행한다.
+
+    한꺼번에 켜면 공용 EVE-NG가 부담을 받고 부팅도 서로 느려져서, 무거운 것부터
+    간격을 두고 올린다. 요청은 바로 돌려주고 진행은 화면 폴링이 본다.
+    """
+    from .models import Lab
+    try:
+        lab = Lab.objects.prefetch_related('nodes').get(id=lab_id)
+        nodes = {n.name: n for n in lab.nodes.all()}
+        # 켤 때는 RAM 큰 것부터, 끌 때는 순서가 상관없다
+        ordered = sorted(node_names, key=lambda n: -nodes[n].ram if n in nodes else 0)
+        client = eveng.EvengClient()
+        for i, name in enumerate(ordered):
+            node = nodes.get(name)
+            if node is None:
+                continue
+            try:
+                if action == 'start':
+                    client.start_node(lab.path, node.eve_id)
+                else:
+                    client.stop_node(lab.path, node.eve_id)
+            except eveng.EvengError:
+                logger.exception('전원 조작 실패: %s %s', action, name)
+            if action == 'start' and i < len(ordered) - 1:
+                time.sleep(POWER_STAGGER_SECONDS)
+    except Exception:
+        logger.exception('전원 작업이 중단됐습니다 (lab=%s, action=%s)', lab_id, action)
+    finally:
+        connection.close()  # 스레드가 쓴 DB 커넥션은 직접 닫는다
+
+
+# 순차 기동 간격. 9노드(44GB)를 한꺼번에 띄우면 공용 EVE-NG가 휘청인다.
+POWER_STAGGER_SECONDS = 3
+
+
+class LabPowerView(APIView):
+    """POST /api/labs/<id>/power/ — 노드 전원 조작 (엔지니어 이상).
+
+    body: {"action": "start"|"stop", "nodes": ["A10_1", ...]}
+    nodes를 생략하면 랩 전체. 조작은 백그라운드에서 순차로 돌고, 진행 상황은
+    /status/ 폴링으로 본다 — 9노드를 동기로 처리하면 요청이 수십 초 걸린다.
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    def post(self, request, id):
+        from .models import Lab
+        lab = Lab.objects.prefetch_related('nodes').filter(id=id).first()
+        if lab is None:
+            return Response({'error': '등록되지 않은 랩입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        action = request.data.get('action')
+        if action not in ('start', 'stop'):
+            return Response({'error': "action은 start 또는 stop이어야 합니다."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if not eveng.is_configured():
+            return _eveng_error_response(eveng.EvengNotConfigured(
+                'EVE-NG 접속 정보가 없습니다.'))
+
+        known = {n.name for n in lab.nodes.all()}
+        requested = request.data.get('nodes')
+        names = [n for n in requested if n in known] if requested else sorted(known)
+        if not names:
+            return Response({'error': '대상 노드가 없습니다. 토폴로지를 먼저 갱신하세요.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        threading.Thread(target=_power_worker, args=(lab.id, action, names),
+                         daemon=True).start()
+        return Response({
+            'action': action,
+            'nodes': names,
+            'message': (f'{len(names)}대를 {POWER_STAGGER_SECONDS}초 간격으로 켜는 중입니다.'
+                        if action == 'start' else f'{len(names)}대를 끄는 중입니다.'),
+        }, status=status.HTTP_202_ACCEPTED)

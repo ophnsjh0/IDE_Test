@@ -62,6 +62,9 @@ urlpatterns = [
     path('labs/icons/<str:filename>', views.LabIconView.as_view(), name='lab-icon'),
     path('labs/<int:id>/', views.LabTopologyView.as_view(), name='lab-topology'),
     path('labs/<int:id>/refresh/', views.LabRefreshView.as_view(), name='lab-refresh'),
+    path('labs/<int:id>/access/', views.LabAccessView.as_view(), name='lab-access'),
+    path('labs/<int:id>/status/', views.LabStatusView.as_view(), name='lab-status'),
+    path('labs/<int:id>/power/', views.LabPowerView.as_view(), name='lab-power'),
     path('settings/gmail-sync/', views.GmailSyncScheduleView.as_view(),
          name='gmail-sync-schedule'),
 ]

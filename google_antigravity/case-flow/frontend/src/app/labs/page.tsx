@@ -6,21 +6,33 @@ import {
   ScrollArea, Select, Stack, Table, Text, Textarea, TextInput, Title, Tooltip,
 } from '@mantine/core';
 import {
-  IconAlertTriangle, IconCheck, IconCirclePlus, IconPlayerPlay, IconPlayerStop,
-  IconRefresh, IconSend, IconServerOff, IconTerminal2, IconTrash,
+  IconAlertTriangle, IconCheck, IconCircleCheck, IconCirclePlus,
+  IconPlayerPlay, IconPlayerStop,
+  IconKey, IconRefresh, IconSend, IconServerOff, IconTerminal2, IconTrash,
 } from '@tabler/icons-react';
 import AppHeader from '../components/AppHeader';
 import { apiFetch } from '../lib/api';
 import { useMe } from '../lib/useMe';
 import TopologyCanvas from './TopologyCanvas';
-import { nodeState, type AvailableLab, type LabDetail, type LabNode, type LabSummary, type NodeState } from './types';
+import {
+  DRIVERS, fallbackState,
+  type AvailableLab, type LabDetail, type LabNode, type LabStatus,
+  type LabSummary, type NodeAccess, type NodeState,
+} from './types';
 
 // Step 1 — EVE-NG를 실제로 읽는다. 전원 제어와 준비 판정은 Step 2에서 붙는다.
 // 지금 화면이 알 수 있는 상태는 꺼짐 / 기동 중(프로세스가 떴음)까지다.
 
 const READY_LABEL: Record<NodeState, string> = {
-  off: '꺼짐', booting: '기동 중', ready: '준비됨',
+  off: '꺼짐', booting: '기동 중', ready: '준비됨', unknown: '확인 불가',
 };
+const STATE_COLOR: Record<NodeState, string> = {
+  off: 'gray', booting: 'yellow', ready: 'teal', unknown: 'violet',
+};
+
+// 상태 폴링 주기. 부팅은 분 단위로 진행되고 프로브가 노드마다 최대 3초 걸리므로
+// 이보다 촘촘하게 볼 이유가 없다.
+const POLL_MS = 5000;
 
 const STEPS = [
   { label: '토폴로지 확인', hint: 'EVE-NG 배선과 대조' },
@@ -45,6 +57,12 @@ export default function LabsPage() {
   const [available, setAvailable] = useState<AvailableLab[] | null>(null);
   const [form, setForm] = useState({ path: '', name: '', vendor: '', description: '' });
   const [registering, setRegistering] = useState(false);
+
+  const [status, setStatus] = useState<LabStatus | null>(null);
+  const [powering, setPowering] = useState(false);
+  const [accessOpen, setAccessOpen] = useState(false);
+  const [access, setAccess] = useState<NodeAccess[]>([]);
+  const [savingAccess, setSavingAccess] = useState(false);
 
   const [chat, setChat] = useState<{ role: 'user' | 'assistant'; text: string }[]>([]);
   const [input, setInput] = useState('');
@@ -83,6 +101,25 @@ export default function LabsPage() {
     return () => { cancelled = true; };
   }, [labId]);
 
+  // 상태는 주기적으로 다시 묻는다. SSE 대신 폴링인 이유: 부팅이 분 단위로
+  // 진행되고 백엔드도 결국 EVE-NG를 폴링해야 해서, 긴 연결을 유지하는 값이
+  // 크지 않다. 랩을 바꾸거나 화면을 떠나면 타이머가 정리된다.
+  useEffect(() => {
+    if (!labId) { setStatus(null); return; }
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const res = await apiFetch(`/api/labs/${labId}/status/`);
+        if (!res.ok) return;
+        const data: LabStatus = await res.json();
+        if (!cancelled) setStatus(data);
+      } catch { /* 폴링 실패는 조용히 넘긴다 — 다음 주기에 다시 본다 */ }
+    };
+    tick();
+    const timer = setInterval(tick, POLL_MS);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [labId]);
+
   const refresh = async () => {
     if (!labId) return;
     setRefreshing(true);
@@ -98,6 +135,63 @@ export default function LabsPage() {
       setError(`토폴로지 갱신 실패: ${e instanceof Error ? e.message : e}`);
     } finally {
       setRefreshing(false);
+    }
+  };
+
+  const power = async (action: 'start' | 'stop', nodeNames?: string[]) => {
+    if (!labId) return;
+    if (action === 'start' && !nodeNames) {
+      // 공용 EVE-NG라 전체 켜기는 확인을 받는다 — 이 랩만 44GB를 먹는다
+      const ok = window.confirm(
+        `${nodes.length}대를 켭니다. EVE-NG에서 ${(totalRam / 1024).toFixed(0)}GB · `
+        + `${totalCpu} vCPU를 점유합니다.\n\n계속할까요?`);
+      if (!ok) return;
+    }
+    setPowering(true);
+    setError('');
+    try {
+      const res = await apiFetch(`/api/labs/${labId}/power/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, ...(nodeNames ? { nodes: nodeNames } : {}) }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    } catch (e) {
+      setError(`전원 조작 실패: ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setPowering(false);
+    }
+  };
+
+  const openAccess = async () => {
+    if (!labId) return;
+    setAccessOpen(true);
+    const res = await apiFetch(`/api/labs/${labId}/access/`);
+    const saved: NodeAccess[] = res.ok ? await res.json() : [];
+    const byName = new Map(saved.map((a) => [a.node_name, a]));
+    // 토폴로지의 모든 노드를 한 줄씩 보여준다 — 어디가 비었는지 보이는 게 목적
+    setAccess(nodes.map((n) => byName.get(n.name) ?? {
+      node_name: n.name, role: '', mgmt_ip: '', driver: 'none',
+      username: '', has_password: false,
+    }));
+  };
+
+  const saveAccess = async () => {
+    if (!labId) return;
+    setSavingAccess(true);
+    try {
+      const res = await apiFetch(`/api/labs/${labId}/access/`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rows: access }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setAccessOpen(false);
+    } catch (e) {
+      setError(`접속 정보 저장 실패: ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setSavingAccess(false);
     }
   };
 
@@ -154,7 +248,12 @@ export default function LabsPage() {
   };
 
   const nodes = lab?.nodes ?? [];
-  const running = nodes.filter((n) => n.running).length;
+  const stateOf = (n: LabNode): NodeState => status?.states[n.name] ?? fallbackState(n);
+  const ready = status?.counts.ready ?? 0;
+  const booting = status?.counts.booting ?? 0;
+  const unknown = status?.counts.unknown ?? 0;
+  const allOff = nodes.length > 0 && nodes.every((n) => stateOf(n) === 'off');
+  const allReady = nodes.length > 0 && ready === nodes.length;
   const totalRam = nodes.reduce((s, n) => s + n.ram, 0);
   const totalCpu = nodes.reduce((s, n) => s + n.cpu, 0);
   const nodeLinkCount = (lab?.links ?? []).filter(
@@ -215,6 +314,12 @@ export default function LabsPage() {
               </Button>
             )}
             <Button
+              variant="light" size="sm" leftSection={<IconKey size={16} />}
+              disabled={!lab || nodes.length === 0} onClick={openAccess}
+            >
+              접속 정보
+            </Button>
+            <Button
               variant="default" size="sm" leftSection={<IconRefresh size={16} />}
               loading={refreshing} disabled={!labId} onClick={refresh}
             >
@@ -249,19 +354,20 @@ export default function LabsPage() {
                  style={{ flex: '1 1 62%', display: 'flex', flexDirection: 'column' }}>
             <Group justify="space-between" mb="sm" wrap="nowrap">
               <Group gap="xs">
-                {/* 전원 제어는 Step 2에서 연결한다. 지금 누르면 아무 일도 없어야
-                    하므로 비활성으로 두고 이유를 툴팁에 적는다. */}
-                <Tooltip label="전원 제어는 다음 단계에서 연결됩니다">
-                  <Button size="sm" leftSection={<IconPlayerPlay size={16} />} disabled>
-                    전체 켜기
-                  </Button>
-                </Tooltip>
-                <Tooltip label="전원 제어는 다음 단계에서 연결됩니다">
-                  <Button size="sm" variant="default"
-                          leftSection={<IconPlayerStop size={16} />} disabled>
-                    전체 끄기
-                  </Button>
-                </Tooltip>
+                <Button
+                  size="sm" leftSection={<IconPlayerPlay size={16} />}
+                  loading={powering} disabled={nodes.length === 0 || !allOff}
+                  onClick={() => power('start')}
+                >
+                  전체 켜기
+                </Button>
+                <Button
+                  size="sm" variant="default" leftSection={<IconPlayerStop size={16} />}
+                  loading={powering} disabled={nodes.length === 0 || allOff}
+                  onClick={() => power('stop')}
+                >
+                  전체 끄기
+                </Button>
                 {nodes.length > 0 && (
                   <Tooltip label="이 랩 전체를 켰을 때 EVE-NG에서 점유하는 자원">
                     <Badge variant="light" color="gray" size="lg">
@@ -271,10 +377,34 @@ export default function LabsPage() {
                 )}
               </Group>
 
+              {/* 말씀하신 "다 켜졌는지 확인시켜주는 알람" — 부팅 완료 기준이다 */}
               {nodes.length > 0 && (
-                <Badge size="lg" color={running > 0 ? 'yellow' : 'gray'}>
-                  기동 중 {running}/{nodes.length}
-                </Badge>
+                <Group gap="xs" wrap="nowrap">
+                  {unknown > 0 && (
+                    <Tooltip label={`접속 정보 미등록: ${status?.unprobeable.join(', ')}`}>
+                      <Badge size="lg" color="violet" variant="light"
+                             style={{ cursor: 'pointer' }} onClick={openAccess}>
+                        확인 불가 {unknown}
+                      </Badge>
+                    </Tooltip>
+                  )}
+                  {allReady ? (
+                    <Badge size="lg" color="teal"
+                           leftSection={<IconCircleCheck size={14} />}>
+                      전체 준비됨 {ready}/{nodes.length}
+                    </Badge>
+                  ) : (
+                    <Badge
+                      size="lg" color={booting > 0 ? 'yellow' : 'gray'}
+                      leftSection={booting > 0
+                        ? <Loader size={11} color="yellow" />
+                        : <IconAlertTriangle size={14} />}
+                    >
+                      준비 {ready}/{nodes.length}
+                      {booting > 0 && ` · 기동 중 ${booting}`}
+                    </Badge>
+                  )}
+                </Group>
               )}
             </Group>
 
@@ -284,6 +414,7 @@ export default function LabsPage() {
               ) : (
                 <TopologyCanvas
                   lab={lab}
+                  states={status?.states ?? {}}
                   selectedName={selected?.name ?? null}
                   onSelect={setSelected}
                 />
@@ -292,18 +423,13 @@ export default function LabsPage() {
 
             <Group justify="space-between" mt="sm" wrap="nowrap">
               <Group gap="lg">
-                {(['ready', 'booting', 'off'] as NodeState[]).map((s) => (
+                {(['ready', 'booting', 'unknown', 'off'] as NodeState[]).map((s) => (
                   <Group key={s} gap={6}>
                     <div style={{
                       width: 10, height: 10, borderRadius: 3,
-                      background: s === 'ready' ? 'var(--mantine-color-teal-5)'
-                        : s === 'booting' ? 'var(--mantine-color-yellow-5)'
-                        : 'var(--mantine-color-gray-4)',
-                      opacity: s === 'ready' ? 0.4 : 1,
+                      background: `var(--mantine-color-${STATE_COLOR[s]}-${s === 'off' ? 4 : 5})`,
                     }} />
-                    <Text size="xs" c="dimmed">
-                      {READY_LABEL[s]}{s === 'ready' && ' (다음 단계)'}
-                    </Text>
+                    <Text size="xs" c="dimmed">{READY_LABEL[s]}</Text>
                   </Group>
                 ))}
               </Group>
@@ -311,9 +437,8 @@ export default function LabsPage() {
               {selected ? (
                 <Group gap="xs" wrap="nowrap">
                   <Text size="sm" fw={600}>{selected.name}</Text>
-                  <Badge size="sm" variant="light"
-                         color={selected.running ? 'yellow' : 'gray'}>
-                    {READY_LABEL[nodeState(selected)]}
+                  <Badge size="sm" variant="light" color={STATE_COLOR[stateOf(selected)]}>
+                    {READY_LABEL[stateOf(selected)]}
                   </Badge>
                   <Text size="xs" c="dimmed">
                     {selected.image} · {selected.ram / 1024}GB · {selected.cpu} vCPU
@@ -323,11 +448,19 @@ export default function LabsPage() {
                       <Button size="compact-sm" variant="light">동작</Button>
                     </Menu.Target>
                     <Menu.Dropdown>
-                      <Menu.Item leftSection={<IconPlayerPlay size={14} />} disabled>
-                        켜기 (다음 단계)
+                      <Menu.Item
+                        leftSection={<IconPlayerPlay size={14} />}
+                        disabled={stateOf(selected) !== 'off'}
+                        onClick={() => power('start', [selected.name])}
+                      >
+                        켜기
                       </Menu.Item>
-                      <Menu.Item leftSection={<IconPlayerStop size={14} />} disabled>
-                        끄기 (다음 단계)
+                      <Menu.Item
+                        leftSection={<IconPlayerStop size={14} />}
+                        disabled={stateOf(selected) === 'off'}
+                        onClick={() => power('stop', [selected.name])}
+                      >
+                        끄기
                       </Menu.Item>
                       <Menu.Item
                         leftSection={<IconTerminal2 size={14} />}
@@ -418,6 +551,83 @@ export default function LabsPage() {
             </Paper>
           </Stack>
         </Group>
+
+        {/* 노드별 관리 접속 정보 — EVE-NG가 모르는 값이라 사람이 적는다.
+            준비 판정(프로브)이 이 정보로 장비를 찌른다. 토폴로지 갱신으로
+            덮이지 않는 별도 표다. */}
+        <Modal opened={accessOpen} onClose={() => setAccessOpen(false)}
+               title="노드 접속 정보" size="xl">
+          <Stack gap="md">
+            <Text size="sm" c="dimmed">
+              EVE-NG는 장비의 관리 IP를 모릅니다(장비 설정 안에 있습니다).
+              여기 적은 정보로 &ldquo;부팅이 끝났는지&rdquo;를 판정합니다.
+              비워두면 그 노드는 <b>확인 불가</b>로 표시됩니다.
+            </Text>
+            <div style={{ overflowX: 'auto' }}>
+              <Table>
+                <Table.Thead>
+                  <Table.Tr>
+                    <Table.Th style={{ minWidth: 110 }}>노드</Table.Th>
+                    <Table.Th style={{ minWidth: 130 }}>역할</Table.Th>
+                    <Table.Th style={{ minWidth: 140 }}>관리 IP</Table.Th>
+                    <Table.Th style={{ minWidth: 150 }}>확인 방식</Table.Th>
+                    <Table.Th style={{ minWidth: 110 }}>계정</Table.Th>
+                    <Table.Th style={{ minWidth: 130 }}>비밀번호</Table.Th>
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {access.map((row, i) => {
+                    const set = (patch: Partial<NodeAccess>) => setAccess(
+                      (prev) => prev.map((r, j) => (i === j ? { ...r, ...patch } : r)));
+                    return (
+                      <Table.Tr key={row.node_name}>
+                        <Table.Td><Text size="sm" fw={600}>{row.node_name}</Text></Table.Td>
+                        <Table.Td>
+                          <TextInput size="xs" placeholder="lb-primary"
+                                     value={row.role}
+                                     onChange={(e) => set({ role: e.currentTarget.value })} />
+                        </Table.Td>
+                        <Table.Td>
+                          <TextInput size="xs" placeholder="192.168.74.151"
+                                     value={row.mgmt_ip}
+                                     onChange={(e) => set({ mgmt_ip: e.currentTarget.value })} />
+                        </Table.Td>
+                        <Table.Td>
+                          <Select size="xs" data={DRIVERS} allowDeselect={false}
+                                  value={row.driver}
+                                  onChange={(v) => v && set({ driver: v })} />
+                        </Table.Td>
+                        <Table.Td>
+                          <TextInput size="xs" value={row.username}
+                                     onChange={(e) => set({ username: e.currentTarget.value })} />
+                        </Table.Td>
+                        <Table.Td>
+                          {/* 저장된 비밀번호는 돌려받지 않는다. 비워두면 그대로 유지 */}
+                          <TextInput size="xs" type="password"
+                                     placeholder={row.has_password ? '저장됨 (변경 시 입력)' : ''}
+                                     value={row.password ?? ''}
+                                     onChange={(e) => set({ password: e.currentTarget.value })} />
+                        </Table.Td>
+                      </Table.Tr>
+                    );
+                  })}
+                </Table.Tbody>
+              </Table>
+            </div>
+            <Text size="xs" c="dimmed">
+              비밀번호는 DB에 저장되고 화면으로 다시 내려오지 않습니다.
+              DB 백업은 암호화되지만 DB 자체에는 평문으로 들어가므로,
+              <b> 운영 장비 계정은 넣지 마세요.</b>
+            </Text>
+            <Group justify="flex-end" gap="xs">
+              <Button variant="default" onClick={() => setAccessOpen(false)}>취소</Button>
+              <Button leftSection={<IconCheck size={16} />} loading={savingAccess}
+                      onClick={saveAccess}>
+                저장
+              </Button>
+            </Group>
+          </Stack>
+        </Modal>
 
         {/* 등록은 EVE-NG의 랩을 이 메뉴에 올리는 것일 뿐 EVE-NG를 바꾸지 않는다.
             EVE-NG에는 다른 사람 작업용 랩이 섞여 있어 전부 노출하지 않는다. */}

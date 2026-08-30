@@ -2,7 +2,7 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from .models import (Case, CaseEmail, ChatSession, ChatTurn, KnowledgeItem,
-                     Lab, LabLink, LabNetwork, LabNode)
+                     Lab, LabLink, LabNetwork, LabNode, LabNodeAccess)
 
 
 class CaseEmailSerializer(serializers.ModelSerializer):
@@ -138,3 +138,17 @@ class LabDetailSerializer(LabSerializer):
 
     class Meta(LabSerializer.Meta):
         fields = LabSerializer.Meta.fields + ['nodes', 'networks', 'links']
+
+
+class LabNodeAccessSerializer(serializers.ModelSerializer):
+    """비밀번호는 받기만 하고 내보내지 않는다. 저장돼 있는지 여부만 알려준다."""
+    password = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    has_password = serializers.SerializerMethodField()
+
+    def get_has_password(self, obj):
+        return bool(obj.password)
+
+    class Meta:
+        model = LabNodeAccess
+        fields = ['node_name', 'role', 'mgmt_ip', 'driver', 'username',
+                  'password', 'has_password']

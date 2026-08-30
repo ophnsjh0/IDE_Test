@@ -16,7 +16,7 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from .models import AppSetting, Case, CaseEmail
-from .services import analyzer, eveng, gmail_sync, help_agent
+from .services import analyzer, eveng, gmail_sync, help_agent, lab_probe
 from .services.email_parser import (build_gmail_query, clean_subject,
                                     detect_vendor_and_direction,
                                     extract_device_info, find_ignore_reason,
@@ -2871,6 +2871,173 @@ class LabRegistryTests(TestCase):
         # 등록도 막는다 — 안 막으면 base_url이 빈 서버 행이 생겨 랩이 붕 뜬다
         self.assertEqual(self.register().status_code, 503)
         self.assertEqual(LabServer.objects.count(), 0)
+
+
+class LabProbeTests(TestCase):
+    """준비 판정 — EVE-NG의 running과 프로브를 합쳐 4단계로 가른다."""
+
+    def access(self, name, driver='a10_axapi', ip='10.0.0.1'):
+        from .models import Lab, LabNodeAccess, LabServer
+        server = LabServer.objects.get_or_create(base_url='http://eve.test')[0]
+        lab = Lab.objects.get_or_create(server=server, path='/x.unl',
+                                        defaults={'name': 'x'})[0]
+        return LabNodeAccess(lab=lab, node_name=name, driver=driver, mgmt_ip=ip,
+                             username='u', password='p')
+
+    def test_running_without_access_is_unknown_not_booting(self):
+        """접속 정보가 없으면 '기동 중'이 아니라 '확인 불가'다 —
+        영영 안 끝나는 것처럼 보이면 뭘 해야 할지 알 수 없다."""
+        states = lab_probe.node_states({'A10_1': True, 'A10_2': False}, [])
+        self.assertEqual(states, {'A10_1': lab_probe.UNKNOWN, 'A10_2': lab_probe.OFF})
+
+    def test_probe_result_splits_ready_and_booting(self):
+        accesses = [self.access('A10_1'), self.access('A10_2')]
+        with patch.object(lab_probe, 'probe',
+                          side_effect=lambda a: a.node_name == 'A10_1'):
+            states = lab_probe.node_states({'A10_1': True, 'A10_2': True}, accesses)
+        self.assertEqual(states, {'A10_1': lab_probe.READY, 'A10_2': lab_probe.BOOTING})
+
+    def test_stopped_nodes_are_not_probed(self):
+        """꺼진 노드를 찌르면 타임아웃만 기다리게 된다."""
+        with patch.object(lab_probe, 'probe') as mocked:
+            lab_probe.node_states({'A10_1': False}, [self.access('A10_1')])
+        mocked.assert_not_called()
+
+    def test_probe_without_ip_or_driver_is_unknown(self):
+        cases = [self.access('n1', driver='none'), self.access('n2', ip='')]
+        for access in cases:
+            self.assertIsNone(lab_probe.probe(access))
+
+    def test_probe_failure_is_not_ready_not_crash(self):
+        """장비가 부팅 중이면 예외가 난다 — 그냥 '아직 아니다'로 본다."""
+        access = self.access('n1', driver='linux_ssh', ip='203.0.113.1')
+        with patch('api.services.lab_probe.socket.create_connection',
+                   side_effect=OSError('timed out')):
+            self.assertFalse(lab_probe.probe(access))
+
+
+@override_settings(EVENG_URL='http://eve.test', EVENG_USER='admin', EVENG_PASSWORD='pw')
+class LabPowerAndAccessTests(TestCase):
+    """전원 제어와 노드 접속 정보."""
+
+    def setUp(self):
+        from .models import Lab, LabNode, LabServer
+        from .permissions import set_user_role
+        for username, role in (('lp-v', 'viewer'), ('lp-e', 'engineer')):
+            user = User.objects.create_user(username, password='lp-pass-1!')
+            set_user_role(user, role)
+        server = LabServer.objects.create(base_url='http://eve.test')
+        self.lab = Lab.objects.create(server=server, path='/x.unl', name='x')
+        LabNode.objects.create(lab=self.lab, name='A10_1', eve_id=3, ram=8192)
+        LabNode.objects.create(lab=self.lab, name='Arista_1', eve_id=1, ram=4096)
+
+    def login(self, username='lp-e'):
+        self.client.post('/api/auth/login/',
+                         {'username': username, 'password': 'lp-pass-1!'},
+                         content_type='application/json')
+
+    def test_power_starts_heaviest_first(self):
+        """한꺼번에 켜면 공용 EVE-NG가 부담을 받는다 — 무거운 것부터 순차로."""
+        client = MagicMock()
+        self.login()
+        with patch('api.views.eveng.EvengClient', return_value=client), \
+             patch('api.views.time.sleep'), \
+             patch('api.views.connection.close'), \
+             patch('api.views.threading.Thread',
+                   side_effect=lambda target, args, daemon: SimpleNamespace(
+                       start=lambda: target(*args))):
+            res = self.client.post(f'/api/labs/{self.lab.id}/power/', {'action': 'start'},
+                                   content_type='application/json')
+
+        self.assertEqual(res.status_code, 202)
+        started = [call.args[1] for call in client.start_node.call_args_list]
+        self.assertEqual(started, [3, 1])  # A10(8GB) -> Arista(4GB)
+
+    def test_power_rejects_unknown_action(self):
+        self.login()
+        res = self.client.post(f'/api/labs/{self.lab.id}/power/', {'action': 'reboot'},
+                               content_type='application/json')
+        self.assertEqual(res.status_code, 400)
+
+    def test_power_ignores_nodes_not_in_the_lab(self):
+        """오타로 남의 랩 노드를 끄는 일이 없게 토폴로지에 있는 이름만 받는다."""
+        self.login()
+        with patch('api.views._power_worker'):
+            res = self.client.post(f'/api/labs/{self.lab.id}/power/',
+                                   {'action': 'stop', 'nodes': ['A10_1', '남의노드']},
+                                   content_type='application/json')
+        self.assertEqual(res.json()['nodes'], ['A10_1'])
+
+    def test_viewer_cannot_control_power(self):
+        self.login('lp-v')
+        res = self.client.post(f'/api/labs/{self.lab.id}/power/', {'action': 'stop'},
+                               content_type='application/json')
+        self.assertEqual(res.status_code, 403)
+
+    def test_access_password_is_never_returned(self):
+        self.login()
+        self.client.put(f'/api/labs/{self.lab.id}/access/', {'rows': [
+            {'node_name': 'A10_1', 'mgmt_ip': '10.0.0.1', 'driver': 'a10_axapi',
+             'username': 'admin', 'password': 'lab-secret'},
+        ]}, content_type='application/json')
+
+        body = self.client.get(f'/api/labs/{self.lab.id}/access/').json()
+        row = [r for r in body if r['node_name'] == 'A10_1'][0]
+        self.assertTrue(row['has_password'])
+        self.assertNotIn('lab-secret', json.dumps(body))
+        self.assertNotIn('password', row)
+
+    def test_blank_password_keeps_the_stored_one(self):
+        """화면은 비밀번호를 안 받아오므로 매번 빈 값으로 올라온다 —
+        그걸로 덮으면 저장해둔 값이 날아간다."""
+        from .models import LabNodeAccess
+        self.login()
+        rows = [{'node_name': 'A10_1', 'mgmt_ip': '10.0.0.1', 'driver': 'a10_axapi',
+                 'username': 'admin', 'password': 'keep-me'}]
+        self.client.put(f'/api/labs/{self.lab.id}/access/', {'rows': rows},
+                        content_type='application/json')
+        rows[0]['password'] = ''
+        rows[0]['role'] = 'lb-primary'
+        self.client.put(f'/api/labs/{self.lab.id}/access/', {'rows': rows},
+                        content_type='application/json')
+
+        access = LabNodeAccess.objects.get(lab=self.lab, node_name='A10_1')
+        self.assertEqual(access.password, 'keep-me')
+        self.assertEqual(access.role, 'lb-primary')
+
+    def test_access_rejects_names_not_in_topology(self):
+        """오타로 만든 유령 행이 남으면 나중에 어느 노드 얘기인지 알 수 없다."""
+        from .models import LabNodeAccess
+        self.login()
+        self.client.put(f'/api/labs/{self.lab.id}/access/', {'rows': [
+            {'node_name': '없는노드', 'mgmt_ip': '10.0.0.9', 'driver': 'a10_axapi'},
+        ]}, content_type='application/json')
+        self.assertEqual(LabNodeAccess.objects.count(), 0)
+
+    def test_access_survives_topology_refresh(self):
+        """사람이 적은 값은 EVE-NG 갱신으로 덮이면 안 된다."""
+        from .models import LabNodeAccess
+        self.login()
+        self.client.put(f'/api/labs/{self.lab.id}/access/', {'rows': [
+            {'node_name': 'A10_1', 'mgmt_ip': '10.0.0.1', 'driver': 'a10_axapi',
+             'username': 'admin', 'password': 'pw'},
+        ]}, content_type='application/json')
+
+        with patch('api.views.eveng.EvengClient', return_value=fake_eveng()):
+            self.client.post(f'/api/labs/{self.lab.id}/refresh/')
+
+        access = LabNodeAccess.objects.get(lab=self.lab, node_name='A10_1')
+        self.assertEqual((access.mgmt_ip, access.password), ('10.0.0.1', 'pw'))
+
+    def test_status_counts_and_lists_unprobeable(self):
+        self.login()
+        with patch('api.views.eveng.EvengClient') as client:
+            client.return_value.node_states.return_value = {'A10_1': True, 'Arista_1': False}
+            body = self.client.get(f'/api/labs/{self.lab.id}/status/').json()
+
+        self.assertEqual(body['counts'], {'unknown': 1, 'off': 1})
+        self.assertEqual(body['unprobeable'], ['A10_1'])
+        self.assertEqual(body['total'], 2)
 
 
 class LabConfigTests(TestCase):

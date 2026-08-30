@@ -171,6 +171,25 @@ class EvengClient:
             'links': links,
         }
 
+    # ------------------------------------------------------------ 전원
+
+    def start_node(self, lab_path, eve_id):
+        """노드 전원을 켠다. 돌아오는 건 '프로세스를 띄웠다'까지고, 부팅 완료가
+        아니다 — 준비 판정은 lab_probe가 장비 관리 API를 찔러서 한다."""
+        self.get(f'/api/labs/{_quote(lab_path)}/nodes/{int(eve_id)}/start')
+
+    def stop_node(self, lab_path, eve_id):
+        self.get(f'/api/labs/{_quote(lab_path)}/nodes/{int(eve_id)}/stop')
+
+    def node_states(self, lab_path):
+        """{노드 이름: 프로세스가 떠 있는가}. 상태만 필요할 때 토폴로지 전체를
+        다시 받지 않으려고 따로 둔다(폴링이 매번 도는 자리)."""
+        raw = self.get(f'/api/labs/{_quote(lab_path)}/nodes') or {}
+        return {
+            (n.get('name') or f'node{eve_id}'): int(n.get('status') or 0) != 0
+            for eve_id, n in raw.items()
+        }
+
     def icon(self, filename):
         """노드 아이콘 원본 바이트. 브라우저가 EVE-NG에 직접 붙지 않도록 중계한다."""
         if not self._logged_in:

@@ -3,7 +3,7 @@
 import { Text } from '@mantine/core';
 import { apiUrl } from '../lib/api';
 import type { LabDetail, LabNode, NodeState } from './types';
-import { nodeState } from './types';
+import { fallbackState } from './types';
 
 // EVE-NG 좌표를 그대로 받아 SVG로 다시 그린다. 스크린샷을 가져오지 않는 이유:
 // ① EVE-NG에 토폴로지 캡처 API가 없고(랩 pictures도 비어 있음) ② 이미지였다면
@@ -14,6 +14,9 @@ const STATE_COLOR: Record<NodeState, string> = {
   off: 'var(--mantine-color-gray-4)',
   booting: 'var(--mantine-color-yellow-5)',
   ready: 'var(--mantine-color-teal-5)',
+  // 확인 불가는 '기동 중'과 구분되는 색이어야 한다 — 기다리면 되는 상태가 아니라
+  // 접속 정보를 채워야 하는 상태다.
+  unknown: 'var(--mantine-color-violet-4)',
 };
 
 const BOX_W = 108;
@@ -22,10 +25,12 @@ const PAD = 60;
 
 export default function TopologyCanvas({
   lab,
+  states,
   selectedName,
   onSelect,
 }: {
   lab: LabDetail | null;
+  states: Record<string, NodeState>;
   selectedName: string | null;
   onSelect: (node: LabNode) => void;
 }) {
@@ -77,8 +82,9 @@ export default function TopologyCanvas({
         if (!a || !b) return null;
         const p = center(a);
         const q = center(b);
-        // 양쪽 다 떠 있는 링크만 진하게 — 어디까지 살아났는지 배선으로도 읽힌다
-        const live = a.running && b.running;
+        // 양쪽 다 준비된 링크만 진하게 — 어디까지 살아났는지 배선으로도 읽힌다
+        const live = (states[a.name] ?? fallbackState(a)) === 'ready'
+          && (states[b.name] ?? fallbackState(b)) === 'ready';
         return (
           <g key={i}>
             <line
@@ -100,7 +106,7 @@ export default function TopologyCanvas({
 
       {lab.nodes.map((n) => {
         const selected = n.name === selectedName;
-        const state = nodeState(n);
+        const state = states[n.name] ?? fallbackState(n);
         return (
           <g
             key={n.name}
@@ -114,6 +120,13 @@ export default function TopologyCanvas({
               stroke={STATE_COLOR[state]}
               strokeWidth={selected ? 4 : 2.5}
             />
+            {state === 'booting' && (
+              <rect width={BOX_W} height={BOX_H} rx={8} fill="none"
+                    stroke={STATE_COLOR.booting} strokeWidth={2.5}>
+                <animate attributeName="opacity" values="1;0.15;1"
+                         dur="1.2s" repeatCount="indefinite" />
+              </rect>
+            )}
             {/* 아이콘은 백엔드가 EVE-NG에서 중계한다 — 브라우저가 EVE-NG에
                 직접 붙지 않게 하고, 자격증명도 나가지 않는다. */}
             {n.icon && (
