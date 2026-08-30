@@ -17,6 +17,7 @@ import {
   Loader,
   Center,
   Select,
+  Tooltip,
   Pagination
 } from '@mantine/core';
 import {
@@ -33,17 +34,10 @@ import ScrollToTopButton from '../components/ScrollToTopButton';
 import { apiFetch } from '../lib/api';
 import { useMe } from '../lib/useMe';
 
-interface ModelInfo {
-  id: string;
-  provider: string;
-  note: string;
-  key_configured: boolean;
-}
-
-const PROVIDER_LABELS: Record<string, string> = {
-  anthropic: 'Anthropic Claude',
-  openai: 'OpenAI',
-  google: 'Google Gemini',
+// 모델 id -> 화면 표기. 지식 추출 선택지는 서버(analyzer.KNOWLEDGE_MODELS)와 맞춘다.
+const MODEL_LABELS: Record<string, string> = {
+  'claude-opus-5': 'Opus 5',
+  'claude-sonnet-5': 'Sonnet 5',
 };
 
 interface KnowledgeItem {
@@ -51,9 +45,14 @@ interface KnowledgeItem {
   knowledge_id: string;
   vendor: string;
   title: string;
+  environment: string;
   problem: string;
+  diagnosis: string;
   root_cause: string;
   resolution: string;
+  verification: string;
+  caveats: string;
+  related_refs: string;
   device_model: string;
   software_version: string;
   status: string; // draft | confirmed
@@ -131,62 +130,21 @@ function KnowledgeListPage() {
   const [sortAsc, setSortAsc] = useState(searchParams.get('dir') !== 'desc');
   const [syncing, setSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState('');
-  const [models, setModels] = useState<ModelInfo[]>([]);
-  const [currentModel, setCurrentModel] = useState<string | null>(null);
-  const [modelSaving, setModelSaving] = useState(false);
+  const [knowledgeModel, setKnowledgeModel] = useState<string | null>(null);
   const { isAdmin } = useMe();
   const router = useRouter();
 
-  // 케이스 목록과 동일한 전역 AI 모델 설정 — 지식 추출도 이 모델을 쓴다
-  const fetchModelInfo = async () => {
+  // 지식 추출 전용 모델(메일 분석 모델과 별개). 여기서는 표시만 하고,
+  // 변경은 관리자 페이지에서 한다 — 화면마다 같은 설정을 바꿀 수 있으면
+  // 무엇이 바뀌는지 알기 어렵다.
+  const fetchKnowledgeModel = async () => {
     try {
-      const response = await apiFetch('/api/settings/translation-model/');
-      if (response.ok) {
-        const data = await response.json();
-        setModels(data.models);
-        setCurrentModel(data.current);
-      }
+      const response = await apiFetch('/api/settings/knowledge-model/');
+      if (response.ok) setKnowledgeModel((await response.json()).current);
     } catch (error) {
-      console.error('Error fetching model info:', error);
+      console.error('Error fetching knowledge model:', error);
     }
   };
-
-  const changeModel = async (model: string | null) => {
-    if (!model || model === currentModel) return;
-    setModelSaving(true);
-    try {
-      const response = await apiFetch('/api/settings/translation-model/', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model }),
-      });
-      const data = await response.json();
-      if (response.ok) {
-        setCurrentModel(data.current);
-        setSyncMessage(`AI 분석 모델이 ${data.current}(으)로 변경되었습니다.`);
-      } else {
-        setSyncMessage(`모델 변경 실패: ${data.error || response.statusText}`);
-      }
-    } catch (error) {
-      console.error('Error changing model:', error);
-      setSyncMessage('모델 변경 실패: 백엔드 서버에 연결할 수 없습니다.');
-    } finally {
-      setModelSaving(false);
-    }
-  };
-
-  const modelSelectData = Object.keys(PROVIDER_LABELS)
-    .map((provider) => ({
-      group: PROVIDER_LABELS[provider],
-      items: models
-        .filter((m) => m.provider === provider)
-        .map((m) => ({
-          value: m.id,
-          label: `${m.id} (${m.note})`,
-          disabled: !m.key_configured,
-        })),
-    }))
-    .filter((group) => group.items.length > 0);
 
   const fetchItems = async () => {
     setLoading(true);
@@ -208,7 +166,7 @@ function KnowledgeListPage() {
 
   useEffect(() => {
     fetchItems();
-    fetchModelInfo();
+    fetchKnowledgeModel();
   }, []);
 
   // 미검토 Resolved 케이스에서 지식 일괄 추출 (관리자 전용, 한 번에 최대 10건)
@@ -255,7 +213,8 @@ function KnowledgeListPage() {
     const statusMatch = statusTab === 'all' || k.status === statusTab;
     const q = searchQuery.toLowerCase();
     // 커맨드·에러 문자열 검색이 핵심 용도라 해결 본문까지 검색 대상에 포함
-    const searchMatch = [k.title, k.problem, k.root_cause, k.resolution,
+    const searchMatch = [k.title, k.environment, k.problem, k.diagnosis, k.root_cause,
+      k.resolution, k.verification, k.caveats, k.related_refs,
       k.knowledge_id, k.device_model, k.software_version, k.source_case?.case_id]
       .some((field) => (field || '').toLowerCase().includes(q));
     return vendorMatch && statusMatch && searchMatch;
@@ -392,20 +351,16 @@ function KnowledgeListPage() {
               <Text c="dimmed">해결된 케이스에서 추출한 문제-원인-해결 지식</Text>
             </div>
             <Group gap="xs">
-              {isAdmin && (
-                <Select
-                  leftSection={<IconSparkles size={14} />}
-                  placeholder="AI 분석 모델"
-                  data={modelSelectData}
-                  value={currentModel}
-                  onChange={changeModel}
-                  disabled={modelSaving}
-                  w={300}
-                  size="sm"
-                  searchable={false}
-                  allowDeselect={false}
-                  comboboxProps={{ width: 340, position: 'bottom-end' }}
-                />
+              {/* 여기 있던 모델 셀렉터는 '메일 분석' 전역 설정이었다 — 지식 화면에서
+                  바꾸면 메일 동기화 모델까지 바뀌어 오해를 샀다. 지식 추출 모델은
+                  관리자 페이지에서 바꾸고, 여기서는 무엇으로 뽑는지만 보여준다. */}
+              {knowledgeModel && (
+                <Tooltip label="변경: 계정 관리 > 지식 추출 AI 모델" position="bottom">
+                  <Badge size="lg" variant="light" color="gray" radius="sm"
+                         leftSection={<IconSparkles size={12} />}>
+                    {MODEL_LABELS[knowledgeModel] ?? knowledgeModel}
+                  </Badge>
+                </Tooltip>
               )}
               {isAdmin && (
                 <Button

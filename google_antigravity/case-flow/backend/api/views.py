@@ -28,8 +28,12 @@ from .serializers import (CaseSerializer, CaseDetailSerializer,
 from .services.usage import log_event
 from .services.analyzer import (
     AVAILABLE_MODELS,
+    KNOWLEDGE_MODEL_DEFAULT,
+    KNOWLEDGE_MODEL_SETTING_KEY,
+    KNOWLEDGE_MODELS,
     TRANSLATION_MODEL_SETTING_KEY,
     detect_provider,
+    get_knowledge_model,
     get_translation_model,
     provider_api_key,
 )
@@ -209,6 +213,51 @@ class TranslationModelView(APIView):
             'models': [
                 {**m, 'key_configured': bool(provider_api_key(m['provider']))}
                 for m in AVAILABLE_MODELS
+            ],
+        }
+
+
+class KnowledgeModelView(APIView):
+    """GET/PUT /api/settings/knowledge-model/ — 지식 추출 전용 모델 조회/변경.
+
+    메일 분석 모델(translation-model)과 분리돼 있다. 메일은 건수가 많아 저비용
+    모델이 합리적이지만 지식은 케이스당 1회 만들어 오래 재사용하는 자산이라
+    품질이 우선이고, 그래서 선택지도 상위 두 모델(analyzer.KNOWLEDGE_MODELS)로
+    묶여 있다. 기본값은 Opus 5.
+    """
+
+    def get_permissions(self):
+        # 비용에 영향 -> 변경은 관리자만. 조회는 전 역할(어떤 모델로 뽑혔는지 표시).
+        if self.request.method == 'PUT':
+            return [IsAdminRole()]
+        return super().get_permissions()
+
+    def get(self, request):
+        return Response(self._payload())
+
+    def put(self, request):
+        model = (request.data.get('model') or '').strip()
+        if model not in KNOWLEDGE_MODELS:
+            allowed = ', '.join(KNOWLEDGE_MODELS)
+            return Response({'error': f'지식 추출 모델은 {allowed} 중에서만 선택할 수 있습니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if not provider_api_key(detect_provider(model)):
+            return Response({'error': '해당 제공자의 API 키가 .env에 설정되어 있지 않습니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        AppSetting.set(KNOWLEDGE_MODEL_SETTING_KEY, model)
+        return Response(self._payload())
+
+    @staticmethod
+    def _payload():
+        catalog = {m['id']: m for m in AVAILABLE_MODELS}
+        return {
+            'current': get_knowledge_model(),
+            'default': KNOWLEDGE_MODEL_DEFAULT,
+            'models': [
+                {**catalog.get(model_id, {'id': model_id, 'provider': 'anthropic', 'note': ''}),
+                 'key_configured': bool(provider_api_key(detect_provider(model_id)))}
+                for model_id in KNOWLEDGE_MODELS
             ],
         }
 

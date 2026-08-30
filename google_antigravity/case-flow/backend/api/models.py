@@ -173,9 +173,18 @@ class KnowledgeItem(models.Model):
                                      related_name='knowledge_items')
     vendor = models.CharField(max_length=50, choices=Case.VENDOR_CHOICES)
     title = models.CharField(max_length=200)          # 문제 한 줄 요약 (목록 표시용)
+    # 본문 8칸. 처음엔 케이스 분석 스키마(문제-원인-해결)를 그대로 썼는데, 그쪽은
+    # 메일 1건을 "간결히" 줄이는 게 목적이라 재현에 필요한 것들이 resolution 한 칸에
+    # 뭉쳤다. 아래 다섯 칸은 그 뭉침을 푼 것 — AI가 못 채우면 빈 값으로 두고
+    # 엔지니어가 상세 화면에서 직접 채운다.
+    environment = models.TextField(blank=True, default='')   # 전제 조건: 구성·토폴로지·버전
     problem = models.TextField()                      # 증상/문제 상황
+    diagnosis = models.TextField(blank=True, default='')     # 진단 절차: 원인을 좁힌 방법
     root_cause = models.TextField(blank=True, default='')
     resolution = models.TextField()                   # 해결 조치 (CLI 커맨드 포함)
+    verification = models.TextField(blank=True, default='')  # 조치 후 확인 방법
+    caveats = models.TextField(blank=True, default='')       # 주의사항·부작용·적용 조건
+    related_refs = models.TextField(blank=True, default='')  # 벤더 버그 ID·케이스 번호 (줄바꿈 구분)
     device_model = models.CharField(max_length=100, blank=True, default='')
     software_version = models.CharField(max_length=50, blank=True, default='')
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='draft')

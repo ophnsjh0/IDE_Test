@@ -7,26 +7,63 @@ from django.conf import settings
 from django.utils import timezone
 
 from api.models import Case, KnowledgeItem
-from .analyzer import generate_structured, get_translation_model
+from .analyzer import (generate_structured, generate_structured_with_model,
+                       knowledge_model_candidates)
 from .gmail_sync import SyncInProgress
 
 logger = logging.getLogger(__name__)
+
+# 본문 8칸. environment~related_refs는 예전 문제-원인-해결 3칸 시절 resolution에
+# 뭉쳐 있던 것들을 분리한 자리다. 못 채우면 ""로 두고 엔지니어가 화면에서 채운다.
+KNOWLEDGE_FIELDS = ['environment', 'problem', 'diagnosis', 'root_cause',
+                    'resolution', 'verification', 'caveats', 'related_refs']
 
 KNOWLEDGE_SCHEMA = {
     "type": "object",
     "properties": {
         "has_knowledge": {"type": "boolean"},
         "title": {"type": "string"},
-        "problem": {"type": "string"},
-        "root_cause": {"type": "string"},
-        "resolution": {"type": "string"},
+        **{field: {"type": "string"} for field in KNOWLEDGE_FIELDS},
         "device_model": {"type": "string"},
         "software_version": {"type": "string"},
     },
-    "required": ["has_knowledge", "title", "problem", "root_cause",
-                 "resolution", "device_model", "software_version"],
+    "required": (["has_knowledge", "title"] + KNOWLEDGE_FIELDS
+                 + ["device_model", "software_version"]),
     "additionalProperties": False,
 }
+
+# 케이스·대화 추출이 공유하는 본문 작성 규칙. 두 프롬프트에 같은 문장을 두 벌
+# 적어두면 한쪽만 고쳐지므로 여기 한 군데서 관리한다.
+FIELD_GUIDE = """- title: 한 줄 요약 (최대 80자, 검색될 것을 고려해 증상 또는 시나리오·장비를 담을 것)
+- environment: 이 지식이 적용되는 전제 조건 — 구성 방식(예: Standalone/HA/SSL-I),
+  토폴로지, 장비 모델, 소프트웨어 버전, 관련 라이선스·모듈. 조건이 드러나지 않으면 "".
+- problem: 증상과 문제 상황 — 어떤 조건에서 무엇이 잘못됐는지. 설정 절차·벤더 확답
+  유형이면 확인하려던 목표와 질문.
+- diagnosis: 원인을 좁혀간 절차 — 어떤 명령·로그·테스트로 무엇을 확인했는지 순서대로.
+  실제로 수행한 진단만 적고, 없으면 "".
+- root_cause: 밝혀진 근본 원인. **밝혀지지 않았으면 ""로 두세요** — "규명되지
+  않았습니다" 같은 문장으로 채우지 말 것.
+- resolution: 해결 조치·설정 절차·벤더가 확인해 준 결론을 단계별로.
+  **이력에 나온 CLI 명령어·설정 라인·패치 버전을 그대로 포함**할 것. 명령어는 각각
+  별도 줄에 두세요. 임시 조치(워크어라운드)와 근본 해결이 모두 있으면 구분해 적을 것.
+- verification: 조치가 됐는지 확인하는 방법 — 어떤 명령의 어떤 출력을 보면 되는지,
+  무엇이 정상 상태인지. 이력에 없으면 "".
+- caveats: 주의사항 — 부작용, 재발 조건, 적용 범위 밖인 상황, 함께 확인해야 할 것.
+  없으면 "".
+- related_refs: 벤더 버그 ID, 케이스 번호, 문서명 등 참조. 한 줄에 하나씩. 없으면 "".
+- device_model: 대상 장비 모델명 원문 그대로. 없으면 "".
+- software_version: 대상 소프트웨어 버전 원문 그대로. 없으면 ""."""
+
+# 분량을 숫자로 지시하면 없는 내용을 지어내므로, 목적과 보존 규칙으로만 유도한다.
+DEPTH_GUIDE = """작성 기준: 이 지식만 읽고 다른 엔지니어가 같은 상황을 재현하고 조치할 수
+있어야 합니다. 요약하지 말고, 이력에 실제로 있는 사실은 빠뜨리지 마세요. 특히 명령어·
+설정 라인·로그·에러 문자열·버전 번호는 원문 그대로 옮깁니다. 반대로 이력에 없는 내용을
+지어내서는 안 되며, 근거가 없는 필드는 빈 문자열 ""로 둡니다 — 빈 칸은 엔지니어가
+직접 채웁니다.
+
+**모든 필드 공통: 고객사명·담당자 이름은 쓰지 마세요.** 지식은 벤더·장비·증상 기준으로
+재사용되므로 어느 고객의 케이스였는지는 필요 없습니다. 케이스 참조가 필요하면
+벤더 케이스 번호만 남기고 제목에 섞인 고객사명은 지웁니다."""
 
 SYSTEM_PROMPT = """당신은 네트워크 벤더(A10/Arista/HPE Aruba/Juniper) TAC 케이스 이력에서
 나중에 비슷한 문제를 만난 엔지니어가 재사용할 수 있는 기술 지식을 추출하는 어시스턴트입니다.
@@ -46,16 +83,7 @@ SYSTEM_PROMPT = """당신은 네트워크 벤더(A10/Arista/HPE Aruba/Juniper) T
   해결 방법이나 벤더 답변이 이력에 드러나지 않은 케이스, 문의만 있고 답이 없는 케이스,
   원인 규명 없이 종결된 케이스.
   false면 나머지 필드는 빈 문자열 "".
-- title: 한 줄 요약 (최대 80자, 검색될 것을 고려해 증상 또는 시나리오·장비를 담을 것)
-- problem: ①이면 증상과 문제 상황 — 어떤 조건에서 무엇이 잘못됐는지.
-  ②·③이면 확인하려던 목표·질문과 전제 조건(구성 방식, 토폴로지, 버전).
-  고객사명은 쓰지 말 것.
-- root_cause: 밝혀진 근본 원인. ②·③이거나 벤더가 명확히 밝히지 않았으면 빈 문자열 "".
-- resolution: ①이면 해결 조치를, ②면 설정 절차를, ③이면 벤더가 확인해 준 결론과 그 적용
-  조건을 단계별로. **이력에 나온 CLI 명령어·설정 변경·패치 버전을 그대로 포함**할 것 —
-  이 필드가 지식의 핵심 가치입니다. 명령어는 각각 별도 줄에 두세요.
-- device_model: 대상 장비 모델명 원문 그대로. 없으면 "".
-- software_version: 문제가 발생한 소프트웨어 버전 원문 그대로. 없으면 ""."""
+""" + FIELD_GUIDE + "\n\n" + DEPTH_GUIDE
 
 # 케이스당 컨텍스트에 넣을 메일 본문 상한 (오래된 순으로 자름)
 _MAX_CONTEXT_CHARS = 40000
@@ -103,7 +131,9 @@ def extract_knowledge(case, mark_checked=True):
     if existing:
         return 'exists', existing
 
-    result = generate_structured(SYSTEM_PROMPT, build_case_material(case), KNOWLEDGE_SCHEMA)
+    used_model, result = generate_structured_with_model(
+        SYSTEM_PROMPT, build_case_material(case), KNOWLEDGE_SCHEMA,
+        models=knowledge_model_candidates())
     if result is None:
         return 'failed', None
     if not result.get('has_knowledge') or not (result.get('resolution') or '').strip():
@@ -115,12 +145,12 @@ def extract_knowledge(case, mark_checked=True):
         case=case,
         vendor=case.vendor,
         title=result['title'][:200],
-        problem=result['problem'],
-        root_cause=result['root_cause'],
-        resolution=result['resolution'],
         device_model=(result['device_model'] or case.device_model)[:100],
         software_version=(result['software_version'] or case.software_version)[:50],
-        analyzed_by=get_translation_model(),
+        analyzed_by=used_model,
+        # 스키마에 필드를 추가할 때 여기를 같이 고치는 걸 잊지 않도록 목록에서 채운다.
+        # get()을 쓰는 이유: 예전 스키마로 만든 목(mock)이나 구모델 응답도 살려둔다.
+        **{field: (result.get(field) or '') for field in KNOWLEDGE_FIELDS},
     )
     logger.info("Knowledge extracted from %s -> %s", case.case_id, item.knowledge_id)
     if mark_checked:
@@ -217,15 +247,7 @@ CHAT_SYSTEM_PROMPT = """당신은 네트워크 벤더(A10/Arista/HPE Aruba/Junip
   구체적 설정 없이 개념만 오간 일반 상식 문답, 결론이 나지 않은 대화.
   false면 나머지 필드는 빈 문자열 "".
 - vendor: 대화에서 다룬 장비의 벤더. 대화에 단서가 없으면 "Unknown".
-- title: 한 줄 요약 (최대 80자, 검색될 것을 고려해 증상 또는 시나리오·장비를 담을 것)
-- problem: ①이면 증상과 문제 상황 — 어떤 조건에서 무엇이 잘못됐는지.
-  ②이면 달성하려는 목표와 전제 조건(구성 방식, 토폴로지, 요구사항).
-  고객사명은 쓰지 말 것.
-- root_cause: 대화에서 밝혀진 근본 원인. ②이거나 명확하지 않으면 빈 문자열 "".
-- resolution: ①이면 해결 조치를, ②이면 설정 절차를 단계별로. **대화에 나온 CLI
-  명령어·설정 변경·패치 버전을 그대로 포함**할 것. 명령어는 각각 별도 줄에 두세요.
-- device_model: 대상 장비 모델명 원문 그대로. 없으면 "".
-- software_version: 대상 소프트웨어 버전 원문 그대로. 없으면 ""."""
+""" + FIELD_GUIDE + "\n\n" + DEPTH_GUIDE
 
 
 def build_chat_material(session):
@@ -263,8 +285,9 @@ def extract_knowledge_from_chat(session):
     if existing:
         return 'exists', existing
 
-    result = generate_structured(CHAT_SYSTEM_PROMPT, build_chat_material(session),
-                                 CHAT_KNOWLEDGE_SCHEMA)
+    used_model, result = generate_structured_with_model(
+        CHAT_SYSTEM_PROMPT, build_chat_material(session), CHAT_KNOWLEDGE_SCHEMA,
+        models=knowledge_model_candidates())
     if result is None:
         return 'failed', None
     if not result.get('has_knowledge') or not (result.get('resolution') or '').strip():
@@ -277,12 +300,10 @@ def extract_knowledge_from_chat(session):
         chat_session=session,
         vendor=vendor,
         title=result['title'][:200],
-        problem=result['problem'],
-        root_cause=result['root_cause'],
-        resolution=result['resolution'],
         device_model=result['device_model'][:100],
         software_version=result['software_version'][:50],
-        analyzed_by=get_translation_model(),
+        analyzed_by=used_model,
+        **{field: (result.get(field) or '') for field in KNOWLEDGE_FIELDS},
     )
     logger.info("Knowledge extracted from chat session %s -> %s",
                 session.id, item.knowledge_id)
@@ -370,7 +391,8 @@ def enrich_with_references(item, top_k=5):
     ]
     for i, c in enumerate(candidates):
         parts.append(f"[{i}] {c['document']} {c['pages']}\n{c['text'][:1500]}")
-    result = generate_structured(ENRICH_PROMPT, '\n\n'.join(parts), ENRICH_SCHEMA)
+    result = generate_structured(ENRICH_PROMPT, '\n\n'.join(parts), ENRICH_SCHEMA,
+                                 models=knowledge_model_candidates())
     if result is None:
         return 'failed'
 

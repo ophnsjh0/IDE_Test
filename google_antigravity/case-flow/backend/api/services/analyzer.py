@@ -58,8 +58,9 @@ SYSTEM_PROMPT = """당신은 네트워크 벤더(A10/Arista/HPE Aruba/Juniper) T
 
 # 프론트/설정 API에서 선택 가능한 모델 카탈로그.
 AVAILABLE_MODELS = [
-    {'id': 'claude-opus-4-8',       'provider': 'anthropic', 'note': '$5/$25 — 최고 품질'},
-    {'id': 'claude-sonnet-5',       'provider': 'anthropic', 'note': '$3/$15 — 중간'},
+    {'id': 'claude-opus-5',         'provider': 'anthropic', 'note': '$5/$25 — 최고 품질'},
+    {'id': 'claude-opus-4-8',       'provider': 'anthropic', 'note': '$5/$25 — 최고 품질(이전 세대)'},
+    {'id': 'claude-sonnet-5',       'provider': 'anthropic', 'note': '$2/$10 — 중간'},
     {'id': 'claude-haiku-4-5',      'provider': 'anthropic', 'note': '$1/$5 — 저비용'},
     {'id': 'gpt-5.5',               'provider': 'openai',    'note': '$5/$30 — 최고 품질'},
     {'id': 'gpt-5.4',               'provider': 'openai',    'note': '$2.5/$15 — 중간'},
@@ -69,6 +70,15 @@ AVAILABLE_MODELS = [
 ]
 
 TRANSLATION_MODEL_SETTING_KEY = 'translation_model'
+
+# 지식 추출 전용 모델 — 메일 번역·분석(translation_model)과 분리해서 고른다.
+# 메일 분석은 건수가 많아 저비용 모델이 합리적이지만, 지식은 케이스당 1회
+# 만들어 오래 재사용하는 자산이라 품질이 비용보다 중요하다. 선택지를 상위 두
+# 모델로 묶어두는 것도 같은 이유 — 여기서 저비용 모델을 고를 수 있게 하면
+# 알아채기 어려운 품질 저하가 지식 베이스에 그대로 쌓인다.
+KNOWLEDGE_MODEL_SETTING_KEY = 'knowledge_model'
+KNOWLEDGE_MODELS = ['claude-opus-5', 'claude-sonnet-5']
+KNOWLEDGE_MODEL_DEFAULT = 'claude-opus-5'
 
 # translation_model_override()로 지정하는 일회성 모델 (백필 등 관리 작업용)
 _model_override = None
@@ -97,6 +107,28 @@ def get_translation_model():
         return AppSetting.get(TRANSLATION_MODEL_SETTING_KEY) or settings.TRANSLATION_MODEL
     except Exception:  # 마이그레이션 전 등 DB 미준비 시 설정값 사용
         return settings.TRANSLATION_MODEL
+
+
+def get_knowledge_model():
+    """지식 추출에 쓸 모델. 저장값이 목록 밖이면 기본값으로 되돌린다 —
+    카탈로그에서 모델이 빠져도 지식 추출이 죽지 않게."""
+    try:
+        from api.models import AppSetting
+        stored = AppSetting.get(KNOWLEDGE_MODEL_SETTING_KEY)
+    except Exception:  # 마이그레이션 전 등 DB 미준비
+        stored = ''
+    return stored if stored in KNOWLEDGE_MODELS else KNOWLEDGE_MODEL_DEFAULT
+
+
+def knowledge_model_candidates():
+    """지식 추출 폴백 순서: 선택 모델 → 나머지 상위 모델.
+
+    번역용 폴백(settings.TRANSLATION_FALLBACK_MODELS, 기본 haiku)을 쓰지
+    않는다 — 저비용 모델로 조용히 떨어지면 눈에 띄지 않는 품질 저하가 지식
+    베이스에 남는다. 둘 다 실패하면 추출을 포기하는 편이 낫다.
+    """
+    chosen = get_knowledge_model()
+    return [chosen] + [m for m in KNOWLEDGE_MODELS if m != chosen]
 
 
 def detect_provider(model):
@@ -261,7 +293,7 @@ def _in_cooldown(model):
     return until is not None and time.monotonic() < until
 
 
-def _generate_with_fallback(system, user_content, schema, max_tokens, label=''):
+def _generate_with_fallback(system, user_content, schema, max_tokens, label='', models=None):
     """모델 후보를 순서대로 시도해 첫 성공 결과를 (모델, 결과)로 돌려준다.
 
     키가 없거나 할당량 초과로 쉬는 중인 모델은 건너뛰고, 호출 실패·파싱 실패는
@@ -272,7 +304,7 @@ def _generate_with_fallback(system, user_content, schema, max_tokens, label=''):
     실패했을 때만 마지막 예외를 스택과 함께 기록한다.
     """
     last_error = None
-    for model in model_candidates():
+    for model in (models if models is not None else model_candidates()):
         provider = detect_provider(model)
         if not provider_api_key(provider):
             logger.warning("API key for %s not set; skipping %s.", provider, model)
@@ -301,13 +333,25 @@ def _generate_with_fallback(system, user_content, schema, max_tokens, label=''):
     return None, None
 
 
-def generate_structured(system, user_content, schema, max_tokens=16000):
+def generate_structured_with_model(system, user_content, schema, max_tokens=16000,
+                                   models=None):
+    """generate_structured와 같지만 (실제 응답한 모델, 결과)를 함께 돌려준다.
+
+    폴백이 걸리면 설정된 모델과 실제로 답한 모델이 달라지므로, 결과에 모델을
+    기록해야 하는 곳(지식의 analyzed_by 등)은 이 함수를 써야 한다.
+    """
+    return _generate_with_fallback(system, user_content, schema, max_tokens, models=models)
+
+
+def generate_structured(system, user_content, schema, max_tokens=16000, models=None):
     """임의 프롬프트+JSON 스키마로 구조화 응답을 생성하는 범용 헬퍼.
 
     analyze_email과 동일하게 현재 번역 모델 설정을 따라 제공자를 라우팅하고
     실패 시 폴백 모델로 재시도하며, 모두 실패하면 None. 지식 추출 등 분석 외 작업용.
+    models를 주면 그 순서로만 시도한다(지식 추출처럼 후보를 좁혀야 하는 경우).
     """
-    _, result = _generate_with_fallback(system, user_content, schema, max_tokens)
+    _, result = generate_structured_with_model(system, user_content, schema,
+                                               max_tokens, models=models)
     return result
 
 

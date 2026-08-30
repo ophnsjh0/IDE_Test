@@ -50,8 +50,9 @@ class KnowledgeItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = KnowledgeItem
-        fields = ['id', 'knowledge_id', 'vendor', 'title', 'problem', 'root_cause',
-                  'resolution', 'device_model', 'software_version', 'status',
+        fields = ['id', 'knowledge_id', 'vendor', 'title', 'environment', 'problem',
+                  'diagnosis', 'root_cause', 'resolution', 'verification', 'caveats',
+                  'related_refs', 'device_model', 'software_version', 'status',
                   'analyzed_by', 'references', 'source_case', 'source_session',
                   'created_at', 'updated_at']
         read_only_fields = ['vendor', 'analyzed_by', 'references']

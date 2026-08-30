@@ -25,6 +25,11 @@ from .services.gmail_sync import (SyncInProgress, _find_case,
                                   apply_device_info)
 
 
+# 지식 추출 목을 위한 모델 이름 — generate_structured_with_model이 (실제 모델, 결과)를
+# 돌려주므로, 목도 같은 모양이어야 analyzed_by 기록 경로가 함께 검증된다.
+MODEL = 'claude-opus-5'
+
+
 def make_case(**kwargs):
     defaults = dict(vendor='Arista', status='Open', summary='요약', source='email')
     defaults.update(kwargs)
@@ -1268,8 +1273,8 @@ class ChatKnowledgeExtractTests(TestCase):
     def extract(self, session_id=None, ai_result='default'):
         if ai_result == 'default':
             ai_result = dict(self.EXTRACTED)
-        with patch('api.services.knowledge.generate_structured',
-                   return_value=ai_result), \
+        with patch('api.services.knowledge.generate_structured_with_model',
+                   return_value=(MODEL, ai_result)), \
              patch('api.services.knowledge.enrich_with_references',
                    return_value='no_candidates'):
             return self.client.post(
@@ -1359,8 +1364,8 @@ class KnowledgeSyncTests(TestCase):
     def sync(self, ai_result='default'):
         if ai_result == 'default':
             ai_result = dict(self.EXTRACTED)
-        with patch('api.services.knowledge.generate_structured',
-                   return_value=ai_result), \
+        with patch('api.services.knowledge.generate_structured_with_model',
+                   return_value=(MODEL, ai_result)), \
              patch('api.services.knowledge.enrich_with_references',
                    return_value='no_candidates'):
             return self.client.post('/api/knowledge/sync/')
@@ -2585,6 +2590,169 @@ class UsageEventTests(TestCase):
         self.assertEqual(uv1['logins'], 1)
 
 
+class KnowledgeFieldsTests(TestCase):
+    """지식 본문 8칸 — AI가 채우고, 못 채운 칸은 엔지니어가 화면에서 채운다."""
+
+    FULL = {
+        'has_knowledge': True, 'title': 'VRRP failover 지연',
+        'environment': 'HA 구성, TH1040-F, ACOS 6.0.8',
+        'problem': 'failover가 3초 이상 지연됩니다.',
+        'diagnosis': 'show vrrp-a detail 로 advertisement 주기를 확인했습니다.',
+        'root_cause': 'advertisement interval 기본값이 큽니다.',
+        'resolution': 'vrrp-a interval 100\nwrite memory',
+        'verification': 'show vrrp-a detail 에서 interval 100 확인',
+        'caveats': '인터벌을 너무 줄이면 플래핑이 발생할 수 있습니다.',
+        'related_refs': 'ACOS-104904\nC-1118',
+        'device_model': 'TH1040-F', 'software_version': '6.0.8',
+    }
+
+    def setUp(self):
+        from .permissions import set_user_role
+        for username, role in (('kf-v', 'viewer'), ('kf-e', 'engineer')):
+            user = User.objects.create_user(username, password='kf-pass-1!')
+            set_user_role(user, role)
+        self.case = make_case(vendor='A10', status='Resolved', resolution='조치')
+
+    def login(self, username):
+        self.client.post('/api/auth/login/',
+                         {'username': username, 'password': 'kf-pass-1!'},
+                         content_type='application/json')
+
+    def extract(self, payload):
+        from .services import knowledge
+        with patch.object(knowledge, 'generate_structured_with_model',
+                          return_value=(MODEL, payload)), \
+             patch.object(knowledge, 'enrich_with_references'):
+            return knowledge.extract_knowledge(self.case)
+
+    def test_all_eight_fields_are_saved(self):
+        outcome, item = self.extract(dict(self.FULL))
+        self.assertEqual(outcome, 'created')
+        for field in ('environment', 'diagnosis', 'verification', 'caveats', 'related_refs'):
+            self.assertEqual(getattr(item, field), self.FULL[field], field)
+
+    def test_missing_fields_become_blank_not_crash(self):
+        """예전 스키마 응답이나 일부 필드를 뺀 응답도 저장은 되어야 한다."""
+        outcome, item = self.extract({
+            'has_knowledge': True, 'title': '제목', 'problem': '문제',
+            'root_cause': '', 'resolution': '조치',
+            'device_model': '', 'software_version': '',
+        })
+        self.assertEqual(outcome, 'created')
+        self.assertEqual(item.environment, '')
+        self.assertEqual(item.caveats, '')
+
+    def test_engineer_can_fill_blank_fields(self):
+        """AI가 비워둔 칸을 사람이 채우는 것이 이 필드들의 목적이다."""
+        _, item = self.extract({
+            'has_knowledge': True, 'title': '제목', 'problem': '문제',
+            'root_cause': '', 'resolution': '조치',
+            'device_model': '', 'software_version': '',
+        })
+        self.login('kf-e')
+        res = self.client.patch(f'/api/knowledge/{item.id}/',
+                                {'caveats': '재부팅이 필요합니다.',
+                                 'verification': 'show version 으로 확인'},
+                                content_type='application/json')
+        self.assertEqual(res.status_code, 200)
+        item.refresh_from_db()
+        self.assertEqual(item.caveats, '재부팅이 필요합니다.')
+        self.assertEqual(item.verification, 'show version 으로 확인')
+
+    def test_detail_api_exposes_new_fields(self):
+        _, item = self.extract(dict(self.FULL))
+        self.login('kf-v')
+        body = self.client.get(f'/api/knowledge/{item.id}/').json()
+        for field in ('environment', 'diagnosis', 'verification', 'caveats', 'related_refs'):
+            self.assertIn(field, body)
+
+    def test_agent_search_matches_the_new_fields(self):
+        """검증 방법·주의사항에만 있는 명령어가 검색에서 빠지면 지식을 못 찾는다."""
+        self.extract(dict(self.FULL))
+        results = json.loads(help_agent._search_knowledge(query='플래핑'))
+        self.assertEqual(results['count'], 1)
+        results = json.loads(help_agent._search_knowledge(query='ACOS-104904'))
+        self.assertEqual(results['count'], 1)
+
+
+class KnowledgeModelSettingTests(TestCase):
+    """지식 추출 모델은 메일 분석 모델과 분리돼 있고, 상위 두 모델로 제한된다."""
+
+    def setUp(self):
+        from .permissions import set_user_role
+        for username, role in (('km-v', 'viewer'), ('km-e', 'engineer'), ('km-a', 'admin')):
+            user = User.objects.create_user(username, password='km-pass-1!')
+            set_user_role(user, role)
+
+    def login(self, username):
+        self.client.post('/api/auth/login/',
+                         {'username': username, 'password': 'km-pass-1!'},
+                         content_type='application/json')
+
+    def test_defaults_to_opus5_and_ignores_unknown_stored_value(self):
+        self.assertEqual(analyzer.get_knowledge_model(), 'claude-opus-5')
+        # 카탈로그에서 빠진 모델이 저장돼 있어도 지식 추출이 죽으면 안 된다
+        AppSetting.set(analyzer.KNOWLEDGE_MODEL_SETTING_KEY, 'gemini-3.5-flash')
+        self.assertEqual(analyzer.get_knowledge_model(), 'claude-opus-5')
+
+    def test_candidates_never_fall_back_to_cheap_models(self):
+        """저비용 모델로 조용히 떨어지면 눈에 안 띄는 품질 저하가 지식에 남는다."""
+        AppSetting.set(analyzer.KNOWLEDGE_MODEL_SETTING_KEY, 'claude-sonnet-5')
+        self.assertEqual(analyzer.knowledge_model_candidates(),
+                         ['claude-sonnet-5', 'claude-opus-5'])
+        self.assertNotIn('claude-haiku-4-5', analyzer.knowledge_model_candidates())
+
+    def test_is_independent_of_translation_model(self):
+        """메일 분석 모델을 바꿔도 지식 추출 모델은 그대로여야 한다."""
+        AppSetting.set(analyzer.TRANSLATION_MODEL_SETTING_KEY, 'claude-haiku-4-5')
+        self.assertEqual(analyzer.get_translation_model(), 'claude-haiku-4-5')
+        self.assertEqual(analyzer.get_knowledge_model(), 'claude-opus-5')
+
+    def test_get_is_open_and_put_is_admin_only(self):
+        self.login('km-v')
+        res = self.client.get('/api/settings/knowledge-model/')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()['current'], 'claude-opus-5')
+        self.assertEqual([m['id'] for m in res.json()['models']],
+                         ['claude-opus-5', 'claude-sonnet-5'])
+
+        self.login('km-e')
+        self.assertEqual(
+            self.client.put('/api/settings/knowledge-model/', {'model': 'claude-sonnet-5'},
+                            content_type='application/json').status_code, 403)
+
+    def test_analyzed_by_records_the_model_that_actually_answered(self):
+        """폴백이 걸리면 설정 모델과 답한 모델이 갈린다 — 기록은 답한 쪽이어야 한다."""
+        from .services import knowledge
+        case = make_case(vendor='A10', status='Resolved', resolution='조치')
+        result = {'has_knowledge': True, 'title': '제목', 'problem': '문제',
+                  'root_cause': '원인', 'resolution': '조치', 'device_model': '',
+                  'software_version': ''}
+        with patch.object(knowledge, 'generate_structured_with_model',
+                          return_value=('claude-sonnet-5', result)), \
+             patch.object(knowledge, 'enrich_with_references'):
+            outcome, item = knowledge.extract_knowledge(case)
+
+        self.assertEqual(outcome, 'created')
+        self.assertEqual(analyzer.get_knowledge_model(), 'claude-opus-5')  # 설정값
+        self.assertEqual(item.analyzed_by, 'claude-sonnet-5')             # 실제 답한 모델
+
+    @override_settings(ANTHROPIC_API_KEY='test-key')
+    def test_admin_can_switch_between_the_two_models_only(self):
+        self.login('km-a')
+        res = self.client.put('/api/settings/knowledge-model/', {'model': 'claude-sonnet-5'},
+                              content_type='application/json')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()['current'], 'claude-sonnet-5')
+        self.assertEqual(analyzer.get_knowledge_model(), 'claude-sonnet-5')
+
+        # 목록 밖 모델은 거부 — 지식 품질이 조용히 떨어지는 경로를 막는다
+        res = self.client.put('/api/settings/knowledge-model/', {'model': 'claude-haiku-4-5'},
+                              content_type='application/json')
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(analyzer.get_knowledge_model(), 'claude-sonnet-5')
+
+
 class KnowledgeBaseTests(TestCase):
     """지식 베이스 — 추출 서비스 필터링, API 권한, 에이전트 검색 도구."""
 
@@ -2616,7 +2784,8 @@ class KnowledgeBaseTests(TestCase):
         result = {'has_knowledge': True, 'title': '제목', 'problem': '문제',
                   'root_cause': '원인', 'resolution': 'CLI 조치',
                   'device_model': '', 'software_version': '5.2.1-P7'}
-        with patch.object(knowledge, 'generate_structured', return_value=result):
+        with patch.object(knowledge, 'generate_structured_with_model',
+                          return_value=(MODEL, result)):
             outcome, item = knowledge.extract_knowledge(self.case)
         self.assertEqual(outcome, 'created')
         self.assertEqual(item.status, 'draft')
@@ -2629,12 +2798,13 @@ class KnowledgeBaseTests(TestCase):
         no_knowledge = {'has_knowledge': False, 'title': '', 'problem': '',
                         'root_cause': '', 'resolution': '',
                         'device_model': '', 'software_version': ''}
-        with patch.object(knowledge, 'generate_structured', return_value=no_knowledge):
+        with patch.object(knowledge, 'generate_structured_with_model',
+                          return_value=(MODEL, no_knowledge)):
             outcome, item = knowledge.extract_knowledge(self.case)
         self.assertEqual((outcome, item), ('no_knowledge', None))
 
         existing = self.make_item()
-        with patch.object(knowledge, 'generate_structured') as mocked:
+        with patch.object(knowledge, 'generate_structured_with_model') as mocked:
             outcome, item = knowledge.extract_knowledge(self.case)
         mocked.assert_not_called()  # 기존 항목이 있으면 AI 호출 자체를 안 함
         self.assertEqual((outcome, item), ('exists', existing))
@@ -3517,13 +3687,13 @@ class CaseKnowledgeExtractTests(TestCase):
     def test_extracts_from_ongoing_case(self):
         from .models import KnowledgeItem
         self.client.force_login(self.engineer)
-        with patch('api.services.knowledge.generate_structured', return_value={
+        with patch('api.services.knowledge.generate_structured_with_model', return_value=(MODEL, {
             'has_knowledge': True, 'title': 'ACOS-104904 VRRP 타이머 버그',
             'problem': 'VRRP advertisement 타이머 부정확',
             'root_cause': 'ACOS 6.0.6-SP1~6.0.8 버그',
             'resolution': '6.0.9 이상으로 업그레이드',
             'device_model': 'TH1040-F', 'software_version': '6.0.8',
-        }), patch('api.services.knowledge.enrich_with_references'):
+        })), patch('api.services.knowledge.enrich_with_references'):
             res = self.post()
 
         self.assertEqual(res.status_code, 201)
@@ -3535,8 +3705,8 @@ class CaseKnowledgeExtractTests(TestCase):
     def test_ongoing_case_is_not_marked_checked(self):
         """진행 중 케이스를 '검토 완료'로 찍으면 해결된 뒤 자동 동기화가 영영 건너뛴다."""
         self.client.force_login(self.engineer)
-        with patch('api.services.knowledge.generate_structured',
-                   return_value={'has_knowledge': False, 'resolution': ''}):
+        with patch('api.services.knowledge.generate_structured_with_model',
+                   return_value=(MODEL, {'has_knowledge': False, 'resolution': ''})):
             res = self.post()
 
         self.assertEqual(res.status_code, 400)
@@ -3549,8 +3719,8 @@ class CaseKnowledgeExtractTests(TestCase):
         self.case.status = 'Resolved'
         self.case.save(update_fields=['status'])
         self.client.force_login(self.engineer)
-        with patch('api.services.knowledge.generate_structured',
-                   return_value={'has_knowledge': False, 'resolution': ''}):
+        with patch('api.services.knowledge.generate_structured_with_model',
+                   return_value=(MODEL, {'has_knowledge': False, 'resolution': ''})):
             self.post()
         self.case.refresh_from_db()
         self.assertIsNotNone(self.case.knowledge_checked_at)
@@ -3562,7 +3732,8 @@ class CaseKnowledgeExtractTests(TestCase):
             'root_cause': '원인', 'resolution': '해결',
             'device_model': '', 'software_version': '',
         }
-        with patch('api.services.knowledge.generate_structured', return_value=payload), \
+        with patch('api.services.knowledge.generate_structured_with_model',
+                   return_value=(MODEL, payload)), \
              patch('api.services.knowledge.enrich_with_references'):
             first = self.post()
             second = self.post()

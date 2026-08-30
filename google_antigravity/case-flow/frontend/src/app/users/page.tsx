@@ -22,7 +22,7 @@ import {
   Title,
 } from '@mantine/core';
 import { useForm } from '@mantine/form';
-import { IconKey, IconMailDown, IconPlus, IconTrash, IconUserCheck, IconUserOff } from '@tabler/icons-react';
+import { IconBulb, IconKey, IconMailDown, IconPlus, IconTrash, IconUserCheck, IconUserOff } from '@tabler/icons-react';
 import AppHeader from '../components/AppHeader';
 import { apiFetch } from '../lib/api';
 import { ROLE_LABELS, Role, useMe } from '../lib/useMe';
@@ -32,6 +32,18 @@ interface SyncSchedule {
   last_run: string;
   schedule: string;
 }
+
+interface KnowledgeModelSetting {
+  current: string;
+  default: string;
+  models: { id: string; note: string; key_configured: boolean }[];
+}
+
+// 모델 id를 사람이 읽는 이름으로. 서버가 주는 목록은 두 개뿐이라 여기만 맞추면 된다.
+const MODEL_LABELS: Record<string, string> = {
+  'claude-opus-5': 'Opus 5',
+  'claude-sonnet-5': 'Sonnet 5',
+};
 
 interface Account {
   id: number;
@@ -89,6 +101,41 @@ export default function UsersPage() {
       .then((data) => data && setSchedule(data))
       .catch(() => {});
   }, []);
+
+  // 지식 추출 모델 — 메일 분석 모델과 별개다. 지식은 케이스당 1회 만들어
+  // 오래 재사용하는 자산이라 품질 우선이고, 선택지도 상위 두 모델로 제한된다.
+  const [knowledgeModel, setKnowledgeModel] = useState<KnowledgeModelSetting | null>(null);
+  const [knowledgeModelSaving, setKnowledgeModelSaving] = useState(false);
+
+  useEffect(() => {
+    apiFetch('/api/settings/knowledge-model/')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => data && setKnowledgeModel(data))
+      .catch(() => {});
+  }, []);
+
+  const handleKnowledgeModelChange = async (model: string | null) => {
+    if (!model || model === knowledgeModel?.current) return;
+    setKnowledgeModelSaving(true);
+    try {
+      const response = await apiFetch('/api/settings/knowledge-model/', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model }),
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setKnowledgeModel(data);
+        setMessage(`지식 추출 모델을 ${MODEL_LABELS[data.current] ?? data.current}(으)로 변경했습니다.`);
+      } else {
+        setMessage(data.error || '지식 추출 모델 변경에 실패했습니다.');
+      }
+    } catch {
+      setMessage('백엔드 서버에 연결할 수 없습니다.');
+    } finally {
+      setKnowledgeModelSaving(false);
+    }
+  };
 
   const handleScheduleToggle = async (enabled: boolean) => {
     setScheduleSaving(true);
@@ -336,6 +383,39 @@ export default function UsersPage() {
                   onChange={(event) => handleScheduleToggle(event.currentTarget.checked)}
                   label={schedule.enabled ? '켜짐' : '꺼짐'}
                   labelPosition="left"
+                />
+              </Group>
+            </Paper>
+          )}
+
+          {knowledgeModel && (
+            <Paper shadow="xs" p="md" withBorder mb="lg">
+              <Group justify="space-between" wrap="nowrap" align="flex-start">
+                <Group gap="sm" wrap="nowrap">
+                  <IconBulb size={20} />
+                  <div>
+                    <Text fw={600}>지식 추출 AI 모델</Text>
+                    <Text size="sm" c="dimmed">
+                      해결된 케이스와 AI 도우미 대화에서 지식 초안을 정리하는 모델입니다.
+                      메일 번역·분석 모델(케이스 목록에서 선택)과는 별개로 동작합니다.
+                    </Text>
+                    <Text size="xs" c="dimmed" mt={4}>
+                      지식은 한 번 만들어 오래 재사용하므로 품질을 우선합니다.
+                      Opus 5가 더 자세하고, Sonnet 5는 비용이 약 40% 수준입니다.
+                    </Text>
+                  </div>
+                </Group>
+                <Select
+                  w={180}
+                  allowDeselect={false}
+                  value={knowledgeModel.current}
+                  disabled={knowledgeModelSaving}
+                  onChange={handleKnowledgeModelChange}
+                  data={knowledgeModel.models.map((m) => ({
+                    value: m.id,
+                    label: `${MODEL_LABELS[m.id] ?? m.id} · ${m.note.split('—')[0].trim()}`,
+                    disabled: !m.key_configured,
+                  }))}
                 />
               </Group>
             </Paper>

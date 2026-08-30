@@ -505,9 +505,14 @@ def _search_knowledge(query='', vendor='', limit=5):
     for keyword in (query or '').split():
         items = items.filter(
             Q(title__icontains=keyword)
+            | Q(environment__icontains=keyword)
             | Q(problem__icontains=keyword)
+            | Q(diagnosis__icontains=keyword)
             | Q(root_cause__icontains=keyword)
             | Q(resolution__icontains=keyword)
+            | Q(verification__icontains=keyword)
+            | Q(caveats__icontains=keyword)
+            | Q(related_refs__icontains=keyword)
             | Q(device_model__icontains=keyword)
             | Q(software_version__icontains=keyword)
         )
@@ -515,9 +520,14 @@ def _search_knowledge(query='', vendor='', limit=5):
         'knowledge_id': item.knowledge_id,
         'vendor': item.vendor,
         'title': item.title,
+        'environment': item.environment,
         'problem': item.problem,
+        'diagnosis': item.diagnosis,
         'root_cause': item.root_cause,
         'resolution': item.resolution,
+        'verification': item.verification,
+        'caveats': item.caveats,
+        'related_refs': item.related_refs,
         'device_model': item.device_model,
         'software_version': item.software_version,
         'status': item.status,  # draft=AI 초안(미검증), confirmed=엔지니어 확인됨
