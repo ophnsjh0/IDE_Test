@@ -562,3 +562,38 @@ class LabAppliedObject(models.Model):
 
     def __str__(self):
         return f"run#{self.run_id} {self.node_name} ({len(self.commands)}개)"
+
+
+class LabProposal(models.Model):
+    """랩 에이전트가 만든 설정 변경 제안.
+
+    **에이전트는 이걸 만들 수만 있고 실행할 수 없다.** 실행은 사람이 승인
+    버튼을 눌렀을 때 뷰가 한다 — 게이트를 프롬프트가 아니라 코드로 두는 자리다.
+
+    이 구분이 중요한 이유: 이 에이전트는 케이스 메일·벤더 문서·웹 검색 결과처럼
+    우리가 쓰지 않은 텍스트를 읽는다. 거기 섞인 지시문이 도구를 직접 실행할 수
+    있으면, 잘못된 한 줄이 장비 설정 변경까지 간다.
+    """
+    STATUS_CHOICES = [
+        ('pending', '승인 대기'),
+        ('approved', '승인됨'),
+        ('rejected', '거절됨'),
+    ]
+
+    lab = models.ForeignKey(Lab, on_delete=models.CASCADE, related_name='proposals')
+    title = models.CharField(max_length=200)
+    reason = models.TextField(blank=True, default='')
+    steps = models.JSONField(default=list)      # LabBlueprint.steps와 같은 모양
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
+    run = models.ForeignKey('LabRun', null=True, blank=True, on_delete=models.SET_NULL,
+                            related_name='proposals')
+    created_at = models.DateTimeField(auto_now_add=True)
+    decided_by = models.ForeignKey(django_settings.AUTH_USER_MODEL, null=True, blank=True,
+                                   on_delete=models.SET_NULL)
+    decided_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.title} ({self.status})"

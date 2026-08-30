@@ -16,7 +16,7 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from .models import AppSetting, Case, CaseEmail
-from .services import (analyzer, eveng, gmail_sync, help_agent,
+from .services import (analyzer, eveng, gmail_sync, help_agent, lab_agent,
                        lab_drivers, lab_probe)
 from .services.email_parser import (build_gmail_query, clean_subject,
                                     detect_vendor_and_direction,
@@ -3381,6 +3381,165 @@ class LabRunnerTests(TestCase):
         res = self.client.post(f'/api/labs/{self.lab.id}/runs/', {'blueprint': alien.id},
                                content_type='application/json')
         self.assertEqual(res.status_code, 400)
+
+
+@override_settings(EVENG_URL='http://eve.test', EVENG_USER='admin',
+                   EVENG_PASSWORD='pw', ANTHROPIC_API_KEY='test-key')
+class LabAgentTests(TestCase):
+    """랩 에이전트 — 설정 변경은 제안까지만, 실행은 사람 승인으로만."""
+
+    STEP = {
+        'role': 'core-a', 'label': '태그',
+        'apply': ['interface Ethernet5', 'description TAG'],
+        'verify': {'command': 'show interfaces Ethernet5 description', 'contains': 'TAG'},
+        'rollback': ['interface Ethernet5', 'no description'],
+    }
+
+    def setUp(self):
+        from .models import Lab, LabNode, LabNodeAccess, LabServer
+        from .permissions import set_user_role
+        for username, role in (('la-v', 'viewer'), ('la-e', 'engineer')):
+            user = User.objects.create_user(username, password='la-pass-1!')
+            set_user_role(user, role)
+        server = LabServer.objects.create(base_url='http://eve.test')
+        self.lab = Lab.objects.create(server=server, path='/x.unl', name='x')
+        LabNode.objects.create(lab=self.lab, name='Arista_1', eve_id=1)
+        LabNodeAccess.objects.create(lab=self.lab, node_name='Arista_1', role='core-a',
+                                     mgmt_ip='10.0.0.1', driver='arista_eapi',
+                                     username='u', password='p')
+
+    def login(self, username='la-e'):
+        self.client.post('/api/auth/login/',
+                         {'username': username, 'password': 'la-pass-1!'},
+                         content_type='application/json')
+
+    # ---- 실행 게이트 ----
+
+    def test_propose_tool_cannot_reach_devices(self):
+        """에이전트 도구는 제안만 만든다. 드라이버를 부르는 경로가 없어야 한다."""
+        from .models import LabProposal
+        driver = MagicMock()
+        with patch('api.services.lab_runner.get_driver', return_value=driver):
+            out = lab_agent._propose(self.lab, '태그 달기', [dict(self.STEP)], '이유')
+
+        self.assertTrue(out['accepted'])
+        self.assertEqual(LabProposal.objects.get(id=out['proposal_id']).status, 'pending')
+        # 드라이버 객체를 만들어보는 것(실행 가능한지 확인)은 하지만
+        # 장비로 나가는 호출은 하나도 없어야 한다
+        driver.apply.assert_not_called()
+        driver.run_command.assert_not_called()
+
+    def test_proposal_missing_rollback_is_refused(self):
+        step = dict(self.STEP)
+        step.pop('rollback')
+        out = lab_agent._propose(self.lab, '위험한 변경', [step])
+        self.assertFalse(out['accepted'])
+        self.assertIn('rollback', out['problems'][0])
+
+    def test_approval_is_what_executes(self):
+        from .models import LabProposal
+        proposal = LabProposal.objects.create(lab=self.lab, title='태그',
+                                              steps=[dict(self.STEP)])
+        driver = MagicMock()
+        driver.run_command.return_value = 'TAG'
+        self.login()
+        with patch('api.services.lab_runner.get_driver', return_value=driver):
+            body = self.client.post(f'/api/labs/proposals/{proposal.id}/',
+                                    {'decision': 'approve'},
+                                    content_type='application/json').json()
+
+        self.assertEqual(body['status'], 'approved')
+        self.assertEqual(body['run']['status'], 'passed')
+        driver.apply.assert_any_call(['interface Ethernet5', 'description TAG'])
+
+    def test_rejection_does_not_touch_devices(self):
+        from .models import LabProposal
+        proposal = LabProposal.objects.create(lab=self.lab, title='태그',
+                                              steps=[dict(self.STEP)])
+        driver = MagicMock()
+        self.login()
+        with patch('api.services.lab_runner.get_driver', return_value=driver):
+            body = self.client.post(f'/api/labs/proposals/{proposal.id}/',
+                                    {'decision': 'reject'},
+                                    content_type='application/json').json()
+
+        self.assertEqual(body['status'], 'rejected')
+        driver.apply.assert_not_called()
+
+    def test_proposal_cannot_be_approved_twice(self):
+        from .models import LabProposal
+        proposal = LabProposal.objects.create(lab=self.lab, title='태그',
+                                              steps=[dict(self.STEP)], status='approved')
+        self.login()
+        res = self.client.post(f'/api/labs/proposals/{proposal.id}/',
+                               {'decision': 'approve'}, content_type='application/json')
+        self.assertEqual(res.status_code, 409)
+
+    def test_viewer_cannot_approve(self):
+        from .models import LabProposal
+        proposal = LabProposal.objects.create(lab=self.lab, title='태그',
+                                              steps=[dict(self.STEP)])
+        self.login('la-v')
+        res = self.client.post(f'/api/labs/proposals/{proposal.id}/',
+                               {'decision': 'approve'}, content_type='application/json')
+        self.assertEqual(res.status_code, 403)
+
+    # ---- 도구 구성 ----
+
+    def test_tools_come_from_the_shared_definitions(self):
+        """도구 정의를 여기서 다시 쓰면 한쪽만 고쳐져 에이전트마다 능력이 갈린다
+        (검색 에이전트가 문서 검색을 거절했던 2026-08-11 사고)."""
+        names = {t['name'] for t in lab_agent._tools()}
+        self.assertTrue({'search_knowledge', 'search_references', 'search_cases',
+                         'web_search', 'fetch_url'} <= names)
+        for name in lab_agent.SHARED_TOOL_NAMES:
+            self.assertIs(help_agent._SEARCH_TOOL_DEFS[name],
+                          next(t for t in lab_agent._tools() if t['name'] == name))
+
+    def test_no_power_or_delete_tool_is_exposed(self):
+        """전원·삭제는 에이전트에 주지 않는다 — 다른 사람 작업을 날릴 수 있다."""
+        names = {t['name'] for t in lab_agent._tools()}
+        for forbidden in ('power', 'start_node', 'stop_node', 'delete_lab', 'rollback'):
+            self.assertNotIn(forbidden, names)
+
+    def test_tool_output_is_truncated(self):
+        """도구 출력은 매 턴 컨텍스트에 누적된다 — 리포팅에서 회당 $9가 났던 구조."""
+        handlers = {'big': lambda: 'x' * (lab_drivers.MAX_OUTPUT_CHARS + 1000)}
+        output, is_error = lab_agent._execute(handlers, 'big', {})
+        self.assertFalse(is_error)
+        self.assertIn('이하 생략', output)
+
+    def test_model_defaults_to_opus5_and_rejects_others(self):
+        self.assertEqual(lab_agent.get_model(), 'claude-opus-5')
+        AppSetting.set(lab_agent.LAB_AGENT_MODEL_SETTING_KEY, 'claude-haiku-4-5')
+        self.assertEqual(lab_agent.get_model(), 'claude-opus-5')
+
+        self.login()
+        res = self.client.put('/api/settings/lab-agent-model/',
+                              {'model': 'claude-haiku-4-5'},
+                              content_type='application/json')
+        self.assertEqual(res.status_code, 403)   # 변경은 관리자만
+
+    def test_chat_reports_proposals_without_applying_them(self):
+        """대화 응답에 제안이 실려 나가되, 그 시점에 장비는 건드리지 않는다."""
+        from .models import LabProposal
+
+        def fake_chat(lab, messages):
+            out = lab_agent._propose(lab, '태그', [dict(self.STEP)], '이유')
+            return {'reply': '제안을 만들었습니다.', 'tools': [{'name': 'propose_change'}],
+                    'model': 'claude-opus-5', 'proposals': [out['proposal_id']]}
+
+        self.login()
+        with patch('api.views.lab_agent.chat', side_effect=fake_chat), \
+             patch('api.services.lab_runner.get_driver') as driver:
+            body = self.client.post(f'/api/labs/{self.lab.id}/chat/',
+                                    {'messages': [{'role': 'user', 'content': '태그 달아줘'}]},
+                                    content_type='application/json').json()
+
+        self.assertEqual(len(body['proposals']), 1)
+        self.assertEqual(body['proposals'][0]['status'], 'pending')
+        self.assertEqual(LabProposal.objects.filter(status='pending').count(), 1)
+        driver.return_value.apply.assert_not_called()
 
 
 class LabConfigTests(TestCase):

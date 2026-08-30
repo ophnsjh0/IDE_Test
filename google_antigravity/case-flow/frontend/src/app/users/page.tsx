@@ -22,7 +22,7 @@ import {
   Title,
 } from '@mantine/core';
 import { useForm } from '@mantine/form';
-import { IconBulb, IconKey, IconMailDown, IconPlus, IconTrash, IconUserCheck, IconUserOff } from '@tabler/icons-react';
+import { IconBulb, IconFlask, IconKey, IconMailDown, IconPlus, IconTrash, IconUserCheck, IconUserOff } from '@tabler/icons-react';
 import AppHeader from '../components/AppHeader';
 import { apiFetch } from '../lib/api';
 import { ROLE_LABELS, Role, useMe } from '../lib/useMe';
@@ -134,6 +134,40 @@ export default function UsersPage() {
       setMessage('백엔드 서버에 연결할 수 없습니다.');
     } finally {
       setKnowledgeModelSaving(false);
+    }
+  };
+
+  // 랩 에이전트 모델 — 지식 추출 모델과 같은 패턴, 선택지도 상위 두 모델
+  const [labModel, setLabModel] = useState<KnowledgeModelSetting | null>(null);
+  const [labModelSaving, setLabModelSaving] = useState(false);
+
+  useEffect(() => {
+    apiFetch('/api/settings/lab-agent-model/')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => data && setLabModel(data))
+      .catch(() => {});
+  }, []);
+
+  const handleLabModelChange = async (model: string | null) => {
+    if (!model || model === labModel?.current) return;
+    setLabModelSaving(true);
+    try {
+      const response = await apiFetch('/api/settings/lab-agent-model/', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model }),
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setLabModel(data);
+        setMessage(`랩 에이전트 모델을 ${MODEL_LABELS[data.current] ?? data.current}(으)로 변경했습니다.`);
+      } else {
+        setMessage(data.error || '랩 에이전트 모델 변경에 실패했습니다.');
+      }
+    } catch {
+      setMessage('백엔드 서버에 연결할 수 없습니다.');
+    } finally {
+      setLabModelSaving(false);
     }
   };
 
@@ -412,6 +446,39 @@ export default function UsersPage() {
                   disabled={knowledgeModelSaving}
                   onChange={handleKnowledgeModelChange}
                   data={knowledgeModel.models.map((m) => ({
+                    value: m.id,
+                    label: `${MODEL_LABELS[m.id] ?? m.id} · ${m.note.split('—')[0].trim()}`,
+                    disabled: !m.key_configured,
+                  }))}
+                />
+              </Group>
+            </Paper>
+          )}
+
+          {labModel && (
+            <Paper shadow="xs" p="md" withBorder mb="lg">
+              <Group justify="space-between" wrap="nowrap" align="flex-start">
+                <Group gap="sm" wrap="nowrap">
+                  <IconFlask size={20} />
+                  <div>
+                    <Text fw={600}>랩 에이전트 AI 모델</Text>
+                    <Text size="sm" c="dimmed">
+                      Lab Tests 화면의 대화창이 쓰는 모델입니다. 랩 상태·토폴로지를 읽고
+                      설정 변경을 제안합니다.
+                    </Text>
+                    <Text size="xs" c="dimmed" mt={4}>
+                      제안은 승인 버튼을 눌러야 장비에 적용됩니다 — 에이전트가 직접
+                      설정을 바꾸지는 못합니다.
+                    </Text>
+                  </div>
+                </Group>
+                <Select
+                  w={180}
+                  allowDeselect={false}
+                  value={labModel.current}
+                  disabled={labModelSaving}
+                  onChange={handleLabModelChange}
+                  data={labModel.models.map((m) => ({
                     value: m.id,
                     label: `${MODEL_LABELS[m.id] ?? m.id} · ${m.note.split('—')[0].trim()}`,
                     disabled: !m.key_configured,

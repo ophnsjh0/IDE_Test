@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  ActionIcon, Alert, AppShell, Badge, Button, Divider, Group, Loader, Menu,
-  Modal, Paper,
+  ActionIcon, Alert, AppShell, Badge, Button, Card, Divider, Group, Loader,
+  Menu, Modal, Paper,
   ScrollArea, Select, Stack, Table, Text, Textarea, TextInput, Title, Tooltip,
 } from '@mantine/core';
 import {
@@ -20,7 +20,7 @@ import {
   DRIVERS, fallbackState,
   type AvailableLab, type LabDetail, type LabNode, type LabStatus,
   type Blueprint, type CheckReport, type LabSummary, type NodeAccess,
-  type NodeState, type Run,
+  type NodeState, type Proposal, type Run,
 } from './types';
 
 // Step 1 — EVE-NG를 실제로 읽는다. 전원 제어와 준비 판정은 Step 2에서 붙는다.
@@ -73,8 +73,10 @@ export default function LabsPage() {
   const [run, setRun] = useState<Run | null>(null);
   const [running, setRunning] = useState(false);
 
-  const [chat, setChat] = useState<{ role: 'user' | 'assistant'; text: string }[]>([]);
+  type ChatMsg = { role: 'user' | 'assistant'; text: string; proposals?: Proposal[] };
+  const [chat, setChat] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState('');
+  const [thinking, setThinking] = useState(false);
 
   useEffect(() => {
     apiFetch('/api/labs/config/')
@@ -336,15 +338,59 @@ export default function LabsPage() {
     return [...groups.entries()].map(([group, items]) => ({ group, items }));
   }, [labs]);
 
-  const send = () => {
+  const send = async () => {
     const text = input.trim();
-    if (!text) return;
-    setChat((prev) => [...prev, { role: 'user', text }, {
-      role: 'assistant',
-      text: '랩 에이전트는 아직 연결되지 않았습니다 (Step 5). '
-        + '지금은 왼쪽에서 토폴로지를 확인할 수 있습니다.',
-    }]);
+    if (!text || !labId || thinking) return;
+    const history: ChatMsg[] = [...chat, { role: 'user', text }];
+    setChat(history);
     setInput('');
+    setThinking(true);
+    try {
+      const res = await apiFetch(`/api/labs/${labId}/chat/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: history.map((m) => ({ role: m.role, content: m.text })),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      setChat((prev) => [...prev, {
+        role: 'assistant', text: data.reply, proposals: data.proposals,
+      }]);
+    } catch (e) {
+      setChat((prev) => [...prev, {
+        role: 'assistant',
+        text: `답변을 받지 못했습니다: ${e instanceof Error ? e.message : e}`,
+      }]);
+    } finally {
+      setThinking(false);
+    }
+  };
+
+  // 제안 승인·거절 — 여기가 실행 게이트다. 에이전트는 제안까지만 만들 수 있고,
+  // 실제 적용은 이 버튼을 눌렀을 때 서버가 한다.
+  const decide = async (proposal: Proposal, decision: 'approve' | 'reject') => {
+    setThinking(true);
+    try {
+      const res = await apiFetch(`/api/labs/proposals/${proposal.id}/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      setChat((prev) => prev.map((m) => ({
+        ...m,
+        proposals: m.proposals?.map((p) =>
+          (p.id === proposal.id ? { ...p, status: data.status } : p)),
+      })));
+      if (data.run) setRun(data.run);
+    } catch (e) {
+      setError(`제안 처리 실패: ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setThinking(false);
+    }
   };
 
   return (
@@ -721,22 +767,76 @@ export default function LabsPage() {
                 <Stack gap="sm">
                   {chat.length === 0 && (
                     <Text size="sm" c="dimmed">
-                      랩 에이전트는 Step 5에서 연결됩니다. 지금은 왼쪽에서 EVE-NG의
-                      실제 토폴로지를 확인할 수 있습니다.
+                      랩 상태·토폴로지를 묻거나 테스트를 요청하세요. 설정 변경은
+                      제안으로만 나오고, 승인 버튼을 눌러야 장비에 적용됩니다.
                     </Text>
                   )}
                   {chat.map((m, i) => (
-                    <Paper
-                      key={i} p="sm" radius="md"
-                      bg={m.role === 'user' ? 'blue.0' : 'gray.0'}
-                      ml={m.role === 'user' ? 'xl' : 0}
-                      mr={m.role === 'user' ? 0 : 'xl'}
-                    >
-                      <Text size="sm" style={{ whiteSpace: 'pre-wrap', lineHeight: 1.65 }}>
-                        {m.text}
-                      </Text>
-                    </Paper>
+                    <div key={i}>
+                      <Paper
+                        p="sm" radius="md"
+                        bg={m.role === 'user' ? 'blue.0' : 'gray.0'}
+                        ml={m.role === 'user' ? 'xl' : 0}
+                        mr={m.role === 'user' ? 0 : 'xl'}
+                      >
+                        <Text size="sm" style={{ whiteSpace: 'pre-wrap', lineHeight: 1.65 }}>
+                          {m.text}
+                        </Text>
+                      </Paper>
+                      {/* 실행 게이트 — 에이전트는 제안까지만 만든다. 이 버튼을
+                          누르기 전에는 어떤 설정도 장비에 들어가지 않는다. */}
+                      {m.proposals?.map((p) => (
+                        <Card key={p.id} withBorder radius="md" p="sm" mt={6} mr="xl">
+                          <Group justify="space-between" mb={6} wrap="nowrap">
+                            <Text size="xs" fw={700}
+                                  c={p.status === 'pending' ? 'orange'
+                                    : p.status === 'approved' ? 'teal' : 'dimmed'}>
+                              {p.status === 'pending' ? '승인 필요'
+                                : p.status === 'approved' ? '승인됨' : '거절됨'} · {p.title}
+                            </Text>
+                          </Group>
+                          {p.reason && <Text size="xs" c="dimmed" mb={6}>{p.reason}</Text>}
+                          {p.steps.map((step, si) => (
+                            <div key={si} style={{ marginBottom: 8 }}>
+                              <Text size="xs" c="dimmed" mb={3}>
+                                {step.role}{step.label && ` · ${step.label}`}
+                              </Text>
+                              <Paper bg="dark.8" p="xs" radius="sm">
+                                <Text size="xs" c="gray.3" style={{
+                                  fontFamily: 'var(--mantine-font-family-monospace)',
+                                  whiteSpace: 'pre-wrap' }}>
+                                  {step.apply.join('\n')}
+                                </Text>
+                              </Paper>
+                              <Text size="xs" c="dimmed" mt={3}>
+                                검증: {step.verify.command} → {step.verify.contains
+                                  ? `'${step.verify.contains}' 포함`
+                                  : `'${step.verify.not_contains}' 없음`}
+                                {' · '}원복: {step.rollback.join('; ')}
+                              </Text>
+                            </div>
+                          ))}
+                          {p.status === 'pending' && (
+                            <Group gap="xs">
+                              <Button size="compact-sm" color="orange" loading={thinking}
+                                      leftSection={<IconCheck size={14} />}
+                                      onClick={() => decide(p, 'approve')}>
+                                승인하고 적용
+                              </Button>
+                              <Button size="compact-sm" variant="default" loading={thinking}
+                                      onClick={() => decide(p, 'reject')}>
+                                거절
+                              </Button>
+                            </Group>
+                          )}
+                        </Card>
+                      ))}
+                    </div>
                   ))}
+                  {thinking && (
+                    <Group gap="xs"><Loader size="xs" />
+                      <Text size="xs" c="dimmed">생각하는 중...</Text></Group>
+                  )}
                 </Stack>
               </ScrollArea>
               <Group gap="xs" mt="sm" align="flex-end" wrap="nowrap">

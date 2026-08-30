@@ -134,3 +134,24 @@ export interface Run {
   steps: RunStep[];
   pending_rollback: number;  // 되돌리지 않고 장비에 남아 있는 것
 }
+
+export interface Proposal {
+  id: number;
+  title: string;
+  reason: string;
+  steps: {
+    role: string; label?: string;
+    apply: string[];
+    verify: { command: string; contains?: string; not_contains?: string };
+    rollback: string[];
+  }[];
+  status: 'pending' | 'approved' | 'rejected';
+}
+
+export interface ChatReply {
+  reply: string;
+  tools: { name: string }[];
+  model: string;
+  proposals: Proposal[];
+  usage: { input: number; output: number };
+}

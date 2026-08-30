@@ -39,7 +39,8 @@ from .services.analyzer import (
     get_translation_model,
     provider_api_key,
 )
-from .services import eveng, help_agent, lab_check, lab_probe, lab_runner
+from .services import (eveng, help_agent, lab_agent, lab_check, lab_probe,
+                       lab_runner)
 from .services.gmail_client import GmailAuthError
 from .services.gmail_sync import (LAST_RUN_SETTING_KEY, SyncInProgress,
                                   is_cron_enabled, set_cron_enabled, sync_gmail)
@@ -1390,3 +1391,107 @@ class LabRollbackView(APIView):
         outcome = lab_runner.rollback(run)
         run.refresh_from_db()
         return Response({'outcome': outcome, **_run_payload(run)})
+
+
+class LabAgentModelView(APIView):
+    """GET/PUT /api/settings/lab-agent-model/ — 랩 에이전트 모델 (지식 모델과 같은 패턴)."""
+
+    def get_permissions(self):
+        if self.request.method == 'PUT':
+            return [IsAdminRole()]
+        return super().get_permissions()
+
+    def get(self, request):
+        return Response(self._payload())
+
+    def put(self, request):
+        model = (request.data.get('model') or '').strip()
+        if model not in lab_agent.LAB_AGENT_MODELS:
+            allowed = ', '.join(lab_agent.LAB_AGENT_MODELS)
+            return Response({'error': f'{allowed} 중에서만 선택할 수 있습니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        AppSetting.set(lab_agent.LAB_AGENT_MODEL_SETTING_KEY, model)
+        return Response(self._payload())
+
+    @staticmethod
+    def _payload():
+        return {'current': lab_agent.get_model(),
+                'default': lab_agent.LAB_AGENT_MODEL_DEFAULT,
+                'models': lab_agent.available_models()}
+
+
+class LabChatView(APIView):
+    """POST /api/labs/<id>/chat/ — 랩 에이전트 대화 (엔지니어 이상).
+
+    에이전트는 설정을 바꿀 수 없다. 변경은 제안(LabProposal)으로만 나오고,
+    적용은 사람이 승인 엔드포인트를 눌렀을 때 이뤄진다.
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    def post(self, request, id):
+        from .models import Lab, LabProposal
+        lab = Lab.objects.prefetch_related('nodes', 'links', 'accesses').filter(id=id).first()
+        if lab is None:
+            return Response({'error': '등록되지 않은 랩입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        messages = request.data.get('messages')
+        if not isinstance(messages, list) or not messages:
+            return Response({'error': '메시지가 필요합니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            result = lab_agent.chat(lab, messages)
+        except (anthropic.APIError, RuntimeError) as e:
+            logger.exception('랩 에이전트 실패')
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        proposals = LabProposal.objects.filter(id__in=result['proposals'])
+        return Response({
+            **result,
+            'proposals': [{'id': p.id, 'title': p.title, 'reason': p.reason,
+                           'steps': p.steps, 'status': p.status} for p in proposals],
+        })
+
+
+class LabProposalView(APIView):
+    """POST /api/labs/proposals/<proposal_id>/ — 제안 승인·거절 (엔지니어 이상).
+
+    **여기가 실행 게이트다.** 에이전트는 제안을 만들 수만 있고, 실제 적용은
+    사람이 이 엔드포인트를 부를 때만 일어난다. 프롬프트가 아니라 코드로 막는
+    자리라, 도구 쪽에서 우회할 방법이 없어야 한다.
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    def post(self, request, proposal_id):
+        from .models import LabBlueprint, LabProposal, LabRun
+        proposal = LabProposal.objects.select_related('lab').filter(id=proposal_id).first()
+        if proposal is None:
+            return Response({'error': '없는 제안입니다.'}, status=status.HTTP_404_NOT_FOUND)
+        if proposal.status != 'pending':
+            return Response({'error': f'이미 처리된 제안입니다 ({proposal.status}).'},
+                            status=status.HTTP_409_CONFLICT)
+
+        decision = request.data.get('decision')
+        if decision not in ('approve', 'reject'):
+            return Response({'error': "decision은 approve 또는 reject여야 합니다."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        proposal.decided_by = request.user
+        proposal.decided_at = timezone.now()
+        if decision == 'reject':
+            proposal.status = 'rejected'
+            proposal.save(update_fields=['status', 'decided_by', 'decided_at'])
+            return Response({'status': 'rejected'})
+
+        lab = proposal.lab
+        blueprint = LabBlueprint.objects.create(
+            lab=lab, name=f'[제안] {proposal.title}'[:200],
+            description=proposal.reason[:300], steps=proposal.steps)
+        run = LabRun.objects.create(blueprint=blueprint, lab=lab,
+                                    started_by=request.user,
+                                    topology_synced_at=lab.topology_synced_at)
+        lab_runner.execute(run, auto_rollback=request.data.get('rollback', True))
+        run.refresh_from_db()
+        proposal.status = 'approved'
+        proposal.run = run
+        proposal.save(update_fields=['status', 'run', 'decided_by', 'decided_at'])
+        return Response({'status': 'approved', 'run': _run_payload(run)})
