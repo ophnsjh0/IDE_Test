@@ -8,7 +8,8 @@ import {
 import {
   IconAlertTriangle, IconCheck, IconCircleCheck, IconCirclePlus,
   IconPlayerPlay, IconPlayerStop,
-  IconKey, IconRefresh, IconSend, IconServerOff, IconTerminal2, IconTrash,
+  IconKey, IconListCheck, IconRefresh, IconSend, IconServerOff,
+  IconTerminal2, IconTrash, IconX,
 } from '@tabler/icons-react';
 import AppHeader from '../components/AppHeader';
 import { apiFetch } from '../lib/api';
@@ -17,7 +18,7 @@ import TopologyCanvas from './TopologyCanvas';
 import {
   DRIVERS, fallbackState,
   type AvailableLab, type LabDetail, type LabNode, type LabStatus,
-  type LabSummary, type NodeAccess, type NodeState,
+  type CheckReport, type LabSummary, type NodeAccess, type NodeState,
 } from './types';
 
 // Step 1 — EVE-NG를 실제로 읽는다. 전원 제어와 준비 판정은 Step 2에서 붙는다.
@@ -64,6 +65,9 @@ export default function LabsPage() {
   const [access, setAccess] = useState<NodeAccess[]>([]);
   const [savingAccess, setSavingAccess] = useState(false);
 
+  const [check, setCheck] = useState<CheckReport | null>(null);
+  const [checking, setChecking] = useState(false);
+
   const [chat, setChat] = useState<{ role: 'user' | 'assistant'; text: string }[]>([]);
   const [input, setInput] = useState('');
 
@@ -93,6 +97,7 @@ export default function LabsPage() {
     let cancelled = false;
     setLoading(true);
     setSelected(null);
+    setCheck(null);   // 이전 랩의 결과가 남아 있으면 오해한다
     apiFetch(`/api/labs/${labId}/`)
       .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
       .then((data: LabDetail) => { if (!cancelled) { setLab(data); setError(''); } })
@@ -161,6 +166,22 @@ export default function LabsPage() {
       setError(`전원 조작 실패: ${e instanceof Error ? e.message : e}`);
     } finally {
       setPowering(false);
+    }
+  };
+
+  const runCheck = async () => {
+    if (!labId) return;
+    setChecking(true);
+    setError('');
+    try {
+      const res = await apiFetch(`/api/labs/${labId}/check/`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      setCheck(data);
+    } catch (e) {
+      setError(`점검 실패: ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setChecking(false);
     }
   };
 
@@ -485,24 +506,78 @@ export default function LabsPage() {
           {/* ─────────────── 오른쪽: 진행 상황 + AI 대화 ─────────────── */}
           <Stack gap="md" style={{ flex: '1 1 38%', minWidth: 380 }}>
             <Paper withBorder radius="md" p="md">
-              <Text fw={700} size="sm" mb="sm">진행 상황 · 테스트 결과</Text>
-              <Stack gap="xs">
-                {STEPS.map((s) => (
-                  <Group key={s.label} gap="sm" align="flex-start" wrap="nowrap">
-                    <div style={{
-                      width: 10, height: 10, borderRadius: 5, marginLeft: 3, marginTop: 7,
-                      border: '2px solid var(--mantine-color-gray-4)',
-                    }} />
-                    <div>
-                      <Text size="sm" c="dimmed">{s.label}</Text>
-                      <Text size="xs" c="dimmed">{s.hint}</Text>
-                    </div>
+              <Group justify="space-between" mb="sm" wrap="nowrap">
+                <Text fw={700} size="sm">진행 상황 · 테스트 결과</Text>
+                <Button
+                  size="compact-sm" variant="light"
+                  leftSection={<IconListCheck size={14} />}
+                  loading={checking} disabled={!lab || nodes.length === 0}
+                  onClick={runCheck}
+                >
+                  점검 실행
+                </Button>
+              </Group>
+
+              {check ? (
+                <Stack gap="xs">
+                  <Group gap="xs">
+                    <Badge color="teal" variant="light">통과 {check.counts.pass}</Badge>
+                    <Badge color={check.counts.fail ? 'red' : 'gray'} variant="light">
+                      실패 {check.counts.fail}
+                    </Badge>
+                    <Badge color="gray" variant="light">건너뜀 {check.counts.skip}</Badge>
                   </Group>
-                ))}
-              </Stack>
-              <Text size="xs" c="dimmed" mt="sm">
-                실행 엔진은 Step 4에서 연결됩니다.
-              </Text>
+                  <ScrollArea.Autosize mah={260}>
+                    <Stack gap={6}>
+                      {/* 실패를 먼저 보여준다 — 통과 목록을 스크롤해 찾게 하지 않는다 */}
+                      {[...check.results].sort((a, b) =>
+                        (a.status === 'fail' ? 0 : a.status === 'skip' ? 2 : 1)
+                        - (b.status === 'fail' ? 0 : b.status === 'skip' ? 2 : 1)
+                      ).map((r, i) => (
+                        <Group key={i} gap="xs" align="flex-start" wrap="nowrap">
+                          <div style={{ width: 16, paddingTop: 3 }}>
+                            {r.status === 'pass' && <IconCheck size={14} color="var(--mantine-color-teal-6)" />}
+                            {r.status === 'fail' && <IconX size={14} color="var(--mantine-color-red-6)" />}
+                            {r.status === 'skip' && (
+                              <div style={{ width: 8, height: 8, borderRadius: 4, marginLeft: 3,
+                                            border: '2px solid var(--mantine-color-gray-4)' }} />
+                            )}
+                          </div>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <Text size="xs" fw={600} c={r.status === 'fail' ? 'red' : undefined}>
+                              {r.node} · {r.check}
+                            </Text>
+                            <Text size="xs" c="dimmed" style={{ wordBreak: 'break-word' }}>
+                              {r.detail}
+                            </Text>
+                          </div>
+                        </Group>
+                      ))}
+                    </Stack>
+                  </ScrollArea.Autosize>
+                </Stack>
+              ) : (
+                <>
+                  <Stack gap="xs">
+                    {STEPS.map((s) => (
+                      <Group key={s.label} gap="sm" align="flex-start" wrap="nowrap">
+                        <div style={{
+                          width: 10, height: 10, borderRadius: 5, marginLeft: 3, marginTop: 7,
+                          border: '2px solid var(--mantine-color-gray-4)',
+                        }} />
+                        <div>
+                          <Text size="sm" c="dimmed">{s.label}</Text>
+                          <Text size="xs" c="dimmed">{s.hint}</Text>
+                        </div>
+                      </Group>
+                    ))}
+                  </Stack>
+                  <Text size="xs" c="dimmed" mt="sm">
+                    &ldquo;점검 실행&rdquo;은 장비에 붙어 hostname과 LLDP 배선을 대조합니다
+                    (설정은 바꾸지 않습니다). 실행 엔진은 Step 4에서 연결됩니다.
+                  </Text>
+                </>
+              )}
             </Paper>
 
             <Paper withBorder radius="md" p="md"

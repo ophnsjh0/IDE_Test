@@ -65,6 +65,7 @@ urlpatterns = [
     path('labs/<int:id>/access/', views.LabAccessView.as_view(), name='lab-access'),
     path('labs/<int:id>/status/', views.LabStatusView.as_view(), name='lab-status'),
     path('labs/<int:id>/power/', views.LabPowerView.as_view(), name='lab-power'),
+    path('labs/<int:id>/check/', views.LabCheckView.as_view(), name='lab-check'),
     path('settings/gmail-sync/', views.GmailSyncScheduleView.as_view(),
          name='gmail-sync-schedule'),
 ]

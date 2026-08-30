@@ -39,7 +39,7 @@ from .services.analyzer import (
     get_translation_model,
     provider_api_key,
 )
-from .services import eveng, help_agent, lab_probe
+from .services import eveng, help_agent, lab_check, lab_probe
 from .services.gmail_client import GmailAuthError
 from .services.gmail_sync import (LAST_RUN_SETTING_KEY, SyncInProgress,
                                   is_cron_enabled, set_cron_enabled, sync_gmail)
@@ -1259,3 +1259,23 @@ class LabPowerView(APIView):
             'message': (f'{len(names)}대를 {POWER_STAGGER_SECONDS}초 간격으로 켜는 중입니다.'
                         if action == 'start' else f'{len(names)}대를 끄는 중입니다.'),
         }, status=status.HTTP_202_ACCEPTED)
+
+
+class LabCheckView(APIView):
+    """POST /api/labs/<id>/check/ — 읽기 전용 점검 (엔지니어 이상).
+
+    장비에 붙어 hostname과 LLDP 이웃을 읽고, 등록된 노드 이름·EVE-NG 배선과
+    대조한다. 설정은 건드리지 않는다. 판정은 전부 코드가 한다 — LLM은 나중에
+    이 결과를 설명할 뿐 통과/실패를 정하지 않는다.
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    def post(self, request, id):
+        from .models import Lab
+        lab = (Lab.objects.prefetch_related('nodes', 'links', 'accesses')
+               .filter(id=id).first())
+        if lab is None:
+            return Response({'error': '등록되지 않은 랩입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        results = lab_check.run_checks(lab, list(lab.accesses.all()), list(lab.links.all()))
+        return Response({'results': results, 'counts': lab_check.summarize(results)})

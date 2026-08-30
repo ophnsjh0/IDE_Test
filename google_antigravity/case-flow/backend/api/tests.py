@@ -16,7 +16,8 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from .models import AppSetting, Case, CaseEmail
-from .services import analyzer, eveng, gmail_sync, help_agent, lab_probe
+from .services import (analyzer, eveng, gmail_sync, help_agent,
+                       lab_drivers, lab_probe)
 from .services.email_parser import (build_gmail_query, clean_subject,
                                     detect_vendor_and_direction,
                                     extract_device_info, find_ignore_reason,
@@ -3038,6 +3039,177 @@ class LabPowerAndAccessTests(TestCase):
         self.assertEqual(body['counts'], {'unknown': 1, 'off': 1})
         self.assertEqual(body['unprobeable'], ['A10_1'])
         self.assertEqual(body['total'], 2)
+
+
+class PortNormalizeTests(TestCase):
+    """같은 포트를 EVE-NG는 'E1', 장비는 'Ethernet1', LLDP는 'Et1'이라 부른다."""
+
+    def test_same_port_written_differently_matches(self):
+        forms = ['E1', 'Eth1', 'Ethernet1', 'et1', ' Ethernet 1 ']
+        self.assertEqual({lab_drivers.normalize_port(f) for f in forms}, {'e1'})
+
+    def test_different_ports_stay_different(self):
+        self.assertNotEqual(lab_drivers.normalize_port('Eth1'),
+                            lab_drivers.normalize_port('Eth2'))
+        self.assertNotEqual(lab_drivers.normalize_port('Eth1'),
+                            lab_drivers.normalize_port('Mgmt1'))
+
+    def test_unparseable_name_is_kept_as_is(self):
+        self.assertEqual(lab_drivers.normalize_port('port-a/b'), 'port-a/b')
+
+
+class LabDriverTests(TestCase):
+    """드라이버는 벤더 응답을 공통 모양으로 바꾼다."""
+
+    def access(self, driver='arista_eapi'):
+        return SimpleNamespace(driver=driver, mgmt_ip='10.0.0.1',
+                               username='admin', password='pw', node_name='Arista_1')
+
+    def test_arista_parses_hostname_and_lldp(self):
+        payload = {'result': [{'lldpNeighbors': [
+            {'port': 'Ethernet1', 'neighborDevice': 'A10_1.lab', 'neighborPort': 'E1'},
+        ]}]}
+        driver = lab_drivers.AristaDriver(self.access())
+        with patch('api.services.lab_drivers.requests.post') as post:
+            post.return_value = MagicMock(json=lambda: payload)
+            neighbors = driver.lldp_neighbors()
+        self.assertEqual(neighbors, [{'local_port': 'Ethernet1',
+                                      'remote_host': 'A10_1.lab', 'remote_port': 'E1'}])
+
+    def test_arista_error_in_200_body_is_raised(self):
+        """eAPI는 200으로 오류를 돌려준다 — 상태 코드만 보면 놓친다."""
+        driver = lab_drivers.AristaDriver(self.access())
+        with patch('api.services.lab_drivers.requests.post') as post:
+            post.return_value = MagicMock(
+                json=lambda: {'error': {'message': 'invalid command'}})
+            with self.assertRaises(lab_drivers.DriverError):
+                driver.hostname()
+
+    def test_a10_session_always_sends_json_content_type(self):
+        """DELETE에도 이 헤더가 없으면 415다(실측). 세션에 박아둔다."""
+        driver = lab_drivers.A10Driver(self.access('a10_axapi'))
+        self.assertEqual(driver.session.headers['Content-Type'], 'application/json')
+
+    def test_a10_auth_failure_is_reported(self):
+        driver = lab_drivers.A10Driver(self.access('a10_axapi'))
+        with patch.object(driver.session, 'post') as post:
+            post.return_value = MagicMock(status_code=401, json=lambda: {})
+            with self.assertRaises(lab_drivers.DriverError):
+                driver.hostname()
+
+    def test_output_is_truncated(self):
+        """show tech는 수 MB다. 판정은 코드가 하니 원문 전체가 필요 없다."""
+        text = lab_drivers.truncate('x' * (lab_drivers.MAX_OUTPUT_CHARS + 500))
+        self.assertIn('이하 생략', text)
+        self.assertLess(len(text), lab_drivers.MAX_OUTPUT_CHARS + 200)
+
+    def test_driver_is_none_without_ip_or_support(self):
+        self.assertIsNone(lab_drivers.get_driver(
+            SimpleNamespace(driver='arista_eapi', mgmt_ip='')))
+        self.assertIsNone(lab_drivers.get_driver(
+            SimpleNamespace(driver='none', mgmt_ip='10.0.0.1')))
+
+
+@override_settings(EVENG_URL='http://eve.test', EVENG_USER='admin', EVENG_PASSWORD='pw')
+class LabCheckTests(TestCase):
+    """읽기 전용 점검 — 어긋난 것을 실제로 잡아내는지가 전부다."""
+
+    def setUp(self):
+        from .models import Lab, LabLink, LabNode, LabNodeAccess, LabServer
+        from .permissions import set_user_role
+        user = User.objects.create_user('lc-e', password='lc-pass-1!')
+        set_user_role(user, 'engineer')
+        server = LabServer.objects.create(base_url='http://eve.test')
+        self.lab = Lab.objects.create(server=server, path='/x.unl', name='x')
+        for name in ('Arista_1', 'A10_1'):
+            LabNode.objects.create(lab=self.lab, name=name, eve_id=1)
+            LabNodeAccess.objects.create(lab=self.lab, node_name=name,
+                                         mgmt_ip='10.0.0.1', driver='arista_eapi',
+                                         username='u', password='p')
+        # EVE-NG가 아는 배선: Arista_1:Eth1 <-> A10_1:E1
+        LabLink.objects.create(lab=self.lab, source='Arista_1', source_port='Eth1',
+                               target='A10_1', target_port='E1')
+        # 관리망 연결은 LLDP 대조 대상이 아니다
+        LabLink.objects.create(lab=self.lab, source='Arista_1', source_port='Mgmt1',
+                               target='Net', target_port='', target_is_network=True)
+
+    def login(self):
+        self.client.post('/api/auth/login/',
+                         {'username': 'lc-e', 'password': 'lc-pass-1!'},
+                         content_type='application/json')
+
+    def run_with(self, facts_by_node):
+        def fake_facts(access):
+            return {'access': access, **facts_by_node[access.node_name]}
+        with patch('api.services.lab_check._facts', side_effect=fake_facts):
+            self.login()
+            return self.client.post(f'/api/labs/{self.lab.id}/check/').json()
+
+    def matching_facts(self):
+        return {
+            'Arista_1': {'hostname': 'Arista_1', 'neighbors': [
+                {'local_port': 'Ethernet1', 'remote_host': 'A10_1', 'remote_port': 'E1'}]},
+            'A10_1': {'hostname': 'A10_1', 'neighbors': [
+                {'local_port': 'E1', 'remote_host': 'Arista_1', 'remote_port': 'Ethernet1'}]},
+        }
+
+    def test_matching_wiring_passes(self):
+        body = self.run_with(self.matching_facts())
+        self.assertEqual(body['counts']['fail'], 0)
+        wiring = [r for r in body['results'] if r['check'] == '배선 대조']
+        self.assertTrue(all(r['status'] == 'pass' for r in wiring), wiring)
+
+    def test_mismatched_wiring_is_caught(self):
+        """이 단계의 완료 기준 — 배선을 일부러 어긋나게 하면 실패로 잡아야 한다.
+        통과만 되는 검증은 검증이 아니다."""
+        facts = self.matching_facts()
+        # Arista_1이 Eth1이 아니라 Eth9에서 이웃을 본다고 하자
+        facts['Arista_1']['neighbors'] = [
+            {'local_port': 'Ethernet9', 'remote_host': 'A10_1', 'remote_port': 'E1'}]
+        body = self.run_with(facts)
+
+        failed = [r for r in body['results']
+                  if r['check'] == '배선 대조' and r['status'] == 'fail']
+        self.assertEqual(len(failed), 1)
+        self.assertIn('EVE-NG에는 있는데 장비가 못 봄', failed[0]['detail'])
+        self.assertIn('장비는 보는데 EVE-NG에 없음', failed[0]['detail'])
+
+    def test_wrong_device_behind_the_ip_is_caught(self):
+        """관리 IP가 다른 장비를 가리키면 엉뚱한 곳에 설정이 들어간다."""
+        facts = self.matching_facts()
+        facts['Arista_1']['hostname'] = '남의장비'
+        body = self.run_with(facts)
+
+        failed = [r for r in body['results']
+                  if r['check'] == '장비 확인' and r['status'] == 'fail']
+        self.assertEqual(len(failed), 1)
+        self.assertIn('남의장비', failed[0]['detail'])
+
+    def test_port_naming_differences_do_not_cause_false_failures(self):
+        """장비는 Ethernet1, EVE-NG는 Eth1이라고 적는다 — 이건 불일치가 아니다."""
+        body = self.run_with(self.matching_facts())
+        self.assertEqual(body['counts']['fail'], 0)
+
+    def test_unreadable_lldp_is_skip_not_fail(self):
+        """LLDP를 못 읽는 것과 배선이 틀린 것은 다르다."""
+        facts = self.matching_facts()
+        facts['A10_1']['neighbors'] = None
+        body = self.run_with(facts)
+
+        wiring = {r['node']: r['status'] for r in body['results']
+                  if r['check'] == '배선 대조'}
+        self.assertEqual(wiring['A10_1'], 'skip')
+        self.assertEqual(wiring['Arista_1'], 'pass')
+
+    def test_nodes_without_access_are_reported_as_skip(self):
+        from .models import LabNode
+        LabNode.objects.create(lab=self.lab, name='Server_1', eve_id=6)
+        body = self.run_with(self.matching_facts())
+
+        skipped = [r for r in body['results']
+                   if r['check'] == '접속 정보' and r['node'] == 'Server_1']
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]['status'], 'skip')
 
 
 class LabConfigTests(TestCase):

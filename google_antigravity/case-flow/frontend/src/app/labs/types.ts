@@ -93,3 +93,16 @@ export interface AvailableLab {
 export function fallbackState(node: LabNode): NodeState {
   return node.running ? 'unknown' : 'off';
 }
+
+// 읽기 전용 점검 결과. 판정은 서버(코드)가 하고 화면은 보여주기만 한다.
+export interface CheckResult {
+  check: string;                     // '접속 정보' | '장비 확인' | '배선 대조'
+  node: string;
+  status: 'pass' | 'fail' | 'skip';
+  detail: string;
+}
+
+export interface CheckReport {
+  results: CheckResult[];
+  counts: { pass: number; fail: number; skip: number };
+}
