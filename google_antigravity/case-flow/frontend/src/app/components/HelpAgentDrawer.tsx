@@ -135,8 +135,32 @@ const DRAWER_DEFAULT_WIDTH = 440;
 // HelpAgentChatView.MAX_ATTACHMENTS)와 맞춰야 한다. 여기 값은 파일 선택
 // 대화상자를 좁혀주는 힌트일 뿐이고, 실제 거부는 서버가 한다.
 const ATTACHMENT_ACCEPT =
-  '.png,.jpg,.jpeg,.gif,.webp,.pdf,.txt,.log,.cfg,.conf,.csv,.docx,.xlsx';
+  '.png,.jpg,.jpeg,.gif,.webp,.pdf,.txt,.log,.cfg,.conf,.csv,.docx,.xlsx,.pptx';
 const MAX_ATTACHMENTS = 5;
+
+// 붙여넣기로 들어온 이미지에 붙일 확장자. 서버는 확장자로 형식을 판별하는데
+// (help_agent.ATTACHMENT_TYPES) 클립보드 이미지는 이름이 비어 있거나 확장자가
+// 없는 경우가 있어, 그대로 올리면 "지원하지 않는 형식"으로 거부된다.
+const PASTE_EXTENSIONS: Record<string, string> = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+};
+
+// 브라우저가 클립보드 이미지에 붙이는 기본 이름들. 캡처를 여러 장 붙여넣으면
+// 칩이 전부 같은 이름이 되어 어느 것을 지우는지 알 수 없으므로 시각으로 바꾼다.
+// 반대로 파일 탐색기에서 복사해 붙여넣은 파일은 이름이 정보이므로 그대로 둔다.
+const GENERIC_PASTE_NAMES = new Set(['', 'image.png', 'image.jpeg', 'image.jpg', 'image.webp']);
+
+function namedPasteFile(file: File): File | null {
+  const extension = PASTE_EXTENSIONS[file.type];
+  if (!extension) return null; // 이미지가 아니면 붙여넣기에 관여하지 않는다
+  const name = (file.name || '').trim();
+  if (!GENERIC_PASTE_NAMES.has(name.toLowerCase()) && /\.[a-z0-9]+$/i.test(name)) return file;
+  const stamp = new Date().toTimeString().slice(0, 8).replace(/:/g, '');
+  return new File([file], `screenshot-${stamp}${extension}`, { type: file.type });
+}
 
 // AI 도우미 런처 + 채팅 Drawer를 묶은 위젯.
 // variant='inline'  : 페이지 레이아웃 안에 일반 버튼으로 배치 (리스트 페이지)
@@ -197,7 +221,7 @@ export default function HelpAgentWidget({
 
   // 파일을 고르면 곧바로 서버에 올려 file_id를 받아둔다. 질문을 보낼 때
   // 업로드를 시작하면 대기 시간이 답변 지연처럼 보이기 때문.
-  const uploadFiles = async (selected: FileList | null) => {
+  const uploadFiles = async (selected: FileList | File[] | null) => {
     if (!selected || selected.length === 0) return;
     setUploadError('');
     const room = MAX_ATTACHMENTS - pendingFiles.length;
@@ -736,10 +760,10 @@ export default function HelpAgentWidget({
                   <Text size="xs" c="dimmed">첨부 올리는 중...</Text>
                 </Group>
               )}
-              {/* 워드·엑셀은 본문만 전달되므로 표 서식·이미지가 빠진다는 걸 미리 알린다 */}
+              {/* 워드·엑셀·PPT는 본문만 전달되므로 표 서식·이미지가 빠진다는 걸 미리 알린다 */}
               {pendingFiles.some((f) => f.converted) && (
                 <Text size="xs" c="dimmed" w="100%">
-                  워드·엑셀은 본문 텍스트만 전달됩니다 (서식·이미지 제외).
+                  워드·엑셀·PPT는 본문 텍스트만 전달됩니다 (서식·이미지 제외).
                 </Text>
               )}
               {uploadError && <Text size="xs" c="red">{uploadError}</Text>}
@@ -759,7 +783,7 @@ export default function HelpAgentWidget({
                   e.currentTarget.value = ''; // 같은 파일을 다시 골라도 이벤트가 오게
                 }}
               />
-              <Tooltip label="스크린샷·설정 파일·PDF 첨부" position="top">
+              <Tooltip label="스크린샷·설정 파일·문서 첨부 (이미지는 붙여넣기도 가능)" position="top">
                 <ActionIcon
                   size="lg"
                   radius="md"
@@ -775,12 +799,23 @@ export default function HelpAgentWidget({
               <Textarea
                 style={{ flex: 1 }}
                 variant="unstyled"
-                placeholder="케이스에 대해 물어보세요 (스크린샷·문서 첨부 가능)"
+                placeholder="케이스에 대해 물어보세요 (스크린샷 붙여넣기·문서 첨부 가능)"
                 autosize
                 minRows={1}
                 maxRows={4}
                 value={input}
                 onChange={(e) => setInput(e.currentTarget.value)}
+                onPaste={(e) => {
+                  if (loading || uploading) return;
+                  const images = Array.from(e.clipboardData.files)
+                    .map(namedPasteFile)
+                    .filter((f): f is File => f !== null);
+                  if (images.length === 0) return;
+                  // 엑셀·웹페이지에서 복사하면 텍스트와 이미지가 함께 실려 온다.
+                  // 텍스트가 있으면 기본 붙여넣기를 막지 않고 첨부만 덧붙인다.
+                  if (!e.clipboardData.getData('text/plain')) e.preventDefault();
+                  uploadFiles(images);
+                }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                     e.preventDefault();

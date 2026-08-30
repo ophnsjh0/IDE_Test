@@ -937,7 +937,7 @@ class ReportPromptCostTests(TestCase):
 
 
 class OfficeAttachmentTests(TestCase):
-    """워드·엑셀 첨부: 서버에서 본문 텍스트로 변환해 올린다.
+    """워드·엑셀·PPT 첨부: 서버에서 본문 텍스트로 변환해 올린다.
 
     Anthropic document 블록이 오피스 형식을 거부하고(400), 코드 실행 컨테이너로
     읽히기는 하나 파일당 ~2만 토큰이 들어서 택한 방식.
@@ -971,6 +971,86 @@ class OfficeAttachmentTests(TestCase):
         buffer = BytesIO()
         workbook.save(buffer)
         return buffer.getvalue()
+
+    @staticmethod
+    def make_pptx(slides):
+        """slides: [{'texts': [...], 'table': [[...]], 'notes': '...', 'group': [...]}]"""
+        from pptx import Presentation
+        from pptx.util import Inches
+        presentation = Presentation()
+        for spec in slides:
+            slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+            for text in spec.get('texts', ()):
+                box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+                box.text_frame.text = text
+            if spec.get('group'):
+                group = slide.shapes.add_group_shape()
+                for text in spec['group']:
+                    box = group.shapes.add_textbox(Inches(1), Inches(2), Inches(4), Inches(1))
+                    box.text_frame.text = text
+            rows = spec.get('table')
+            if rows:
+                table = slide.shapes.add_table(len(rows), len(rows[0]), Inches(1),
+                                               Inches(3), Inches(4), Inches(1)).table
+                for r, values in enumerate(rows):
+                    for c, value in enumerate(values):
+                        table.cell(r, c).text = value
+            if spec.get('notes'):
+                slide.notes_slide.notes_text_frame.text = spec['notes']
+        buffer = BytesIO()
+        presentation.save(buffer)
+        return buffer.getvalue()
+
+    def test_pptx_labels_each_slide_in_order(self):
+        """슬라이드 경계가 없으면 도형에 흩어진 본문이 뒤섞여 맥락을 잃는다."""
+        data = self.make_pptx([{'texts': ['장애 개요']}, {'texts': ['조치 결과']}])
+        text = help_agent._extract_pptx(data)
+
+        self.assertIn('[슬라이드 1]', text)
+        self.assertIn('[슬라이드 2]', text)
+        self.assertLess(text.index('장애 개요'), text.index('조치 결과'))
+
+    def test_pptx_reads_tables_groups_and_speaker_notes(self):
+        """그룹 도형은 재귀로 들어가야 안쪽 텍스트가 빠지지 않는다."""
+        data = self.make_pptx([{
+            'group': ['그룹 안 원인 설명'],
+            'table': [['Bug', 'Fixed'], ['ACOS-104904', '6.0.9']],
+            'notes': '고객 보고용 배경',
+        }])
+        text = help_agent._extract_pptx(data)
+
+        self.assertIn('그룹 안 원인 설명', text)
+        self.assertIn('ACOS-104904 | 6.0.9', text)
+        self.assertIn('(발표자 노트) 고객 보고용 배경', text)
+
+    def test_image_only_pptx_is_rejected_with_guidance(self):
+        """도형만 있고 텍스트가 없는 발표자료는 캡처해 올리라고 안내한다."""
+        with self.assertRaises(help_agent.AttachmentRejected) as caught:
+            help_agent._office_to_text('.pptx', 'deck.pptx', self.make_pptx([{}]))
+        self.assertIn('캡처', str(caught.exception))
+
+    @override_settings(ANTHROPIC_API_KEY='test-key')
+    def test_pptx_upload_is_converted_to_text(self):
+        original = self.make_pptx([{'texts': ['VRRP 이중화 점검 결과']}])
+        client = MagicMock()
+        client.beta.files.upload.return_value = SimpleNamespace(id='file_ppt')
+        with patch('api.services.help_agent.anthropic.Anthropic', return_value=client):
+            meta = help_agent.upload_attachment('deck.pptx', original)
+
+        self.assertTrue(meta['converted'])
+        self.assertEqual(meta['filename'], 'deck.pptx')  # 사용자에겐 원본 이름
+        name, stream, mime = client.beta.files.upload.call_args.kwargs['file']
+        self.assertEqual((name, mime), ('deck.pptx.txt', 'text/plain'))
+        self.assertIn('VRRP 이중화 점검 결과', stream.getvalue().decode())
+
+    @override_settings(ANTHROPIC_API_KEY='test-key')
+    def test_legacy_office_upload_names_the_format_to_save_as(self):
+        """"PPT 첨부"를 시도하면 .ppt를 올리기 쉽다 — 형식 나열 대신 방법을 알려준다."""
+        for name, modern in (('deck.ppt', '.pptx'), ('report.doc', '.docx'),
+                             ('sheet.xls', '.xlsx')):
+            with self.assertRaises(help_agent.AttachmentRejected) as caught:
+                help_agent.upload_attachment(name, b'ole2-binary')
+            self.assertIn(modern, str(caught.exception))
 
     def test_docx_keeps_document_order_of_paragraphs_and_tables(self):
         """표를 뒤로 몰아버리면 맥락이 끊긴다 — 원래 순서를 지켜야 한다."""

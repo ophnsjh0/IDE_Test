@@ -52,7 +52,7 @@ MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 # 확장자 → (MIME, kind). kind가 모델에 보낼 블록 타입을 결정한다.
 # 목록에 없는 확장자는 거부 — 모델이 못 읽는 파일을 올려두고 기다리는 것보다
 # 업로드 시점에 알려주는 편이 낫다.
-# 워드·엑셀의 MIME이 text/plain인 것은 오타가 아니다 — 아래 OFFICE_EXTRACTORS로
+# 워드·엑셀·PPT의 MIME이 text/plain인 것은 오타가 아니다 — 아래 OFFICE_EXTRACTORS로
 # 본문을 뽑아 평문으로 바꿔 올리기 때문에 업로드되는 실체가 텍스트다.
 ATTACHMENT_TYPES = {
     '.png': ('image/png', 'image'),
@@ -68,6 +68,16 @@ ATTACHMENT_TYPES = {
     '.csv': ('text/plain', 'document'),
     '.docx': ('text/plain', 'document'),
     '.xlsx': ('text/plain', 'document'),
+    '.pptx': ('text/plain', 'document'),
+}
+
+# 구형 오피스 바이너리는 파서가 아예 없다(.pptx/.docx/.xlsx는 zip+XML, 이쪽은
+# OLE 복합 문서). 목록에 안 넣고 두면 "가능한 형식: ..." 나열만 나가서 왜 안
+# 되는지 모르므로, 확장자를 알아보고 무엇을 하면 되는지 알려준다.
+LEGACY_OFFICE_HINTS = {
+    '.ppt': ('PowerPoint 97-2003(.ppt)', '.pptx'),
+    '.doc': ('Word 97-2003(.doc)', '.docx'),
+    '.xls': ('Excel 97-2003(.xls)', '.xlsx'),
 }
 
 # 변환 텍스트 상한. 넘으면 잘라서 올린다 — 행이 수천 개인 이슈 시트를 통째로
@@ -971,11 +981,75 @@ def _extract_xlsx(data):
         workbook.close()
 
 
+def _chart_lines(chart):
+    """차트에 박힌 수치를 텍스트로 편다.
+
+    발표자료의 핵심 숫자는 차트 안에만 있는 경우가 많은데, 도형으로만 남으면
+    모델에게는 없는 값이나 마찬가지다. 다만 차트 종류에 따라 카테고리·계열
+    접근이 실패할 수 있어(복합·3D 차트 등) 여기서 삼킨다 — 슬라이드 하나의
+    차트 때문에 파일 전체가 거부되면 손해가 훨씬 크다.
+    """
+    try:
+        plot = chart.plots[0]
+        categories = [str(c) for c in plot.categories]
+        lines = [f'(차트) 항목: {" | ".join(categories)}' if categories else '(차트)']
+        for series in plot.series:
+            values = ['' if v is None else str(v) for v in series.values]
+            lines.append(f'{series.name}: {" | ".join(values)}')
+        return lines
+    except Exception:
+        logger.debug('pptx chart extraction skipped', exc_info=True)
+        return []
+
+
+def _extract_pptx(data):
+    """PPT에서 슬라이드 순서대로 도형·표·차트 텍스트를 뽑는다.
+
+    발표자료는 본문이 도형에 흩어져 있어 슬라이드 경계가 없으면 맥락이
+    뒤섞인다 — 엑셀의 [시트: 이름]과 같은 이유로 머리말을 남긴다.
+    그룹 도형은 재귀로 들어가야 안쪽 텍스트가 빠지지 않는다.
+    """
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    def walk(shapes, out):
+        for shape in shapes:
+            if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                walk(shape.shapes, out)
+            elif shape.has_table:
+                for row in shape.table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    if any(cells):
+                        out.append(' | '.join(cells))
+            elif shape.has_chart:
+                out.extend(_chart_lines(shape.chart))
+            elif shape.has_text_frame:
+                text = shape.text_frame.text.strip()
+                if text:
+                    out.append(text)
+
+    presentation = Presentation(BytesIO(data))
+    parts = []
+    for number, slide in enumerate(presentation.slides, 1):
+        lines = []
+        walk(slide.shapes, lines)
+        # 발표자 노트에 배경·결론이 적혀 있는 경우가 많아 함께 싣는다
+        if slide.has_notes_slide:
+            note = slide.notes_slide.notes_text_frame.text.strip()
+            if note:
+                lines.append(f'(발표자 노트) {note}')
+        if lines:
+            parts.append(f'[슬라이드 {number}]')
+            parts.extend(lines)
+    return '\n'.join(parts)
+
+
 # 오피스 문서는 document 블록이 거부한다(API: "Only PDF and plaintext documents
 # are supported"). 코드 실행 컨테이너로 읽히기는 하지만 파일 하나에 2만 토큰쯤
 # 들어서, 서버에서 본문만 뽑아 평문으로 올린다 — 서식·이미지는 잃는 대신
 # 비용이 1/20 수준이고 채팅으로 묻는 용도에는 내용이면 충분하다.
-OFFICE_EXTRACTORS = {'.docx': _extract_docx, '.xlsx': _extract_xlsx}
+OFFICE_EXTRACTORS = {'.docx': _extract_docx, '.xlsx': _extract_xlsx,
+                     '.pptx': _extract_pptx}
 
 
 def _office_to_text(extension, name, data):
@@ -1003,7 +1077,7 @@ def _office_to_text(extension, name, data):
 def upload_attachment(filename, data):
     """사용자 첨부를 Files API에 올리고 메시지에 실을 메타데이터를 반환한다.
 
-    워드·엑셀은 여기서 평문으로 변환해 올린다(converted=True) — 사용자에게는
+    워드·엑셀·PPT는 여기서 평문으로 변환해 올린다(converted=True) — 사용자에게는
     원래 파일명·크기를 그대로 돌려주고, 모델에는 추출한 텍스트가 간다.
     반환: {'file_id', 'filename', 'kind', 'size_bytes', 'converted'}
     거부 사유(형식·크기·빈 파일·해독 실패)는 AttachmentRejected로 알린다.
@@ -1013,6 +1087,11 @@ def upload_attachment(filename, data):
 
     name = (filename or '').strip() or 'attachment'
     extension = os.path.splitext(name)[1].lower()
+    if extension in LEGACY_OFFICE_HINTS:
+        label, modern = LEGACY_OFFICE_HINTS[extension]
+        raise AttachmentRejected(
+            f'{label} 형식은 읽을 수 없습니다. 파일을 열어 '
+            f'{modern} 형식으로 저장한 뒤 첨부해주세요.')
     if extension not in ATTACHMENT_TYPES:
         allowed = ', '.join(sorted(ATTACHMENT_TYPES))
         raise AttachmentRejected(f'지원하지 않는 형식입니다. 가능한 형식: {allowed}')
