@@ -106,3 +106,31 @@ export interface CheckReport {
   results: CheckResult[];
   counts: { pass: number; fail: number; skip: number };
 }
+
+export interface Blueprint {
+  id: number;
+  name: string;
+  description: string;
+  steps: number;
+  problems: string[];        // 실행 전에 못 돌리는 이유 (역할 미매핑 등)
+}
+
+export interface RunStep {
+  seq: number;
+  phase: 'precheck' | 'apply' | 'verify' | 'rollback';
+  node: string;
+  label: string;
+  status: string;            // pass | fail | skip | error
+  detail: string;
+}
+
+export interface Run {
+  id: number;
+  blueprint: string;
+  status: 'running' | 'passed' | 'failed' | 'rolled_back' | 'error';
+  started_at: string;
+  finished_at: string | null;
+  topology_synced_at: string | null;
+  steps: RunStep[];
+  pending_rollback: number;  // 되돌리지 않고 장비에 남아 있는 것
+}

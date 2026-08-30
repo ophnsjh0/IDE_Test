@@ -39,7 +39,7 @@ from .services.analyzer import (
     get_translation_model,
     provider_api_key,
 )
-from .services import eveng, help_agent, lab_check, lab_probe
+from .services import eveng, help_agent, lab_check, lab_probe, lab_runner
 from .services.gmail_client import GmailAuthError
 from .services.gmail_sync import (LAST_RUN_SETTING_KEY, SyncInProgress,
                                   is_cron_enabled, set_cron_enabled, sync_gmail)
@@ -1286,3 +1286,107 @@ class LabCheckView(APIView):
         results = lab_check.run_checks(lab, list(lab.accesses.all()),
                                        list(lab.links.all()), running)
         return Response({'results': results, 'counts': lab_check.summarize(results)})
+
+
+class LabBlueprintView(APIView):
+    """GET/POST /api/labs/<id>/blueprints/ — 시나리오 목록·등록 (엔지니어 이상)."""
+    permission_classes = [IsEngineerOrAbove]
+
+    def get(self, request, id):
+        from .models import Lab
+        lab = Lab.objects.prefetch_related('blueprints', 'accesses').filter(id=id).first()
+        if lab is None:
+            return Response({'error': '등록되지 않은 랩입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        accesses = list(lab.accesses.all())
+        return Response([{
+            'id': bp.id, 'name': bp.name, 'description': bp.description,
+            'steps': len(bp.steps),
+            # 실행 전에 못 돌리는 이유를 미리 보여준다 (역할 미매핑 등)
+            'problems': lab_runner.validate(bp, accesses),
+        } for bp in lab.blueprints.all()])
+
+    def post(self, request, id):
+        from .models import Lab, LabBlueprint
+        lab = Lab.objects.filter(id=id).first()
+        if lab is None:
+            return Response({'error': '등록되지 않은 랩입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        name = (request.data.get('name') or '').strip()
+        steps = request.data.get('steps')
+        if not name or not isinstance(steps, list) or not steps:
+            return Response({'error': '이름과 steps가 필요합니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        bp = LabBlueprint.objects.create(
+            lab=lab, name=name[:200],
+            description=(request.data.get('description') or '').strip()[:300],
+            steps=steps)
+        return Response({'id': bp.id, 'name': bp.name}, status=status.HTTP_201_CREATED)
+
+
+def _run_payload(run):
+    return {
+        'id': run.id,
+        'blueprint': run.blueprint.name,
+        'status': run.status,
+        'started_at': run.started_at,
+        'finished_at': run.finished_at,
+        'topology_synced_at': run.topology_synced_at,
+        'steps': [{'seq': s.seq, 'phase': s.phase, 'node': s.node_name,
+                   'label': s.label, 'status': s.status, 'detail': s.detail}
+                  for s in run.steps.all()],
+        # 되돌리지 않은 것이 남아 있으면 화면이 롤백 버튼을 살린다
+        'pending_rollback': run.applied.filter(rolled_back_at__isnull=True).count(),
+    }
+
+
+class LabRunView(APIView):
+    """POST /api/labs/<id>/runs/ — 블루프린트 실행 (엔지니어 이상).
+
+    동기로 돈다. 랩 시나리오는 단계가 많지 않고, 진행 중에 화면을 떠나도
+    적용 원장이 남아 롤백 버튼으로 되돌릴 수 있다.
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    def get(self, request, id):
+        from .models import LabRun
+        runs = (LabRun.objects.filter(lab_id=id)
+                .select_related('blueprint').prefetch_related('steps', 'applied')[:20])
+        return Response([_run_payload(r) for r in runs])
+
+    def post(self, request, id):
+        from .models import Lab, LabBlueprint, LabRun
+        lab = Lab.objects.filter(id=id).first()
+        if lab is None:
+            return Response({'error': '등록되지 않은 랩입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        bp = LabBlueprint.objects.filter(lab=lab, id=request.data.get('blueprint')).first()
+        if bp is None:
+            return Response({'error': '이 랩의 시나리오가 아닙니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        run = LabRun.objects.create(
+            blueprint=bp, lab=lab, started_by=request.user,
+            # 어떤 배선 상태에서 돌린 결과인지 나중에 답할 수 있게 남긴다
+            topology_synced_at=lab.topology_synced_at)
+        lab_runner.execute(run, auto_rollback=request.data.get('rollback', True))
+        run.refresh_from_db()
+        return Response(_run_payload(run), status=status.HTTP_201_CREATED)
+
+
+class LabRollbackView(APIView):
+    """POST /api/labs/runs/<run_id>/rollback/ — 적용 원장을 역순으로 되돌린다.
+
+    대화와 무관하게 사람이 누른다. 실행이 중간에 죽었어도 원장만 있으면
+    되돌아간다 — 두 번 눌러도 안전하다(이미 되돌린 항목은 건너뛴다).
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    def post(self, request, run_id):
+        from .models import LabRun
+        run = LabRun.objects.filter(id=run_id).first()
+        if run is None:
+            return Response({'error': '없는 실행입니다.'}, status=status.HTTP_404_NOT_FOUND)
+        outcome = lab_runner.rollback(run)
+        run.refresh_from_db()
+        return Response({'outcome': outcome, **_run_payload(run)})

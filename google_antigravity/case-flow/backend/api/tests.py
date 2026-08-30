@@ -3228,6 +3228,161 @@ class LabCheckTests(TestCase):
         self.assertEqual(skipped[0]['status'], 'skip')
 
 
+@override_settings(EVENG_URL='http://eve.test', EVENG_USER='admin', EVENG_PASSWORD='pw')
+class LabRunnerTests(TestCase):
+    """실행 엔진 — 넣고, 코드로 판정하고, 원장으로 되돌린다."""
+
+    STEP = {
+        'role': 'core-a', 'label': '태그 설정',
+        'apply': ['interface Ethernet5', 'description TAG'],
+        'verify': {'command': 'show interfaces Ethernet5 description', 'contains': 'TAG'},
+        'rollback': ['interface Ethernet5', 'no description'],
+    }
+
+    def setUp(self):
+        from .models import (Lab, LabBlueprint, LabNode, LabNodeAccess, LabServer)
+        from .permissions import set_user_role
+        user = User.objects.create_user('lr2-e', password='lr2-pass-1!')
+        set_user_role(user, 'engineer')
+        server = LabServer.objects.create(base_url='http://eve.test')
+        self.lab = Lab.objects.create(server=server, path='/x.unl', name='x')
+        LabNode.objects.create(lab=self.lab, name='Arista_1', eve_id=1)
+        LabNodeAccess.objects.create(lab=self.lab, node_name='Arista_1', role='core-a',
+                                     mgmt_ip='10.0.0.1', driver='arista_eapi',
+                                     username='u', password='p')
+        self.bp = LabBlueprint.objects.create(lab=self.lab, name='bp', steps=[dict(self.STEP)])
+
+    def login(self):
+        self.client.post('/api/auth/login/',
+                         {'username': 'lr2-e', 'password': 'lr2-pass-1!'},
+                         content_type='application/json')
+
+    def fake_driver(self, output='... TAG ...', apply_error=None):
+        driver = MagicMock()
+        driver.run_command.return_value = output
+        if apply_error:
+            driver.apply.side_effect = lab_drivers.DriverError(apply_error)
+        return driver
+
+    def run_blueprint(self, driver, rollback=True):
+        self.login()
+        with patch('api.services.lab_runner.get_driver', return_value=driver):
+            return self.client.post(f'/api/labs/{self.lab.id}/runs/',
+                                    {'blueprint': self.bp.id, 'rollback': rollback},
+                                    content_type='application/json').json()
+
+    def test_apply_verify_rollback_in_order(self):
+        driver = self.fake_driver()
+        body = self.run_blueprint(driver)
+
+        self.assertEqual(body['status'], 'passed')
+        self.assertEqual([s['phase'] for s in body['steps']],
+                         ['precheck', 'apply', 'verify', 'rollback'])
+        self.assertEqual(body['pending_rollback'], 0)
+
+    def test_ledger_is_written_before_the_command_is_sent(self):
+        """명령을 보낸 뒤에 기록하면, 중간에 죽었을 때 장비에는 들어갔는데
+        원장에는 없는 찌꺼기가 남는다."""
+        from .models import LabAppliedObject
+        order = []
+        driver = MagicMock()
+        driver.apply.side_effect = lambda cmds: order.append('apply')
+        driver.run_command.return_value = 'TAG'
+        original = LabAppliedObject.objects.create
+
+        def spy(**kwargs):
+            order.append('ledger')
+            return original(**kwargs)
+
+        with patch.object(LabAppliedObject.objects, 'create', side_effect=spy):
+            self.run_blueprint(driver)
+        self.assertEqual(order[:2], ['ledger', 'apply'])
+
+    def test_verify_failure_still_rolls_back(self):
+        """실패해도 넣은 것은 되돌린다."""
+        driver = self.fake_driver(output='아무것도 없음')
+        body = self.run_blueprint(driver)
+
+        self.assertEqual(body['status'], 'failed')
+        self.assertEqual(body['pending_rollback'], 0)
+        driver.apply.assert_any_call(['interface Ethernet5', 'no description'])
+
+    def test_apply_failure_rolls_back_what_was_recorded(self):
+        driver = self.fake_driver(apply_error='eAPI 오류')
+        body = self.run_blueprint(driver)
+        self.assertEqual(body['status'], 'failed')
+        errors = [s for s in body['steps'] if s['status'] == 'error']
+        self.assertTrue(errors)
+
+    def test_rollback_button_works_after_the_run_is_gone(self):
+        """실행이 죽어도 원장만 있으면 되돌아간다 — 이 단계의 진짜 시험."""
+        driver = self.fake_driver()
+        body = self.run_blueprint(driver, rollback=False)
+        self.assertEqual(body['pending_rollback'], 1)   # 장비에 남아 있음
+
+        driver2 = self.fake_driver()
+        with patch('api.services.lab_runner.get_driver', return_value=driver2):
+            rb = self.client.post(f"/api/labs/runs/{body['id']}/rollback/").json()
+
+        self.assertEqual(rb['outcome'], 'done')
+        self.assertEqual(rb['pending_rollback'], 0)
+        driver2.apply.assert_called_once_with(['interface Ethernet5', 'no description'])
+
+    def test_rollback_twice_is_safe(self):
+        driver = self.fake_driver()
+        body = self.run_blueprint(driver, rollback=False)
+        with patch('api.services.lab_runner.get_driver', return_value=self.fake_driver()):
+            self.client.post(f"/api/labs/runs/{body['id']}/rollback/")
+            again = self.client.post(f"/api/labs/runs/{body['id']}/rollback/").json()
+        self.assertEqual(again['outcome'], 'nothing')
+
+    def test_blueprint_without_rollback_is_refused(self):
+        """되돌릴 방법이 없는 단계는 아예 실행하지 않는다."""
+        from .models import LabBlueprint
+        step = dict(self.STEP)
+        step.pop('rollback')
+        bad = LabBlueprint.objects.create(lab=self.lab, name='bad', steps=[step])
+        self.login()
+        body = self.client.post(f'/api/labs/{self.lab.id}/runs/',
+                                {'blueprint': bad.id}, content_type='application/json').json()
+
+        self.assertEqual(body['status'], 'error')
+        self.assertIn('rollback', body['steps'][0]['detail'])
+
+    def test_unmapped_role_is_caught_before_touching_devices(self):
+        from .models import LabBlueprint
+        step = dict(self.STEP, role='없는역할')
+        bad = LabBlueprint.objects.create(lab=self.lab, name='bad', steps=[step])
+        driver = self.fake_driver()
+        self.login()
+        with patch('api.services.lab_runner.get_driver', return_value=driver):
+            body = self.client.post(f'/api/labs/{self.lab.id}/runs/',
+                                    {'blueprint': bad.id},
+                                    content_type='application/json').json()
+
+        self.assertEqual(body['status'], 'error')
+        driver.apply.assert_not_called()   # 장비를 건드리기 전에 막는다
+
+    def test_run_records_which_topology_it_ran_on(self):
+        """실패 분석 때 '어떤 배선에서 돌린 결과인가'를 답할 수 있어야 한다."""
+        from django.utils import timezone
+        self.lab.topology_synced_at = timezone.now()
+        self.lab.save(update_fields=['topology_synced_at'])
+        body = self.run_blueprint(self.fake_driver())
+        self.assertIsNotNone(body['topology_synced_at'])
+
+    def test_blueprint_from_another_lab_is_refused(self):
+        from .models import Lab, LabBlueprint, LabServer
+        other = Lab.objects.create(
+            server=LabServer.objects.get(base_url='http://eve.test'),
+            path='/y.unl', name='y')
+        alien = LabBlueprint.objects.create(lab=other, name='alien', steps=[dict(self.STEP)])
+        self.login()
+        res = self.client.post(f'/api/labs/{self.lab.id}/runs/', {'blueprint': alien.id},
+                               content_type='application/json')
+        self.assertEqual(res.status_code, 400)
+
+
 class LabConfigTests(TestCase):
     """Lab Tests — EVE-NG 설정 여부 조회. 랩 서버가 없어도 앱은 정상 동작해야 한다."""
 

@@ -2,14 +2,15 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  ActionIcon, Alert, AppShell, Badge, Button, Group, Loader, Menu, Modal, Paper,
+  ActionIcon, Alert, AppShell, Badge, Button, Divider, Group, Loader, Menu,
+  Modal, Paper,
   ScrollArea, Select, Stack, Table, Text, Textarea, TextInput, Title, Tooltip,
 } from '@mantine/core';
 import {
   IconAlertTriangle, IconCheck, IconCircleCheck, IconCirclePlus,
   IconPlayerPlay, IconPlayerStop,
   IconKey, IconListCheck, IconRefresh, IconSend, IconServerOff,
-  IconTerminal2, IconTrash, IconX,
+  IconArrowBackUp, IconPlayerTrackNext, IconTerminal2, IconTrash, IconX,
 } from '@tabler/icons-react';
 import AppHeader from '../components/AppHeader';
 import { apiFetch } from '../lib/api';
@@ -18,7 +19,8 @@ import TopologyCanvas from './TopologyCanvas';
 import {
   DRIVERS, fallbackState,
   type AvailableLab, type LabDetail, type LabNode, type LabStatus,
-  type CheckReport, type LabSummary, type NodeAccess, type NodeState,
+  type Blueprint, type CheckReport, type LabSummary, type NodeAccess,
+  type NodeState, type Run,
 } from './types';
 
 // Step 1 — EVE-NG를 실제로 읽는다. 전원 제어와 준비 판정은 Step 2에서 붙는다.
@@ -67,6 +69,9 @@ export default function LabsPage() {
 
   const [check, setCheck] = useState<CheckReport | null>(null);
   const [checking, setChecking] = useState(false);
+  const [blueprints, setBlueprints] = useState<Blueprint[]>([]);
+  const [run, setRun] = useState<Run | null>(null);
+  const [running, setRunning] = useState(false);
 
   const [chat, setChat] = useState<{ role: 'user' | 'assistant'; text: string }[]>([]);
   const [input, setInput] = useState('');
@@ -98,6 +103,11 @@ export default function LabsPage() {
     setLoading(true);
     setSelected(null);
     setCheck(null);   // 이전 랩의 결과가 남아 있으면 오해한다
+    setRun(null);
+    apiFetch(`/api/labs/${labId}/blueprints/`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then(setBlueprints)
+      .catch(() => setBlueprints([]));
     apiFetch(`/api/labs/${labId}/`)
       .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
       .then((data: LabDetail) => { if (!cancelled) { setLab(data); setError(''); } })
@@ -182,6 +192,41 @@ export default function LabsPage() {
       setError(`점검 실패: ${e instanceof Error ? e.message : e}`);
     } finally {
       setChecking(false);
+    }
+  };
+
+  const startRun = async (blueprintId: number) => {
+    setRunning(true);
+    setError('');
+    try {
+      const res = await apiFetch(`/api/labs/${labId}/runs/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ blueprint: blueprintId }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      setRun(data);
+    } catch (e) {
+      setError(`실행 실패: ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  // 롤백은 실행과 무관하게 사람이 누른다 — 실행이 죽었어도 원장만 있으면 되돌아간다
+  const doRollback = async () => {
+    if (!run) return;
+    setRunning(true);
+    try {
+      const res = await apiFetch(`/api/labs/runs/${run.id}/rollback/`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      setRun(data);
+    } catch (e) {
+      setError(`롤백 실패: ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setRunning(false);
     }
   };
 
@@ -518,7 +563,66 @@ export default function LabsPage() {
                 </Button>
               </Group>
 
-              {check ? (
+              {/* 실행 결과가 있으면 그것을, 없으면 점검 결과나 안내를 보여준다 */}
+              {run ? (
+                <Stack gap="xs">
+                  <Group gap="xs" justify="space-between" wrap="nowrap">
+                    <Group gap="xs">
+                      <Badge color={run.status === 'passed' ? 'teal'
+                        : run.status === 'rolled_back' ? 'gray' : 'red'}>
+                        {run.status === 'passed' ? '통과'
+                          : run.status === 'failed' ? '실패'
+                          : run.status === 'rolled_back' ? '롤백됨' : '오류'}
+                      </Badge>
+                      <Text size="xs" c="dimmed">#{run.id} {run.blueprint}</Text>
+                    </Group>
+                    <Group gap="xs">
+                      {/* 되돌리지 않은 것이 장비에 남아 있으면 눈에 띄게 알린다 */}
+                      {run.pending_rollback > 0 && (
+                        <Button size="compact-xs" color="orange"
+                                leftSection={<IconArrowBackUp size={13} />}
+                                loading={running} onClick={doRollback}>
+                          롤백 ({run.pending_rollback})
+                        </Button>
+                      )}
+                      <Button size="compact-xs" variant="subtle" onClick={() => setRun(null)}>
+                        닫기
+                      </Button>
+                    </Group>
+                  </Group>
+                  {run.pending_rollback > 0 && (
+                    <Text size="xs" c="orange">
+                      적용한 설정이 장비에 남아 있습니다. 롤백을 눌러 되돌리세요.
+                    </Text>
+                  )}
+                  <ScrollArea.Autosize mah={240}>
+                    <Stack gap={6}>
+                      {run.steps.map((s) => (
+                        <Group key={s.seq} gap="xs" align="flex-start" wrap="nowrap">
+                          <div style={{ width: 16, paddingTop: 3 }}>
+                            {s.status === 'pass' && <IconCheck size={14} color="var(--mantine-color-teal-6)" />}
+                            {(s.status === 'fail' || s.status === 'error')
+                              && <IconX size={14} color="var(--mantine-color-red-6)" />}
+                            {s.status === 'skip' && (
+                              <div style={{ width: 8, height: 8, borderRadius: 4, marginLeft: 3,
+                                            border: '2px solid var(--mantine-color-gray-4)' }} />
+                            )}
+                          </div>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <Text size="xs" fw={600}
+                                  c={s.status === 'fail' || s.status === 'error' ? 'red' : undefined}>
+                              {s.phase} · {s.label}{s.node && ` · ${s.node}`}
+                            </Text>
+                            <Text size="xs" c="dimmed" style={{ wordBreak: 'break-word' }}>
+                              {s.detail}
+                            </Text>
+                          </div>
+                        </Group>
+                      ))}
+                    </Stack>
+                  </ScrollArea.Autosize>
+                </Stack>
+              ) : check ? (
                 <Stack gap="xs">
                   <Group gap="xs">
                     <Badge color="teal" variant="light">통과 {check.counts.pass}</Badge>
@@ -574,8 +678,38 @@ export default function LabsPage() {
                   </Stack>
                   <Text size="xs" c="dimmed" mt="sm">
                     &ldquo;점검 실행&rdquo;은 장비에 붙어 hostname과 LLDP 배선을 대조합니다
-                    (설정은 바꾸지 않습니다). 실행 엔진은 Step 4에서 연결됩니다.
+                    (설정은 바꾸지 않습니다).
                   </Text>
+                </>
+              )}
+
+              {blueprints.length > 0 && !run && (
+                <>
+                  <Divider my="sm" />
+                  <Text size="xs" fw={700} c="dimmed" mb={6}>테스트 시나리오</Text>
+                  <Stack gap={6}>
+                    {blueprints.map((bp) => (
+                      <Group key={bp.id} justify="space-between" gap="xs" wrap="nowrap">
+                        <div style={{ minWidth: 0 }}>
+                          <Text size="xs" fw={600}>{bp.name}</Text>
+                          <Text size="xs" c={bp.problems.length ? 'orange' : 'dimmed'}>
+                            {bp.problems.length
+                              ? bp.problems[0]
+                              : `${bp.steps}단계 · ${bp.description || '설명 없음'}`}
+                          </Text>
+                        </div>
+                        <Button
+                          size="compact-xs" variant="light"
+                          leftSection={<IconPlayerTrackNext size={13} />}
+                          loading={running}
+                          disabled={bp.problems.length > 0}
+                          onClick={() => startRun(bp.id)}
+                        >
+                          실행
+                        </Button>
+                      </Group>
+                    ))}
+                  </Stack>
                 </>
               )}
             </Paper>

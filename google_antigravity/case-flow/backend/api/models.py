@@ -466,3 +466,99 @@ class LabNodeAccess(models.Model):
     @property
     def probeable(self):
         return bool(self.mgmt_ip) and self.driver != 'none'
+
+
+class LabBlueprint(models.Model):
+    """테스트 시나리오 선언.
+
+    포트·장비명을 하드코딩하지 않고 **역할**(LabNodeAccess.role)로 쓴다 —
+    랩이 늘어나도 시나리오를 재사용하려면 "A10_1"이 아니라 "lb-primary"를
+    가리켜야 한다.
+
+    steps 예:
+      [{"role": "core-a", "apply": ["interface Ethernet5", "description CASEFLOW-TEST"],
+        "verify": {"command": "show interface Ethernet5", "contains": "CASEFLOW-TEST"},
+        "rollback": ["interface Ethernet5", "no description"]}]
+    """
+    lab = models.ForeignKey(Lab, on_delete=models.CASCADE, related_name='blueprints')
+    name = models.CharField(max_length=200)
+    description = models.CharField(max_length=300, blank=True, default='')
+    steps = models.JSONField(default=list)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return f"{self.lab.name}/{self.name}"
+
+
+class LabRun(models.Model):
+    """블루프린트 실행 1회."""
+    STATUS_CHOICES = [
+        ('running', 'Running'),
+        ('passed', 'Passed'),
+        ('failed', 'Failed'),
+        ('rolled_back', 'Rolled Back'),
+        ('error', 'Error'),
+    ]
+
+    blueprint = models.ForeignKey(LabBlueprint, on_delete=models.CASCADE,
+                                  related_name='runs')
+    lab = models.ForeignKey(Lab, on_delete=models.CASCADE, related_name='runs')
+    started_by = models.ForeignKey(django_settings.AUTH_USER_MODEL, null=True,
+                                   blank=True, on_delete=models.SET_NULL)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='running')
+    # 실행 시점의 토폴로지 수집 시각 — "어떤 배선에서 돌린 결과인가"를 답할 수 있게
+    topology_synced_at = models.DateTimeField(null=True, blank=True)
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-started_at']
+
+    def __str__(self):
+        return f"#{self.id} {self.blueprint.name} ({self.status})"
+
+
+class LabRunStep(models.Model):
+    """실행 중 한 단계의 기록. 화면과 나중에 에이전트가 읽는다."""
+    PHASE_CHOICES = [
+        ('precheck', '사전 점검'),
+        ('apply', '설정 적용'),
+        ('verify', '검증'),
+        ('rollback', '롤백'),
+    ]
+
+    run = models.ForeignKey(LabRun, on_delete=models.CASCADE, related_name='steps')
+    seq = models.IntegerField()
+    phase = models.CharField(max_length=20, choices=PHASE_CHOICES)
+    node_name = models.CharField(max_length=100, blank=True, default='')
+    label = models.CharField(max_length=200)
+    status = models.CharField(max_length=20)          # pass / fail / skip / error
+    detail = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['seq']
+
+
+class LabAppliedObject(models.Model):
+    """적용 원장 — 무엇을 넣었는지.
+
+    EVE-NG Community는 스냅샷·롤백 API가 없어서 복구가 전적으로 이 기록 책임이다.
+    **적용한 뒤가 아니라 적용하는 순간** 기록한다. 중간에 죽으면 그 차이가
+    장비에 찌꺼기로 남는다. 롤백은 이 표를 역순으로 되돌린다.
+    """
+    run = models.ForeignKey(LabRun, on_delete=models.CASCADE, related_name='applied')
+    seq = models.IntegerField()
+    node_name = models.CharField(max_length=100)
+    commands = models.JSONField(default=list)          # 실제로 보낸 것
+    rollback_commands = models.JSONField(default=list)  # 되돌릴 때 보낼 것
+    rolled_back_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['seq']
+
+    def __str__(self):
+        return f"run#{self.run_id} {self.node_name} ({len(self.commands)}개)"

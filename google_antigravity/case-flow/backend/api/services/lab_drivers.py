@@ -70,6 +70,16 @@ class DeviceDriver:
         """[{'local_port', 'remote_host', 'remote_port'}]. 지원 안 하면 None."""
         return None
 
+    # ---- Step 4에서 쓰는 쓰기·조회 ----
+
+    def run_command(self, command):
+        """읽기 명령 하나를 돌려 출력 문자열을 받는다."""
+        raise NotImplementedError
+
+    def apply(self, commands):
+        """설정 명령을 넣는다. 되돌리기는 호출자(원장)가 책임진다."""
+        raise NotImplementedError
+
 
 class AristaDriver(DeviceDriver):
     """eAPI (JSON-RPC). EOS는 구조화 출력이 안정적이라 파싱이 단순하다."""
@@ -94,6 +104,30 @@ class AristaDriver(DeviceDriver):
 
     def hostname(self):
         return self._run(['show hostname'])[0].get('hostname', '')
+
+    def run_command(self, command):
+        """text 포맷으로 받는다 — 검증은 문자열 포함 여부로 하기 때문."""
+        res = self._run_text([command])
+        return truncate(res[0].get('output', ''))
+
+    def _run_text(self, commands):
+        try:
+            res = requests.post(
+                f'http://{self.host}/command-api',
+                json={'jsonrpc': '2.0', 'method': 'runCmds',
+                      'params': {'version': 1, 'cmds': commands, 'format': 'text'},
+                      'id': 'caseflow'},
+                auth=(self.access.username, self.access.password), timeout=TIMEOUT)
+        except requests.RequestException as e:
+            raise DriverError(f'eAPI 연결 실패 ({self.host}): {e}') from e
+        body = res.json()
+        if 'error' in body:
+            raise DriverError(f"eAPI 오류: {body['error'].get('message', body['error'])}")
+        return body['result']
+
+    def apply(self, commands):
+        """configure 모드로 넣는다. EOS는 명령 하나라도 틀리면 전체가 실패한다."""
+        self._run_text(['enable', 'configure'] + list(commands))
 
     def lldp_neighbors(self):
         rows = self._run(['show lldp neighbors'])[0].get('lldpNeighbors', [])
@@ -159,6 +193,13 @@ class A10Driver(DeviceDriver):
 
     def hostname(self):
         return ((self._get('/hostname') or {}).get('hostname') or {}).get('value', '')
+
+    def run_command(self, command):
+        return self.cli([command])
+
+    def apply(self, commands):
+        """configure 모드 명령을 clideploy로 태운다."""
+        self.cli(['configure'] + list(commands))
 
     def lldp_neighbors(self):
         """A10은 LLDP 이웃을 CLI 출력으로만 준다 — 표 형태를 줄 단위로 읽는다.
