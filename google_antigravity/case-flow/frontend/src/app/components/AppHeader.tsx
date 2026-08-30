@@ -7,6 +7,7 @@ import { Group, Title, Button, Text } from '@mantine/core';
 import {
   IconBook2,
   IconFileText,
+  IconFlask,
   IconLayoutDashboard,
   IconList,
   IconLogout,
@@ -93,6 +94,18 @@ export default function AppHeader() {
         >
           Documents
         </Button>
+        {/* 랩 노드 전원 제어가 엔지니어 이상이라 메뉴도 같은 기준으로 노출한다 */}
+        {isEngineer && (
+          <Button
+            component={Link}
+            href="/labs"
+            size="sm"
+            variant={pathname.startsWith('/labs') ? 'light' : 'subtle'}
+            leftSection={<IconFlask size={16} />}
+          >
+            Lab Tests
+          </Button>
+        )}
         {isAdmin && (
           <Button
             component={Link}

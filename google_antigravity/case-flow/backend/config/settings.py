@@ -302,6 +302,16 @@ TRANSLATION_FALLBACK_MODELS = [
     if model.strip()
 ]
 
+# EVE-NG 랩 서버 (Lab Tests). 값이 없으면 /labs는 안내만 띄우고 조회를 시도하지
+# 않는다 — 랩 없이도 앱은 정상 동작해야 하므로 필수 설정이 아니다.
+#
+# 브라우저가 EVE-NG에 직접 붙지 않고 백엔드가 프록시한다(자격증명 비노출).
+# 지금은 개인 Community 서버지만 나중에 Pro로 옮길 수 있어, 접속 정보는 여기
+# 한 곳에서만 읽고 EVE-NG 접근은 services/eveng.py 안에서만 한다.
+EVENG_URL = os.environ.get('CASEFLOW_EVENG_URL', '').rstrip('/')
+EVENG_USER = os.environ.get('CASEFLOW_EVENG_USER', '')
+EVENG_PASSWORD = os.environ.get('CASEFLOW_EVENG_PASSWORD', '')
+
 # 벤더 공식 문서(config guide 등) 벡터 검색 — reference_docs/<벤더>/*.pdf 를
 # ingest_references 커맨드로 임베딩한다 (OpenAI 임베딩 API, OPENAI_API_KEY 사용).
 # 모델 교체 시 전체 재임베딩 필요(ingest_references --force) — 비용은 전체 문서

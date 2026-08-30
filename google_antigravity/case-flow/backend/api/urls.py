@@ -55,6 +55,7 @@ urlpatterns = [
          name='translation-model'),
     path('settings/knowledge-model/', views.KnowledgeModelView.as_view(),
          name='knowledge-model'),
+    path('labs/config/', views.LabConfigView.as_view(), name='lab-config'),
     path('settings/gmail-sync/', views.GmailSyncScheduleView.as_view(),
          name='gmail-sync-schedule'),
 ]

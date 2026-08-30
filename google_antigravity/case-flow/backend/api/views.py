@@ -886,3 +886,22 @@ class UsageStatsView(APIView):
             'daily': daily,
             'users': users,
         })
+
+
+class LabConfigView(APIView):
+    """GET /api/labs/config/ — Lab Tests가 쓸 EVE-NG 서버가 설정돼 있는지.
+
+    자격증명은 내려보내지 않는다(서버 주소만). 이 화면은 EVE-NG 없이도 열리므로,
+    미설정일 때 빈 화면 대신 무엇을 해야 하는지 알려주기 위한 값이다.
+    """
+
+    permission_classes = [IsEngineerOrAbove]
+
+    def get(self, request):
+        configured = bool(settings.EVENG_URL and settings.EVENG_USER
+                          and settings.EVENG_PASSWORD)
+        return Response({
+            'configured': configured,
+            # 주소는 "어느 랩 서버를 보고 있나"를 확인하는 용도라 계정 없이 노출한다
+            'server': settings.EVENG_URL,
+        })

@@ -2675,6 +2675,52 @@ class KnowledgeFieldsTests(TestCase):
         self.assertEqual(results['count'], 1)
 
 
+class LabConfigTests(TestCase):
+    """Lab Tests — EVE-NG 설정 여부 조회. 랩 서버가 없어도 앱은 정상 동작해야 한다."""
+
+    def setUp(self):
+        from .permissions import set_user_role
+        for username, role in (('lab-v', 'viewer'), ('lab-e', 'engineer')):
+            user = User.objects.create_user(username, password='lab-pass-1!')
+            set_user_role(user, role)
+
+    def login(self, username):
+        self.client.post('/api/auth/login/',
+                         {'username': username, 'password': 'lab-pass-1!'},
+                         content_type='application/json')
+
+    @override_settings(EVENG_URL='', EVENG_USER='', EVENG_PASSWORD='')
+    def test_reports_unconfigured_without_failing(self):
+        """설정이 없어도 500이 아니라 configured=false를 돌려줘야 화면이 안내를 띄운다."""
+        self.login('lab-e')
+        res = self.client.get('/api/labs/config/')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json(), {'configured': False, 'server': ''})
+
+    @override_settings(EVENG_URL='http://10.0.0.5', EVENG_USER='admin',
+                       EVENG_PASSWORD='secret')
+    def test_reports_configured_without_leaking_credentials(self):
+        self.login('lab-e')
+        body = self.client.get('/api/labs/config/').json()
+
+        self.assertTrue(body['configured'])
+        self.assertEqual(body['server'], 'http://10.0.0.5')
+        # 계정·비밀번호는 어떤 형태로도 나가지 않는다
+        self.assertNotIn('admin', json.dumps(body))
+        self.assertNotIn('secret', json.dumps(body))
+
+    @override_settings(EVENG_URL='http://10.0.0.5', EVENG_USER='admin', EVENG_PASSWORD='')
+    def test_partial_settings_count_as_unconfigured(self):
+        """셋 중 하나라도 비면 접속이 안 되므로 설정된 것으로 보지 않는다."""
+        self.login('lab-e')
+        self.assertFalse(self.client.get('/api/labs/config/').json()['configured'])
+
+    def test_viewer_is_blocked(self):
+        """노드 전원 제어가 엔지니어 이상이라 랩 화면 자체를 같은 기준으로 막는다."""
+        self.login('lab-v')
+        self.assertEqual(self.client.get('/api/labs/config/').status_code, 403)
+
+
 class KnowledgeModelSettingTests(TestCase):
     """지식 추출 모델은 메일 분석 모델과 분리돼 있고, 상위 두 모델로 제한된다."""
 
