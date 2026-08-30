@@ -1277,5 +1277,12 @@ class LabCheckView(APIView):
         if lab is None:
             return Response({'error': '등록되지 않은 랩입니다.'},
                             status=status.HTTP_404_NOT_FOUND)
-        results = lab_check.run_checks(lab, list(lab.accesses.all()), list(lab.links.all()))
+        # 꺼진 이웃을 배선 대조에서 빼려면 지금 켜져 있는 노드를 알아야 한다
+        try:
+            running = {name for name, up in
+                       eveng.EvengClient().node_states(lab.path).items() if up}
+        except eveng.EvengError as e:
+            return _eveng_error_response(e)
+        results = lab_check.run_checks(lab, list(lab.accesses.all()),
+                                       list(lab.links.all()), running)
         return Response({'results': results, 'counts': lab_check.summarize(results)})

@@ -44,26 +44,36 @@ def _facts(access):
     return {'access': access, 'hostname': hostname, 'neighbors': neighbors}
 
 
-def _expected_neighbors(links, node_name):
+def _expected_neighbors(links, node_name, running):
     """EVE-NG 배선에서 이 노드의 이웃을 뽑는다 — {(로컬포트, 이웃, 이웃포트)}.
 
-    관리망(노드↔네트워크) 연결은 제외한다. LLDP는 장비끼리만 주고받는다.
+    두 가지를 뺀다:
+    - 관리망(노드↔네트워크) 연결. LLDP는 장비끼리만 주고받는다.
+    - **꺼져 있는 이웃.** 실기기에서 확인한 문제 — 랩을 일부만 켜면 켜지 않은
+      이웃이 전부 "장비가 못 봄"으로 잡혀 배선이 틀린 것처럼 보인다.
+      전원이 꺼진 것과 배선이 다른 것은 다르다.
     """
     expected = set()
     for link in links:
         if link.source_is_network or link.target_is_network:
             continue
-        if link.source == node_name:
+        if link.source == node_name and link.target in running:
             expected.add((normalize_port(link.source_port), link.target,
                           normalize_port(link.target_port)))
-        elif link.target == node_name:
+        elif link.target == node_name and link.source in running:
             expected.add((normalize_port(link.target_port), link.source,
                           normalize_port(link.source_port)))
     return expected
 
 
-def run_checks(lab, accesses, links):
-    """점검을 돌려 결과 목록을 돌려준다. 장비 접속은 병렬로 한다."""
+def run_checks(lab, accesses, links, running=None):
+    """점검을 돌려 결과 목록을 돌려준다. 장비 접속은 병렬로 한다.
+
+    running: 지금 켜져 있는 노드 이름 집합. 배선 대조에서 꺼진 이웃을 빼는 데
+    쓴다. None이면 전부 켜져 있다고 본다.
+    """
+    if running is None:
+        running = {n.name for n in lab.nodes.all()}
     targets = [a for a in accesses if a.probeable]
     results = []
 
@@ -108,9 +118,12 @@ def run_checks(lab, accesses, links):
             continue
         seen = {(normalize_port(n['local_port']), n['remote_host'].split('.')[0],
                  normalize_port(n['remote_port'])) for n in neighbors}
-        expected = _expected_neighbors(links, name)
+        # 꺼진 이웃은 양쪽에서 모두 뺀다 — LLDP 캐시가 남아 있을 수 있다
+        seen = {row for row in seen if row[1] in running}
+        expected = _expected_neighbors(links, name, running)
         if not expected:
-            results.append(_result('배선 대조', name, SKIP, 'EVE-NG에 장비 간 배선이 없습니다.'))
+            results.append(_result('배선 대조', name, SKIP,
+                                   '대조할 배선이 없습니다 (이웃이 모두 꺼져 있거나 장비 간 배선 없음).'))
             continue
 
         missing = expected - seen

@@ -3138,10 +3138,14 @@ class LabCheckTests(TestCase):
                          {'username': 'lc-e', 'password': 'lc-pass-1!'},
                          content_type='application/json')
 
-    def run_with(self, facts_by_node):
+    def run_with(self, facts_by_node, running=('Arista_1', 'A10_1')):
         def fake_facts(access):
             return {'access': access, **facts_by_node[access.node_name]}
-        with patch('api.services.lab_check._facts', side_effect=fake_facts):
+        client = MagicMock()
+        client.node_states.return_value = {n.name: n.name in running
+                                           for n in self.lab.nodes.all()}
+        with patch('api.services.lab_check._facts', side_effect=fake_facts), \
+             patch('api.views.eveng.EvengClient', return_value=client):
             self.login()
             return self.client.post(f'/api/labs/{self.lab.id}/check/').json()
 
@@ -3200,6 +3204,18 @@ class LabCheckTests(TestCase):
                   if r['check'] == '배선 대조'}
         self.assertEqual(wiring['A10_1'], 'skip')
         self.assertEqual(wiring['Arista_1'], 'pass')
+
+    def test_powered_off_neighbor_is_not_a_wiring_failure(self):
+        """랩을 일부만 켜면 켜지 않은 이웃이 전부 '장비가 못 봄'으로 잡힌다 —
+        전원이 꺼진 것과 배선이 다른 것은 다르다 (실기기에서 확인된 문제)."""
+        facts = self.matching_facts()
+        facts['Arista_1']['neighbors'] = []   # 이웃이 꺼져 있어 아무것도 안 보임
+        body = self.run_with(facts, running=('Arista_1',))
+
+        wiring = [r for r in body['results']
+                  if r['check'] == '배선 대조' and r['node'] == 'Arista_1'][0]
+        self.assertEqual(wiring['status'], 'skip')
+        self.assertIn('이웃이 모두 꺼져', wiring['detail'])
 
     def test_nodes_without_access_are_reported_as_skip(self):
         from .models import LabNode
