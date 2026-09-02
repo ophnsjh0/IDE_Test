@@ -17,6 +17,7 @@ import {
   Divider,
   TextInput,
   Textarea,
+  Tooltip,
 } from '@mantine/core';
 import { useForm } from '@mantine/form';
 import {
@@ -31,6 +32,7 @@ import ScrollToTopButton from '../../components/ScrollToTopButton';
 import AppHeader from '../../components/AppHeader';
 import { apiFetch, apiUrl } from '../../lib/api';
 import { useMe } from '../../lib/useMe';
+import { SOURCE_COLOR, SOURCE_LABEL, SOURCE_NOTE, sourceOf } from '../source';
 
 // 커맨드/로그의 줄바꿈 유지 + 긴 문자열 강제 줄바꿈. 지식 본문은 명령어가 섞인
 // 긴 글이라 줄간격을 기본값보다 넉넉히 준다 (읽기 어렵다는 피드백이 있었음).
@@ -100,8 +102,10 @@ interface KnowledgeDetail {
   status: string; // draft | confirmed
   analyzed_by: string;
   references: KnowledgeReference[];
+  source: string; // case | lab | chat | manual | '' (불명)
   source_case: { id: number; case_id: string; status: string; vendor_case_number: string | null } | null;
   source_session: { id: number; title: string } | null;
+  source_run: { id: number; lab: string; blueprint: string; status: string } | null;
   created_at: string;
   updated_at: string;
 }
@@ -405,32 +409,43 @@ export default function KnowledgeDetailPage() {
 
             <Group justify="space-between">
               <Group gap="xs">
-                {item.source_session ? (
-                  <>
-                    <Text size="sm" c="dimmed">출처:</Text>
-                    {/* 대화 유래 지식은 벤더 해결 기록이 아닌 AI 답변 기반 —
-                        케이스 유래보다 신뢰도가 낮음을 출처로 드러낸다 */}
-                    <Text size="sm" fw={500} c="grape">
-                      AI 도우미 대화 · {item.source_session.title}
-                    </Text>
-                  </>
-                ) : (
-                  <>
-                    <Text size="sm" c="dimmed">출처 케이스:</Text>
-                    {item.source_case ? (
-                      <Button
-                        size="compact-sm"
-                        variant="light"
-                        rightSection={<IconExternalLink size={14} />}
-                        onClick={() => router.push(`/cases/${item.source_case!.id}`)}
-                      >
-                        {item.source_case.case_id}
-                        {item.source_case.vendor_case_number && ` (${item.source_case.vendor_case_number})`}
-                      </Button>
-                    ) : (
-                      <Text size="sm" c="dimmed">삭제됨</Text>
-                    )}
-                  </>
+                {/* 출처는 신뢰도의 서열이다 — 라벨·색·설명은 source.ts 한 곳에서
+                    관리하고, 여기서는 출처 객체로 가는 링크만 갈라 붙인다 */}
+                <Text size="sm" c="dimmed">출처:</Text>
+                <Tooltip label={SOURCE_NOTE[sourceOf(item)]} withArrow>
+                  <Badge color={SOURCE_COLOR[sourceOf(item)]} variant="light">
+                    {SOURCE_LABEL[sourceOf(item)]}
+                  </Badge>
+                </Tooltip>
+                {item.source_case && (
+                  <Button
+                    size="compact-sm"
+                    variant="light"
+                    rightSection={<IconExternalLink size={14} />}
+                    onClick={() => router.push(`/cases/${item.source_case!.id}`)}
+                  >
+                    {item.source_case.case_id}
+                    {item.source_case.vendor_case_number && ` (${item.source_case.vendor_case_number})`}
+                  </Button>
+                )}
+                {item.source_run && (
+                  <Button
+                    size="compact-sm"
+                    variant="light"
+                    color="teal"
+                    rightSection={<IconExternalLink size={14} />}
+                    onClick={() => router.push(`/labs?run=${item.source_run!.id}`)}
+                  >
+                    {item.source_run.lab} · {item.source_run.blueprint}
+                  </Button>
+                )}
+                {item.source_session && (
+                  <Text size="sm" c="grape">{item.source_session.title}</Text>
+                )}
+                {/* 출처가 케이스·랩·대화인데 그 객체가 지워졌으면 그렇다고 말한다 */}
+                {['case', 'lab', 'chat'].includes(sourceOf(item))
+                  && !item.source_case && !item.source_run && !item.source_session && (
+                  <Text size="sm" c="dimmed">삭제됨</Text>
                 )}
               </Group>
               <Text size="xs" c="dimmed">

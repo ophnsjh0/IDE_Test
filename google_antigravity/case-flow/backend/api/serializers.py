@@ -35,6 +35,7 @@ class KnowledgeItemSerializer(serializers.ModelSerializer):
     knowledge_id = serializers.ReadOnlyField()
     source_case = serializers.SerializerMethodField()
     source_session = serializers.SerializerMethodField()
+    source_run = serializers.SerializerMethodField()
 
     def get_source_case(self, obj):
         if obj.case is None:
@@ -49,14 +50,22 @@ class KnowledgeItemSerializer(serializers.ModelSerializer):
             return None
         return {'id': obj.chat_session.id, 'title': obj.chat_session.title}
 
+    def get_source_run(self, obj):
+        if obj.lab_run is None:
+            return None
+        run = obj.lab_run
+        return {'id': run.id, 'lab': run.lab.name, 'blueprint': run.blueprint.name,
+                'status': run.status}
+
     class Meta:
         model = KnowledgeItem
         fields = ['id', 'knowledge_id', 'vendor', 'title', 'environment', 'problem',
                   'diagnosis', 'root_cause', 'resolution', 'verification', 'caveats',
                   'related_refs', 'device_model', 'software_version', 'status',
-                  'analyzed_by', 'references', 'source_case', 'source_session',
-                  'created_at', 'updated_at']
-        read_only_fields = ['vendor', 'analyzed_by', 'references']
+                  'analyzed_by', 'references', 'source', 'source_case',
+                  'source_session', 'source_run', 'created_at', 'updated_at']
+        # source는 출처 서열이라 사람이 고쳐 쓰면 안 된다 — 만든 경로가 정한다
+        read_only_fields = ['vendor', 'analyzed_by', 'references', 'source']
 
 
 class ChatTurnSerializer(serializers.ModelSerializer):

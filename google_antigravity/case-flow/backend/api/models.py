@@ -154,16 +154,30 @@ class Case(models.Model):
 
 
 class KnowledgeItem(models.Model):
-    """해결된 케이스에서 추출한 재사용 가능한 기술 지식 (문제-원인-해결).
+    """재사용 가능한 기술 지식 (문제-원인-해결).
 
     AI가 초안(draft)으로 만들고 엔지니어가 확인 후 확정(confirmed)한다.
-    출처(케이스 또는 AI 도우미 대화)가 삭제돼도 지식은 남도록 SET_NULL.
-    케이스 유래는 벤더가 실제 해결한 기록, 대화 유래는 AI 추론 기반이라
-    신뢰도가 한 단계 낮다 — UI에서 출처를 구분해 표시한다.
+    출처(케이스·랩 실행·대화)가 삭제돼도 지식은 남도록 전부 SET_NULL.
+
+    **출처는 신뢰도의 서열이다** — 화면과 에이전트가 이걸로 무게를 다르게 준다:
+      case(벤더가 실제 해결한 기록) > lab(우리 랩에서 실제로 돌려본 결과)
+      > chat(AI 추론 기반) · manual(엔지니어가 손으로 적은 것)
+    FK만으로는 이 구분이 안 된다. 출처 객체가 지워지면 FK가 전부 null이 돼
+    "케이스 유래인데 케이스가 삭제됨"과 "대화 유래"가 같은 모양이 되기 때문이다.
+    그래서 서열은 지워지지 않는 source 칸에 따로 적는다.
     """
     STATUS_CHOICES = [
         ('draft', 'AI Draft'),
         ('confirmed', 'Confirmed'),
+    ]
+
+    # 빈 값은 '불명' — source 칸이 생기기 전에 만들어졌고 출처 객체도 이미
+    # 지워진 옛 행들이다. 어느 쪽이었는지 알 방법이 없어 추측해 채우지 않는다.
+    SOURCE_CHOICES = [
+        ('case', '벤더 케이스'),
+        ('lab', '랩 재현'),
+        ('chat', 'AI 도우미 대화'),
+        ('manual', '직접 작성'),
     ]
 
     case = models.ForeignKey(Case, null=True, blank=True, on_delete=models.SET_NULL,
@@ -171,6 +185,11 @@ class KnowledgeItem(models.Model):
     chat_session = models.ForeignKey('ChatSession', null=True, blank=True,
                                      on_delete=models.SET_NULL,
                                      related_name='knowledge_items')
+    lab_run = models.ForeignKey('LabRun', null=True, blank=True,
+                                on_delete=models.SET_NULL,
+                                related_name='knowledge_items')
+    source = models.CharField(max_length=10, choices=SOURCE_CHOICES,
+                              blank=True, default='')
     vendor = models.CharField(max_length=50, choices=Case.VENDOR_CHOICES)
     title = models.CharField(max_length=200)          # 문제 한 줄 요약 (목록 표시용)
     # 본문 8칸. 처음엔 케이스 분석 스키마(문제-원인-해결)를 그대로 썼는데, 그쪽은

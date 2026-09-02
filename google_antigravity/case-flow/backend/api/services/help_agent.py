@@ -355,9 +355,13 @@ _SEARCH_TOOL_DEFS = {
     'search_knowledge': {
         'name': 'search_knowledge',
         'description': (
-            '지식 베이스(과거 케이스에서 추출·검증한 문제-원인-해결 정리)를 검색한다. '
+            '지식 베이스(케이스·랩 실행·대화에서 추출한 문제-원인-해결 정리)를 검색한다. '
             '해결 방법·원인·조치 커맨드를 묻는 질문에 케이스 검색보다 먼저 사용할 것. '
-            'query는 제목/문제/원인/해결 본문에 대한 키워드 부분일치(공백 AND).'
+            'query는 제목/문제/원인/해결 본문에 대한 키워드 부분일치(공백 AND). '
+            '각 결과의 source는 근거의 무게다 — case(벤더가 실제 해결한 기록)가 가장 '
+            '강하고, lab(우리 랩에서 실제로 돌려본 결과)이 다음, chat·manual은 확인이 '
+            '덜 된 것이다. 빈 값은 출처를 알 수 없는 옛 지식이다. 서로 어긋나는 결과가 '
+            '나오면 더 강한 출처를 따르고, 약한 출처를 인용할 때는 그렇다고 밝힐 것.'
         ),
         'input_schema': {
             'type': 'object',
@@ -531,6 +535,10 @@ def _search_knowledge(query='', vendor='', limit=5):
         'device_model': item.device_model,
         'software_version': item.software_version,
         'status': item.status,  # draft=AI 초안(미검증), confirmed=엔지니어 확인됨
+        # 출처는 신뢰도의 서열이다 — 모델이 근거의 무게를 다르게 주도록 함께 낸다.
+        # case(벤더가 실제 해결) > lab(우리 랩에서 실제로 돌려봄) > chat/manual,
+        # ''는 출처 객체가 지워진 옛 지식(불명).
+        'source': item.source,
         'source_case': item.case.case_id if item.case else None,
         # 공식 문서 근거 — 답변에서 (문서명 p.N) 인용에 활용
         'references': item.references,

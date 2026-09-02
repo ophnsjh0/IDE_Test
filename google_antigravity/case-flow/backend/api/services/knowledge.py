@@ -143,6 +143,7 @@ def extract_knowledge(case, mark_checked=True):
 
     item = KnowledgeItem.objects.create(
         case=case,
+        source='case',
         vendor=case.vendor,
         title=result['title'][:200],
         device_model=(result['device_model'] or case.device_model)[:100],
@@ -298,6 +299,7 @@ def extract_knowledge_from_chat(session):
 
     item = KnowledgeItem.objects.create(
         chat_session=session,
+        source='chat',
         vendor=vendor,
         title=result['title'][:200],
         device_model=result['device_model'][:100],

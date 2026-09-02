@@ -1293,6 +1293,7 @@ class ChatKnowledgeExtractTests(TestCase):
 
         item = KnowledgeItem.objects.get(id=data['item']['id'])
         self.assertEqual(item.chat_session, self.session)
+        self.assertEqual(item.source, 'chat')   # 세션이 지워져도 남을 출처 표시
         self.assertEqual(item.vendor, 'A10')
         self.assertEqual(item.status, 'draft')
         self.assertIn('session-sync', item.resolution)
@@ -3823,6 +3824,30 @@ class KnowledgeBaseTests(TestCase):
         # AI가 빈 값을 준 필드는 케이스 값으로 폴백
         self.assertEqual(item.device_model, 'TH5440S')
         self.assertEqual(item.software_version, '5.2.1-P7')
+
+    def test_extract_records_its_source(self):
+        """출처는 FK가 아니라 source 칸이 답한다 — FK는 원본이 지워지면 사라진다."""
+        from .services import knowledge
+        result = {'has_knowledge': True, 'title': '제목', 'problem': '문제',
+                  'root_cause': '원인', 'resolution': 'CLI 조치',
+                  'device_model': '', 'software_version': ''}
+        with patch.object(knowledge, 'generate_structured_with_model',
+                          return_value=(MODEL, result)):
+            _, item = knowledge.extract_knowledge(self.case)
+        self.assertEqual(item.source, 'case')
+
+        # 케이스가 지워져도 "벤더 케이스 유래"라는 사실은 남아야 한다
+        self.case.delete()
+        item.refresh_from_db()
+        self.assertIsNone(item.case)
+        self.assertEqual(item.source, 'case')
+
+    def test_agent_search_reports_the_source(self):
+        """모델이 근거의 무게를 다르게 주려면 출처가 결과에 실려야 한다."""
+        from .services import help_agent
+        self.make_item(source='lab', title='랩에서 확인한 것')
+        rows = json.loads(help_agent._search_knowledge(query='랩에서'))['results']
+        self.assertEqual(rows[0]['source'], 'lab')
 
     def test_extract_skips_no_knowledge_and_existing(self):
         from .services import knowledge

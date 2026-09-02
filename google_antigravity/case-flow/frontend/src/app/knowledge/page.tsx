@@ -33,6 +33,7 @@ import AppHeader from '../components/AppHeader';
 import ScrollToTopButton from '../components/ScrollToTopButton';
 import { apiFetch } from '../lib/api';
 import { useMe } from '../lib/useMe';
+import { SOURCE_COLOR, SOURCE_SHORT, sourceOf } from './source';
 
 // 모델 id -> 화면 표기. 지식 추출 선택지는 서버(analyzer.KNOWLEDGE_MODELS)와 맞춘다.
 const MODEL_LABELS: Record<string, string> = {
@@ -57,8 +58,10 @@ interface KnowledgeItem {
   software_version: string;
   status: string; // draft | confirmed
   analyzed_by: string;
+  source: string; // case | lab | chat | manual | '' (불명)
   source_case: { id: number; case_id: string; status: string; vendor_case_number: string | null } | null;
   source_session: { id: number; title: string } | null;
+  source_run: { id: number; lab: string; blueprint: string; status: string } | null;
   created_at: string;
   updated_at: string;
 }
@@ -323,12 +326,15 @@ function KnowledgeListPage() {
         )}
       </Table.Td>
       <Table.Td style={{ whiteSpace: 'nowrap' }}>
+        {/* 출처는 신뢰도의 서열이라 목록에서도 색으로 구분한다 (source.ts) */}
         {element.source_case ? (
-          <Text size="sm" fw={500}>{element.source_case.case_id}</Text>
-        ) : element.source_session ? (
-          <Text size="sm" fw={500} c="grape">AI 대화</Text>
-        ) : (
+          <Text size="sm" fw={500} c={SOURCE_COLOR.case}>{element.source_case.case_id}</Text>
+        ) : sourceOf(element) === '' ? (
           <Text size="sm" c="dimmed">—</Text>
+        ) : (
+          <Text size="sm" fw={500} c={SOURCE_COLOR[sourceOf(element)]}>
+            {SOURCE_SHORT[sourceOf(element)]}
+          </Text>
         )}
       </Table.Td>
       <Table.Td style={{ whiteSpace: 'nowrap' }}>
