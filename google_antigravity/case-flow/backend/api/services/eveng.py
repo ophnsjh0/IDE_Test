@@ -5,6 +5,7 @@ EVE-NG 접근은 전부 이 모듈 안에서만 한다. 나중에 개인 Communi
 바깥으로 나가는 건 우리 용어로 번역한 dict뿐이다.
 """
 import logging
+from collections import Counter
 
 import requests
 from django.conf import settings
@@ -120,13 +121,20 @@ class EvengClient:
         raw_nets = self.get(f'/api/labs/{quoted}/networks') or {}
         raw_links = self.get(f'/api/labs/{quoted}/topology') or []
 
+        node_keys = _unique_names(raw_nodes, 'node')
+        net_keys = _unique_names(raw_nets, 'network')
+
         nodes = {}
         for eve_id, n in raw_nodes.items():
             nodes[str(eve_id)] = {
                 'eve_id': int(eve_id),
                 # 이름이 우리 쪽 키다. eve_id·console 포트는 서버를 옮기면
-                # 재부여되므로 갱신되는 값으로만 다룬다.
-                'name': n.get('name') or f'node{eve_id}',
+                # 재부여되므로 갱신되는 값으로만 다룬다. 이름이 겹치는 노드만
+                # '이름#eve_id'로 갈라진다(_unique_names 참고).
+                'name': node_keys[str(eve_id)],
+                # EVE-NG 화면에 뜨는 원래 이름. 장비가 스스로 말하는 hostname과
+                # 대조할 때는 키가 아니라 이걸 써야 한다(lab_check).
+                'display_name': n.get('name') or f'node{eve_id}',
                 'template': n.get('template') or '',
                 'image': n.get('image') or '',
                 'icon': n.get('icon') or '',
@@ -145,7 +153,8 @@ class EvengClient:
         for eve_id, net in raw_nets.items():
             networks[str(eve_id)] = {
                 'eve_id': int(eve_id),
-                'name': net.get('name') or f'network{eve_id}',
+                'name': net_keys[str(eve_id)],
+                'display_name': net.get('name') or f'network{eve_id}',
                 'net_type': net.get('type') or '',
                 'left': int(net.get('left') or 0),
                 'top': int(net.get('top') or 0),
@@ -185,8 +194,11 @@ class EvengClient:
         """{노드 이름: 프로세스가 떠 있는가}. 상태만 필요할 때 토폴로지 전체를
         다시 받지 않으려고 따로 둔다(폴링이 매번 도는 자리)."""
         raw = self.get(f'/api/labs/{_quote(lab_path)}/nodes') or {}
+        # 키는 토폴로지와 같은 규칙으로 만든다 — 다르면 이름이 겹치는 랩에서
+        # 상태가 한 칸으로 합쳐져 켠 장비와 끈 장비를 구분하지 못한다.
+        keys = _unique_names(raw, 'node')
         return {
-            (n.get('name') or f'node{eve_id}'): int(n.get('status') or 0) != 0
+            keys[str(eve_id)]: int(n.get('status') or 0) != 0
             for eve_id, n in raw.items()
         }
 
@@ -202,6 +214,26 @@ class EvengClient:
         if res.status_code != 200:
             raise EvengError(f'아이콘을 찾을 수 없습니다: {safe}')
         return res.content, res.headers.get('Content-Type', 'application/octet-stream')
+
+
+def _unique_names(raw, fallback):
+    """EVE-NG의 id → 랩 안에서 유일한 이름. {'1': 'vEOS#1', '2': 'A10#2', ...}
+
+    EVE-NG는 같은 이름의 노드·네트워크를 얼마든지 허용한다. 실측(LAB_A10_OneArm):
+    'vEOS' 2대, 'A10' 2대, 'Net' 3개, 'Net-vEOSiface_2' 3개. 우리 쪽 키가
+    이름이라 그대로 두면 두 장비가 한 행으로 합쳐지고(13노드 → 11행), 배선은
+    자기 자신을 가리키는 선('vEOS Eth7 ↔ vEOS Eth7')이 된다.
+
+    그래서 **겹치는 이름에만** EVE-NG 노드 번호를 붙인다. 겹치지 않으면 이름
+    그대로라, 이미 등록된 랩의 접속 정보(LabNodeAccess)는 이름으로 계속 붙는다.
+    겹치는 노드는 어차피 이름만으로 가릴 수 없어서, 서버를 옮겨 번호가 재부여되면
+    그 노드들만 접속 정보를 다시 이어줘야 한다.
+    """
+    named = {str(eve_id): (item.get('name') or f'{fallback}{eve_id}')
+             for eve_id, item in raw.items()}
+    counts = Counter(named.values())
+    return {eve_id: (f'{name}#{eve_id}' if counts[name] > 1 else name)
+            for eve_id, name in named.items()}
 
 
 def _join(folder, name):

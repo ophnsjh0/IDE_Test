@@ -100,14 +100,15 @@ class CaseDetailSerializer(CaseSerializer):
 class LabNodeSerializer(serializers.ModelSerializer):
     class Meta:
         model = LabNode
-        fields = ['name', 'eve_id', 'template', 'image', 'icon', 'left', 'top',
+        fields = ['name', 'display_name', 'eve_id', 'template', 'image', 'icon',
+                  'left', 'top',
                   'ram', 'cpu', 'ethernet', 'console_url', 'running']
 
 
 class LabNetworkSerializer(serializers.ModelSerializer):
     class Meta:
         model = LabNetwork
-        fields = ['name', 'eve_id', 'net_type', 'left', 'top']
+        fields = ['name', 'display_name', 'eve_id', 'net_type', 'left', 'top']
 
 
 class LabLinkSerializer(serializers.ModelSerializer):

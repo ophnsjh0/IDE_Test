@@ -2755,6 +2755,90 @@ class EvengClientTests(TestCase):
             eveng.EvengClient()
 
 
+# 이름이 겹치는 실제 랩(LAB_A10_OneArm)에서 가져온 모양 — vEOS 2대, A10 2대,
+# 'Net' 클라우드 2개. EVE-NG는 이름 중복을 막지 않는다.
+DUP_NODES = {
+    '1': {'name': 'vEOS', 'template': 'veos', 'left': 267, 'top': 339, 'status': 0},
+    '2': {'name': 'A10', 'template': 'a10', 'left': 144, 'top': 231, 'status': 2},
+    '3': {'name': 'vEOS', 'template': 'veos', 'left': 468, 'top': 342, 'status': 0},
+    '5': {'name': 'A10', 'template': 'a10', 'left': 588, 'top': 228, 'status': 0},
+}
+DUP_NETWORKS = {
+    '17': {'name': 'Net', 'type': 'pnet0', 'left': 30, 'top': 534},
+    '18': {'name': 'Net', 'type': 'pnet0', 'left': 699, 'top': 543},
+}
+DUP_TOPOLOGY = [
+    # 왼쪽 쌍과 오른쪽 쌍 — 이름만 보면 둘 다 'A10 ↔ vEOS'로 같아 보인다
+    {'source': 'node2', 'source_type': 'node', 'source_label': 'E2',
+     'destination': 'node1', 'destination_type': 'node', 'destination_label': 'Eth1'},
+    {'source': 'node5', 'source_type': 'node', 'source_label': 'E2',
+     'destination': 'node3', 'destination_type': 'node', 'destination_label': 'Eth1'},
+    # vEOS끼리 잇는 선 — 이름을 키로 쓰면 자기 자신을 가리키는 선이 된다
+    {'source': 'node3', 'source_type': 'node', 'source_label': 'Eth7',
+     'destination': 'node1', 'destination_type': 'node', 'destination_label': 'Eth7'},
+    {'source': 'node1', 'source_type': 'node', 'source_label': 'Mgmt1',
+     'destination': 'network18', 'destination_type': 'network',
+     'destination_label': ''},
+]
+
+
+def _dup_client():
+    """이름이 겹치는 랩을 돌려주는 가짜 EVE-NG. 실제 서버를 부르지 않는다."""
+    return SimpleNamespace(get=lambda p: (DUP_NODES if p.endswith('/nodes')
+                                          else DUP_NETWORKS if p.endswith('/networks')
+                                          else DUP_TOPOLOGY))
+
+
+class EvengDuplicateNameTests(TestCase):
+    """EVE-NG는 같은 이름의 노드·네트워크를 허용한다 (실기기에서 확인).
+
+    이름이 우리 쪽 키라서, 갈라주지 않으면 두 장비가 한 행으로 합쳐지고
+    배선이 자기 자신을 가리킨다 — 화면에 장비가 통째로 안 뜬다.
+    """
+
+    def topology(self):
+        return eveng.EvengClient.topology(_dup_client(), '/dup.unl')
+
+    def test_duplicate_names_become_distinct_keys(self):
+        nodes = {n['name']: n for n in self.topology()['nodes']}
+
+        self.assertEqual(set(nodes), {'vEOS#1', 'A10#2', 'vEOS#3', 'A10#5'})
+        # 원래 이름은 따로 남는다 — 장비 hostname과 대조할 때 쓴다
+        self.assertEqual(nodes['vEOS#1']['display_name'], 'vEOS')
+        self.assertEqual(nodes['vEOS#3']['eve_id'], 3)
+
+    def test_links_point_at_the_right_twin(self):
+        links = [(l['source'], l['source_port'], l['target'], l['target_port'])
+                 for l in self.topology()['links']]
+
+        self.assertIn(('A10#2', 'E2', 'vEOS#1', 'Eth1'), links)
+        self.assertIn(('A10#5', 'E2', 'vEOS#3', 'Eth1'), links)
+        # vEOS끼리의 선이 자기 자신을 가리키지 않는다
+        self.assertIn(('vEOS#3', 'Eth7', 'vEOS#1', 'Eth7'), links)
+        for source, _, target, _ in links:
+            self.assertNotEqual(source, target)
+
+    def test_duplicate_network_names_are_split_too(self):
+        """'Net'(pnet0)이 여럿이면 관리망 링크가 어느 구름에 붙는지 구분돼야 한다."""
+        networks = {n['name'] for n in self.topology()['networks']}
+        self.assertEqual(networks, {'Net#17', 'Net#18'})
+
+        net_link = [l for l in self.topology()['links'] if l['target_is_network']][0]
+        self.assertEqual(net_link['target'], 'Net#18')
+
+    def test_unique_names_are_left_alone(self):
+        """겹치지 않는 이름은 그대로다 — 기존 랩의 접속 정보가 계속 붙어야 한다."""
+        nodes = {n['name'] for n in fake_eveng().topology('/x.unl')['nodes']}
+        self.assertEqual(nodes, {'A10_1', 'Arista_1'})
+
+    def test_node_states_use_the_same_keys(self):
+        """상태 키가 토폴로지와 다르면 켠 장비와 끈 장비가 한 칸으로 합쳐진다."""
+        states = eveng.EvengClient.node_states(_dup_client(), '/dup.unl')
+
+        self.assertEqual(states, {'vEOS#1': False, 'A10#2': True,
+                                  'vEOS#3': False, 'A10#5': False})
+
+
 @override_settings(EVENG_URL='http://eve.test', EVENG_USER='admin', EVENG_PASSWORD='pw')
 class LabRegistryTests(TestCase):
     """랩 등록·조회·토폴로지 갱신."""
@@ -3226,6 +3310,40 @@ class LabCheckTests(TestCase):
                    if r['check'] == '접속 정보' and r['node'] == 'Server_1']
         self.assertEqual(len(skipped), 1)
         self.assertEqual(skipped[0]['status'], 'skip')
+
+    def test_duplicate_names_compare_against_the_eveng_name(self):
+        """이름이 겹쳐 키가 'vEOS#1'이 돼도, 장비는 자기를 'vEOS'라고 말한다.
+
+        키를 그대로 대조하면 멀쩡한 랩이 전부 불일치로 잡힌다.
+        """
+        from .models import Lab, LabLink, LabNode, LabNodeAccess, LabServer
+        server = LabServer.objects.get(base_url='http://eve.test')
+        lab = Lab.objects.create(server=server, path='/dup.unl', name='dup')
+        for key in ('vEOS#1', 'vEOS#3'):
+            LabNode.objects.create(lab=lab, name=key, display_name='vEOS', eve_id=1)
+            LabNodeAccess.objects.create(lab=lab, node_name=key, mgmt_ip='10.0.0.9',
+                                         driver='arista_eapi', username='u', password='p')
+        LabLink.objects.create(lab=lab, source='vEOS#1', source_port='Eth7',
+                               target='vEOS#3', target_port='Eth7')
+
+        facts = {
+            'vEOS#1': {'hostname': 'vEOS', 'neighbors': [
+                {'local_port': 'Ethernet7', 'remote_host': 'vEOS', 'remote_port': 'Eth7'}]},
+            'vEOS#3': {'hostname': 'vEOS', 'neighbors': [
+                {'local_port': 'Ethernet7', 'remote_host': 'vEOS', 'remote_port': 'Eth7'}]},
+        }
+
+        def fake_facts(access):
+            return {'access': access, **facts[access.node_name]}
+
+        client = MagicMock()
+        client.node_states.return_value = {'vEOS#1': True, 'vEOS#3': True}
+        with patch('api.services.lab_check._facts', side_effect=fake_facts), \
+             patch('api.views.eveng.EvengClient', return_value=client):
+            self.login()
+            body = self.client.post(f'/api/labs/{lab.id}/check/').json()
+
+        self.assertEqual(body['counts']['fail'], 0, body['results'])
 
 
 @override_settings(EVENG_URL='http://eve.test', EVENG_USER='admin', EVENG_PASSWORD='pw')

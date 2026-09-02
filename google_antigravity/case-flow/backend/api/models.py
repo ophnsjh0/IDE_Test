@@ -370,9 +370,15 @@ class LabNode(models.Model):
     키는 eve_id가 아니라 **이름**이다. eve_id와 console 포트는 랩을 다른
     서버로 옮기면 재부여되므로, 이름을 키로 잡아야 랩 등록 정보(MGMT IP·역할
     매핑 등)가 그대로 붙는다.
+
+    단, EVE-NG는 같은 이름의 노드를 허용한다(실측: LAB_A10_OneArm에 'vEOS' 2대).
+    그래서 name은 이름이 겹칠 때만 '이름#eve_id'로 갈라진 **랩 안에서 유일한 키**고,
+    EVE-NG 화면에 뜨는 원래 이름은 display_name에 따로 둔다 — 장비가 스스로 말하는
+    hostname·LLDP 이웃과 대조할 때는 키가 아니라 원래 이름을 써야 한다.
     """
     lab = models.ForeignKey(Lab, on_delete=models.CASCADE, related_name='nodes')
-    name = models.CharField(max_length=100)
+    name = models.CharField(max_length=100)          # 랩 안에서 유일한 키
+    display_name = models.CharField(max_length=100, blank=True, default='')
     eve_id = models.IntegerField()                   # 갱신되는 값
     template = models.CharField(max_length=50, blank=True, default='')
     image = models.CharField(max_length=120, blank=True, default='')
@@ -397,7 +403,10 @@ class LabNode(models.Model):
 class LabNetwork(models.Model):
     """토폴로지의 네트워크(브리지·pnet0). 관리망 연결을 표현하는 데 필요하다."""
     lab = models.ForeignKey(Lab, on_delete=models.CASCADE, related_name='networks')
+    # 노드와 같은 규칙의 유일 키 — 한 랩에 'Net'(pnet0) 클라우드가 여럿 있어서
+    # 이름만으로는 관리망 링크가 어느 구름에 붙는지 구분되지 않는다.
     name = models.CharField(max_length=100)
+    display_name = models.CharField(max_length=100, blank=True, default='')
     eve_id = models.IntegerField()
     net_type = models.CharField(max_length=30, blank=True, default='')  # bridge, pnet0
     left = models.IntegerField(default=0)

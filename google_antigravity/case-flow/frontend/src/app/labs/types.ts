@@ -35,7 +35,10 @@ export interface NodeAccess {
 }
 
 export interface LabNode {
-  name: string;          // 우리 쪽 키 — eve_id·console 포트는 서버를 옮기면 재부여된다
+  // 우리 쪽 키 — eve_id·console 포트는 서버를 옮기면 재부여된다.
+  // EVE-NG는 같은 이름의 노드를 허용해서, 이름이 겹칠 때만 '이름#eve_id'로 갈라진다.
+  name: string;
+  display_name: string;  // EVE-NG 화면에 뜨는 원래 이름
   eve_id: number;
   template: string;
   image: string;
@@ -50,7 +53,8 @@ export interface LabNode {
 }
 
 export interface LabNetwork {
-  name: string;
+  name: string;          // 노드와 같은 규칙의 유일 키 ('Net'이 여럿일 수 있다)
+  display_name: string;
   eve_id: number;
   net_type: string;      // bridge, pnet0
   left: number;

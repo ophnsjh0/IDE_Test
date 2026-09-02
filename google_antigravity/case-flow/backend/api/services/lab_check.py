@@ -44,8 +44,13 @@ def _facts(access):
     return {'access': access, 'hostname': hostname, 'neighbors': neighbors}
 
 
-def _expected_neighbors(links, node_name, running):
+def _expected_neighbors(links, node_name, running, display):
     """EVE-NG 배선에서 이 노드의 이웃을 뽑는다 — {(로컬포트, 이웃, 이웃포트)}.
+
+    이웃 이름은 우리 키가 아니라 **EVE-NG에 적힌 원래 이름**으로 낸다. 대조 상대가
+    장비가 LLDP로 말하는 hostname이라서, 이름이 겹쳐 '#id'가 붙은 키를 그대로 쓰면
+    전부 "장비가 못 봄"으로 잡힌다. 이름이 겹치는 두 이웃은 이 대조에서 구분되지
+    않는다 — 쌍둥이끼리 뒤바뀐 배선은 여기서 잡히지 않는다.
 
     두 가지를 뺀다:
     - 관리망(노드↔네트워크) 연결. LLDP는 장비끼리만 주고받는다.
@@ -58,10 +63,10 @@ def _expected_neighbors(links, node_name, running):
         if link.source_is_network or link.target_is_network:
             continue
         if link.source == node_name and link.target in running:
-            expected.add((normalize_port(link.source_port), link.target,
+            expected.add((normalize_port(link.source_port), display(link.target),
                           normalize_port(link.target_port)))
         elif link.target == node_name and link.source in running:
-            expected.add((normalize_port(link.target_port), link.source,
+            expected.add((normalize_port(link.target_port), display(link.source),
                           normalize_port(link.source_port)))
     return expected
 
@@ -74,6 +79,14 @@ def run_checks(lab, accesses, links, running=None):
     """
     if running is None:
         running = {n.name for n in lab.nodes.all()}
+    # 키('vEOS#1') → EVE-NG에 적힌 이름('vEOS'). 장비가 말하는 hostname·LLDP
+    # 이웃과 대조할 때만 쓴다. 화면·결과에 나가는 이름은 키 그대로다.
+    names = {n.name: (n.display_name or n.name) for n in lab.nodes.all()}
+
+    def display(key):
+        return names.get(key, key)
+
+    running_hosts = {display(n) for n in running}
     targets = [a for a in accesses if a.probeable]
     results = []
 
@@ -103,12 +116,12 @@ def run_checks(lab, accesses, links, running=None):
         hostname = (fact.get('hostname') or '').split('.')[0]
         if not hostname:
             results.append(_result('장비 확인', name, SKIP, 'hostname을 읽지 못했습니다.'))
-        elif hostname.lower() == name.lower():
+        elif hostname.lower() == display(name).lower():
             results.append(_result('장비 확인', name, PASS, f'hostname={hostname}'))
         else:
             results.append(_result(
                 '장비 확인', name, FAIL,
-                f'등록된 노드는 {name}인데 {access.mgmt_ip}에 붙으니 {hostname}입니다. '
+                f'등록된 노드는 {display(name)}인데 {access.mgmt_ip}에 붙으니 {hostname}입니다. '
                 '관리 IP가 다른 장비를 가리키고 있습니다.'))
 
         # 2) LLDP ↔ EVE-NG 배선
@@ -119,8 +132,8 @@ def run_checks(lab, accesses, links, running=None):
         seen = {(normalize_port(n['local_port']), n['remote_host'].split('.')[0],
                  normalize_port(n['remote_port'])) for n in neighbors}
         # 꺼진 이웃은 양쪽에서 모두 뺀다 — LLDP 캐시가 남아 있을 수 있다
-        seen = {row for row in seen if row[1] in running}
-        expected = _expected_neighbors(links, name, running)
+        seen = {row for row in seen if row[1] in running_hosts}
+        expected = _expected_neighbors(links, name, running, display)
         if not expected:
             results.append(_result('배선 대조', name, SKIP,
                                    '대조할 배선이 없습니다 (이웃이 모두 꺼져 있거나 장비 간 배선 없음).'))
