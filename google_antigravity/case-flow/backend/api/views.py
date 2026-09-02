@@ -1429,6 +1429,58 @@ class LabRunDetailView(APIView):
         return Response(_run_payload(run))
 
 
+class LabRunKnowledgeExtractView(APIView):
+    """POST /api/labs/runs/<run_id>/knowledge/ — 이 실행 결과를 지식으로 저장.
+
+    자동으로 만들지 않고 사람이 누른다 — 케이스·대화의 "지식으로 저장"과 같은
+    규칙이다. 랩은 시행착오로도 돌리는 곳이라, 돌아간 실행마다 지식이 생기면
+    베이스가 검증되지 않은 초안으로 덮인다.
+
+    통과하지 못한 실행은 거절한다. "이 방법으로는 안 되더라"도 값진 기록이지만
+    왜 안 됐는지는 기록에 남지 않고 돌려본 사람 머릿속에 있다 — AI가 요약할
+    것이 아니라 사람이 직접 적어야 한다.
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    ERROR_MESSAGES = {
+        'not_verified': '검증에 통과한 단계가 없는 실행입니다. 통과한 실행만 '
+                        '지식으로 저장할 수 있습니다 — 실패에서 배운 것은 '
+                        '지식 베이스에서 직접 작성해주세요.',
+        'no_knowledge': '이 실행에서는 재사용할 만한 설정 절차를 찾지 못했습니다.',
+        'no_vendor': '어느 벤더의 지식인지 정할 수 없습니다. 재현 대상 케이스를 '
+                     '연결하거나, 노드 접속 정보의 드라이버를 지정해주세요.',
+        'failed': 'AI 추출에 실패했습니다. 잠시 후 다시 시도해주세요.',
+    }
+
+    def post(self, request, run_id):
+        from .models import LabRun
+        run = (LabRun.objects.select_related('blueprint', 'lab', 'case')
+               .filter(id=run_id).first())
+        if run is None:
+            return Response({'error': '없는 실행입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        from .services.knowledge import extract_knowledge_from_run
+        try:
+            outcome, item = extract_knowledge_from_run(run)
+        except Exception:
+            logger.exception("lab run knowledge extraction failed (run %s)", run.id)
+            return Response({'error': self.ERROR_MESSAGES['failed']},
+                            status=status.HTTP_502_BAD_GATEWAY)
+
+        if outcome in self.ERROR_MESSAGES:
+            return Response({'error': self.ERROR_MESSAGES[outcome], 'outcome': outcome},
+                            status=status.HTTP_502_BAD_GATEWAY
+                            if outcome == 'failed' else status.HTTP_400_BAD_REQUEST)
+
+        log_event(request.user, 'knowledge_extract',
+                  detail=f"lab run #{run.id} -> {item.knowledge_id} ({outcome})")
+        return Response({'outcome': outcome,
+                         'item': KnowledgeItemSerializer(item).data},
+                        status=status.HTTP_201_CREATED if outcome == 'created'
+                        else status.HTTP_200_OK)
+
+
 class LabRollbackView(APIView):
     """POST /api/labs/runs/<run_id>/rollback/ — 적용 원장을 역순으로 되돌린다.
 

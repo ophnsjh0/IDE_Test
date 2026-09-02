@@ -132,6 +132,23 @@ def rollback(run):
     return 'failed' if failed else 'done'
 
 
+def succeeded(run):
+    """이 실행이 재현에 성공했는가.
+
+    run.status만으로는 답할 수 없다 — 사람이 나중에 롤백 버튼을 누르면
+    status가 'rolled_back'으로 덮여 판정 결과가 지워진다. 되돌렸다는 것과
+    통과하지 못했다는 것은 다른 얘기라서, 판정은 단계 기록에서 읽는다.
+    """
+    if run.status == 'running':
+        return False
+    steps = list(run.steps.all())
+    verified = [s for s in steps if s.phase == 'verify' and s.status == 'pass']
+    broke = [s for s in steps
+             if s.phase in ('precheck', 'apply', 'verify')
+             and s.status in ('fail', 'error')]
+    return bool(verified) and not broke
+
+
 def execute(run, auto_rollback=True):
     """블루프린트를 실행한다. 실패해도 넣은 것은 되돌린다."""
     blueprint = run.blueprint

@@ -12,7 +12,7 @@ import {
   IconPlayerPlay, IconPlayerStop,
   IconKey, IconListCheck, IconRefresh, IconSend, IconServerOff,
   IconArrowBackUp, IconPlayerTrackNext, IconTerminal2, IconTrash, IconX,
-  IconExternalLink,
+  IconExternalLink, IconBulb,
 } from '@tabler/icons-react';
 import AppHeader from '../components/AppHeader';
 import { apiFetch } from '../lib/api';
@@ -80,6 +80,8 @@ function LabsPageInner() {
   // 채우면 결과가 케이스 이력과 지식으로 돌아간다.
   const [runCase, setRunCase] = useState<string | null>(null);
   const [cases, setCases] = useState<{ value: string; label: string }[] | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveResult, setSaveResult] = useState<{ ok: boolean; text: string } | null>(null);
 
   type ChatMsg = { role: 'user' | 'assistant'; text: string; proposals?: Proposal[] };
   const [chat, setChat] = useState<ChatMsg[]>([]);
@@ -258,10 +260,34 @@ function LabsPageInner() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       setRun(data);
+      setSaveResult(null);
     } catch (e) {
       setError(`실행 실패: ${e instanceof Error ? e.message : e}`);
     } finally {
       setRunning(false);
+    }
+  };
+
+  // 실행 결과를 지식으로 남긴다. 자동으로 만들지 않는 이유는 랩이 시행착오로도
+  // 돌아가는 곳이라서 — 돌린 만큼 초안이 쌓이면 지식 베이스가 묽어진다.
+  const saveKnowledge = async () => {
+    if (!run) return;
+    setSaving(true);
+    setSaveResult(null);
+    try {
+      const res = await apiFetch(`/api/labs/runs/${run.id}/knowledge/`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      setSaveResult({
+        ok: true,
+        text: data.outcome === 'exists'
+          ? `이미 지식으로 등록된 실행입니다 (${data.item.knowledge_id}).`
+          : `${data.item.knowledge_id}로 등록했습니다 — "${data.item.title}"`,
+      });
+    } catch (e) {
+      setSaveResult({ ok: false, text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -690,11 +716,30 @@ function LabsPageInner() {
                           롤백 ({run.pending_rollback})
                         </Button>
                       )}
+                      {/* 지식은 사람이 판단해 남긴다. 통과하지 못한 실행은
+                          서버가 거절한다 — 실패에서 배운 것은 왜 안 됐는지가
+                          기록에 없어서 돌려본 사람이 직접 적어야 한다. */}
+                      <Button size="compact-xs" variant="light" color="grape"
+                              leftSection={<IconBulb size={13} />}
+                              loading={saving} onClick={saveKnowledge}>
+                        지식으로 저장
+                      </Button>
                       <Button size="compact-xs" variant="subtle" onClick={() => setRun(null)}>
                         닫기
                       </Button>
                     </Group>
                   </Group>
+                  {saveResult && (
+                    <Text size="xs" c={saveResult.ok ? 'teal' : 'red'}>
+                      {saveResult.text}
+                      {saveResult.ok && (
+                        <Button size="compact-xs" variant="subtle" ml="xs"
+                                onClick={() => router.push('/knowledge')}>
+                          지식 베이스에서 보기
+                        </Button>
+                      )}
+                    </Text>
+                  )}
                   {run.pending_rollback > 0 && (
                     <Text size="xs" c="orange">
                       적용한 설정이 장비에 남아 있습니다. 롤백을 눌러 되돌리세요.

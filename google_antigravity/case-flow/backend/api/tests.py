@@ -3438,6 +3438,74 @@ class LabRunnerTests(TestCase):
         self.assertIsNone(body['case'])
         self.assertEqual(body['status'], 'passed')   # 실행 기록 자체는 남는다
 
+    def test_passed_run_becomes_lab_sourced_knowledge(self):
+        """랩 재현 지식은 벤더 해결 기록보다 한 단계 아래 출처로 들어간다."""
+        from .models import KnowledgeItem
+        from .services import knowledge
+        case = make_case(vendor='Arista', summary='포트 설명이 사라짐')
+        self.login()
+        with patch('api.services.lab_runner.get_driver', return_value=self.fake_driver()):
+            run_id = self.client.post(f'/api/labs/{self.lab.id}/runs/',
+                                      {'blueprint': self.bp.id, 'case': case.id},
+                                      content_type='application/json').json()['id']
+
+        extracted = {'has_knowledge': True, 'vendor': 'Arista', 'title': '포트 설명 설정',
+                     'problem': '설명이 비어 있습니다.', 'root_cause': '',
+                     'resolution': 'interface Ethernet5 / description TAG',
+                     'device_model': '', 'software_version': ''}
+        with patch.object(knowledge, 'generate_structured_with_model',
+                          return_value=(MODEL, extracted)), \
+             patch.object(knowledge, 'enrich_with_references', return_value='no_candidates'):
+            res = self.client.post(f'/api/labs/runs/{run_id}/knowledge/')
+
+        self.assertEqual(res.status_code, 201)
+        item = KnowledgeItem.objects.get(id=res.json()['item']['id'])
+        self.assertEqual(item.source, 'lab')
+        self.assertEqual(item.lab_run_id, run_id)
+        self.assertEqual(item.case, case)   # 어느 케이스를 재현한 것인지도 남는다
+
+    def test_lab_knowledge_does_not_block_case_extraction(self):
+        """랩 지식이 케이스에 붙어도 벤더 이력에서 뽑을 것은 따로 있다."""
+        from .services import knowledge
+        case = make_case(vendor='Arista', status='Resolved', summary='케이스',
+                         resolution='벤더가 알려준 조치')
+        case.knowledge_items.create(source='lab', vendor='Arista', title='랩에서 확인',
+                                    problem='p', resolution='r')
+
+        extracted = {'has_knowledge': True, 'title': '벤더 해결', 'problem': '문제',
+                     'root_cause': '원인', 'resolution': '조치',
+                     'device_model': '', 'software_version': ''}
+        with patch.object(knowledge, 'generate_structured_with_model',
+                          return_value=(MODEL, extracted)), \
+             patch.object(knowledge, 'enrich_with_references', return_value='no_candidates'):
+            outcome, item = knowledge.extract_knowledge(case)
+        self.assertEqual(outcome, 'created')
+        self.assertEqual(item.source, 'case')
+
+    def test_failed_run_is_not_extracted(self):
+        """실패에서 배운 것은 사람이 직접 적어야 한다 — 기록에 이유가 없다."""
+        driver = self.fake_driver(output='설명 없음')   # verify가 통과하지 못한다
+        body = self.run_blueprint(driver)
+        self.assertEqual(body['status'], 'failed')
+
+        res = self.client.post(f"/api/labs/runs/{body['id']}/knowledge/")
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.json()['outcome'], 'not_verified')
+
+    def test_manual_rollback_does_not_erase_the_verdict(self):
+        """롤백은 status를 덮는다 — 통과 판정은 단계 기록에서 읽어야 한다."""
+        from .models import LabRun
+        from .services import lab_runner
+        driver = self.fake_driver()
+        body = self.run_blueprint(driver, rollback=False)
+        self.assertEqual(body['status'], 'passed')
+
+        with patch('api.services.lab_runner.get_driver', return_value=driver):
+            self.client.post(f"/api/labs/runs/{body['id']}/rollback/")
+        run = LabRun.objects.get(id=body['id'])
+        self.assertEqual(run.status, 'rolled_back')
+        self.assertTrue(lab_runner.succeeded(run))
+
     def test_ledger_is_written_before_the_command_is_sent(self):
         """명령을 보낸 뒤에 기록하면, 중간에 죽었을 때 장비에는 들어갔는데
         원장에는 없는 찌꺼기가 남는다."""
@@ -3843,8 +3911,9 @@ class KnowledgeBaseTests(TestCase):
 
     def make_item(self, **kwargs):
         from .models import KnowledgeItem
-        defaults = dict(case=self.case, vendor='A10', title='SSL RST 해결',
-                        problem='RST 발생', resolution='ACOS 5.2.1-P14 업그레이드')
+        defaults = dict(case=self.case, source='case', vendor='A10',
+                        title='SSL RST 해결', problem='RST 발생',
+                        resolution='ACOS 5.2.1-P14 업그레이드')
         defaults.update(kwargs)
         return KnowledgeItem.objects.create(**defaults)
 

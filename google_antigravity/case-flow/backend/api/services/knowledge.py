@@ -127,7 +127,10 @@ def extract_knowledge(case, mark_checked=True):
     지식이 없다고 '검토 완료'로 찍어버리면, 나중에 케이스가 해결됐을 때
     자동 동기화가 영영 건너뛰게 된다.
     """
-    existing = case.knowledge_items.first()
+    # 랩 재현 지식도 재현 대상 케이스에 붙는다. 그건 벤더가 해결한 기록이
+    # 아니므로 여기서 '이미 추출됨'으로 세면 안 된다 — 케이스 유래 지식이
+    # 영영 만들어지지 않는다.
+    existing = case.knowledge_items.filter(source='case').first()
     if existing:
         return 'exists', existing
 
@@ -198,9 +201,11 @@ def sync_from_cases(limit=SYNC_MAX_CASES):
 
 
 def _sync_from_cases(limit):
+    # 케이스 유래 지식이 아직 없는 것만 — 랩 재현 지식이 붙어 있어도
+    # 벤더 이력에서 뽑을 것은 따로 있다 (extract_knowledge와 같은 기준)
     pending = (Case.objects
-               .filter(status='Resolved', knowledge_items__isnull=True,
-                       knowledge_checked_at__isnull=True)
+               .filter(status='Resolved', knowledge_checked_at__isnull=True)
+               .exclude(knowledge_items__source='case')
                .prefetch_related('emails').order_by('id'))
     cases = list(pending[:limit])
 
@@ -310,6 +315,156 @@ def extract_knowledge_from_chat(session):
     logger.info("Knowledge extracted from chat session %s -> %s",
                 session.id, item.knowledge_id)
     # 공식 문서 근거는 부가 정보 — 실패해도 지식 생성 자체는 유지
+    try:
+        enrich_with_references(item)
+    except Exception:
+        logger.exception("reference enrichment failed for %s", item.knowledge_id)
+    return 'created', item
+
+
+
+# ------------------------------------------------- 랩 재현 -> 지식
+
+RUN_KNOWLEDGE_SCHEMA = CHAT_KNOWLEDGE_SCHEMA
+
+RUN_SYSTEM_PROMPT = """당신은 네트워크 랩(EVE-NG)에서 실제로 실행하고 검증한 테스트
+기록에서, 나중에 다른 엔지니어가 재사용할 수 있는 기술 지식을 추출하는 어시스턴트입니다.
+
+기록 전체를 읽고 아래 JSON 필드를 작성하세요. 모든 필드는 한국어(합니다체)로 작성하되,
+기술 용어, 제품명, CLI 명령어, 설정 라인, 로그, 버전 문자열은 원문 그대로 유지합니다.
+
+이 기록의 성격을 정확히 이해하세요. **여기 적힌 명령은 실제로 장비에 들어갔고, 검증
+명령의 출력으로 통과 판정을 받은 것입니다.** 그러므로 추측하지 말고 기록에 있는 것만
+쓰면 됩니다. 반대로 기록에 없는 배경 설명을 지어내지 마세요.
+
+랩은 실제 운영 환경이 아닙니다 — 이 점은 caveats에 반드시 남기세요.
+
+- has_knowledge: 검증에 통과한 설정 절차가 기록에 있으면 true. 통과한 검증이 하나도
+  없거나 적용한 명령이 없으면 false. false면 나머지 필드는 빈 문자열 "".
+- vendor: 대상 장비의 벤더. 기록에 단서가 없으면 "Unknown".
+""" + FIELD_GUIDE + """
+
+랩 기록에서 각 필드를 채우는 법:
+- environment: 랩 토폴로지와 장비 구성, 역할 매핑. 이 절차가 어떤 구성에서 통했는지.
+- problem: 이 랩으로 확인하려던 것. 재현 대상 케이스가 있으면 그 증상.
+- diagnosis: 사전 점검과 검증 단계에서 무엇을 어떤 명령으로 확인했는지.
+- resolution: **실제로 장비에 넣은 명령을 순서대로 그대로.** 요약하지 마세요.
+- verification: 검증에 쓴 명령과, 무엇이 보이면 정상인지.
+- caveats: 되돌리는 명령(롤백)과, 이것이 랩에서 검증된 결과라는 사실.
+
+""" + DEPTH_GUIDE
+
+# 드라이버는 곧 벤더다 — 모델에게 묻는 것보다 이쪽이 정확하다
+_DRIVER_VENDOR = {'a10_axapi': 'A10', 'arista_eapi': 'Arista'}
+
+
+def _run_vendor(run, ai_vendor=''):
+    """이 실행의 벤더. 케이스 > 드라이버 > 모델 판단 순."""
+    if run.case:
+        return run.case.vendor
+    touched = {a.node_name for a in run.applied.all()}
+    vendors = {_DRIVER_VENDOR[a.driver]
+               for a in run.lab.accesses.all()
+               if a.node_name in touched and a.driver in _DRIVER_VENDOR}
+    # 한 벤더만 건드렸을 때만 확정한다. 여러 벤더가 섞였으면 어느 쪽 지식인지
+    # 기록만으로는 정할 수 없으니 모델 판단으로 넘긴다.
+    if len(vendors) == 1:
+        return vendors.pop()
+    return ai_vendor
+
+
+def build_run_material(run):
+    """추출 프롬프트에 넣을 랩 실행 기록을 구성한다.
+
+    무엇을 재현하려 했는지(케이스) · 어떤 구성에서(토폴로지·역할) · 무엇을
+    넣었고(적용 원장) · 무엇으로 확인했는지(단계 기록)를 한 덩어리로 만든다.
+    """
+    parts = [f"랩: {run.lab.name}", f"시나리오: {run.blueprint.name}"]
+    if run.blueprint.description:
+        parts.append(f"시나리오 설명: {run.blueprint.description}")
+    if run.case:
+        parts.append(f"재현 대상 케이스: {run.case.case_id} [{run.case.vendor}] "
+                     f"{run.case.summary}")
+        if run.case.description:
+            parts.append(f"케이스 문제 설명: {run.case.description[:4000]}")
+
+    accesses = {a.node_name: a for a in run.lab.accesses.all()}
+    nodes = []
+    for node in run.lab.nodes.all():
+        access = accesses.get(node.name)
+        role = f", 역할 {access.role}" if access and access.role else ''
+        driver = f", 드라이버 {access.driver}" if access else ''
+        # display_name은 EVE-NG 화면에 뜨는 이름 — 이름이 겹칠 때만 키와 다르다
+        label = node.display_name or node.name
+        nodes.append(f"- {label} ({node.template or node.image or '?'}{role}{driver})")
+    if nodes:
+        parts.append("=== 랩 구성 ===\n" + "\n".join(nodes))
+
+    links = [f"- {l.source} {l.source_port} ↔ {l.target} {l.target_port}"
+             for l in run.lab.links.all()
+             if not l.source_is_network and not l.target_is_network]
+    if links:
+        parts.append("=== 장비 간 배선 ===\n" + "\n".join(links))
+
+    applied = []
+    for obj in run.applied.all():
+        applied.append(f"[{obj.node_name}] 적용: " + ' / '.join(obj.commands))
+        if obj.rollback_commands:
+            applied.append(f"[{obj.node_name}] 되돌리기: "
+                           + ' / '.join(obj.rollback_commands))
+    if applied:
+        parts.append("=== 실제로 장비에 보낸 명령 ===\n" + "\n".join(applied))
+
+    steps = [f"- [{s.phase}/{s.status}] {s.label}"
+             + (f" ({s.node_name})" if s.node_name else '')
+             + (f"\n  {s.detail[:2000]}" if s.detail else '')
+             for s in run.steps.all()]
+    parts.append("=== 실행 단계와 결과 ===\n" + "\n".join(steps))
+    return "\n".join(parts)
+
+
+def extract_knowledge_from_run(run):
+    """랩 실행 1건에서 지식을 추출해 KnowledgeItem(draft)으로 저장한다.
+
+    반환: ('created', item) | ('exists', 기존 item) | ('not_verified', None)
+    | ('no_knowledge', None) | ('no_vendor', None) | ('failed', None)
+
+    **통과하지 못한 실행은 추출하지 않는다.** "이 방법으로는 안 되더라"도
+    값진 기록이지만, 그건 AI가 요약할 게 아니라 돌려본 사람이 직접 적어야
+    한다 — 왜 안 됐는지는 기록에 안 남고 사람 머릿속에만 있다.
+    """
+    existing = run.knowledge_items.first()
+    if existing:
+        return 'exists', existing
+    from . import lab_runner
+    if not lab_runner.succeeded(run):
+        return 'not_verified', None
+
+    used_model, result = generate_structured_with_model(
+        RUN_SYSTEM_PROMPT, build_run_material(run), RUN_KNOWLEDGE_SCHEMA,
+        models=knowledge_model_candidates())
+    if result is None:
+        return 'failed', None
+    if not result.get('has_knowledge') or not (result.get('resolution') or '').strip():
+        return 'no_knowledge', None
+    vendor = _run_vendor(run, result.get('vendor') or '')
+    if vendor not in dict(Case.VENDOR_CHOICES):
+        return 'no_vendor', None
+
+    item = KnowledgeItem.objects.create(
+        lab_run=run,
+        # 케이스 재현이어도 출처는 lab이다 — 벤더가 해결한 기록이 아니라
+        # 우리 랩에서 돌려본 결과이므로 신뢰도가 한 단계 아래다.
+        case=run.case,
+        source='lab',
+        vendor=vendor,
+        title=result['title'][:200],
+        device_model=result['device_model'][:100],
+        software_version=result['software_version'][:50],
+        analyzed_by=used_model,
+        **{field: (result.get(field) or '') for field in KNOWLEDGE_FIELDS},
+    )
+    logger.info("Knowledge extracted from lab run %s -> %s", run.id, item.knowledge_id)
     try:
         enrich_with_references(item)
     except Exception:

@@ -73,6 +73,8 @@ urlpatterns = [
          name='case-lab-runs'),
     path('labs/runs/<int:run_id>/', views.LabRunDetailView.as_view(),
          name='lab-run-detail'),
+    path('labs/runs/<int:run_id>/knowledge/',
+         views.LabRunKnowledgeExtractView.as_view(), name='lab-run-knowledge'),
     path('labs/runs/<int:run_id>/rollback/', views.LabRollbackView.as_view(),
          name='lab-rollback'),
     path('labs/<int:id>/chat/', views.LabChatView.as_view(), name='lab-chat'),
