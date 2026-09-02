@@ -17,6 +17,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from api.models import LabAppliedObject, LabRun, LabRunStep
+from . import lab_recipes
 from .lab_drivers import DriverError, get_driver
 
 logger = logging.getLogger(__name__)
@@ -168,6 +169,18 @@ def execute(run, auto_rollback=True):
     recorder.step('precheck', '블루프린트 확인', 'pass',
                   f'{len(blueprint.steps)}단계, 역할 {len(roles)}개 매핑됨')
 
+    # 사전은 (벤더, OS 버전)이 키다. 버전은 **실행 시점 관측값**이어야 한다 —
+    # 나중에 장비를 올려도 "그때 그 버전에서 통했다"는 기록이 흔들리지 않게.
+    # 노드마다 한 번만, 이미 만들어 쓰는 드라이버로 읽는다.
+    nodes = {n.name: n for n in run.lab.nodes.all()}
+    facts = {}
+
+    def fact_for(access, driver):
+        if access.node_name not in facts:
+            facts[access.node_name] = lab_recipes.observe_node(
+                access, nodes.get(access.node_name), driver=driver)
+        return facts[access.node_name]
+
     ok = True
     applied_seq = 0
     for index, step in enumerate(blueprint.steps, 1):
@@ -187,6 +200,9 @@ def execute(run, auto_rollback=True):
             driver.apply(step['apply'])
         except DriverError as e:
             recorder.step('apply', label, 'error', str(e), access.node_name)
+            # 넣는 것부터 거절당한 명령이야말로 사전에 남을 값이 있다
+            lab_recipes.record(step, access, fact_for(access, driver), run,
+                               passed=False, detail=str(e))
             ok = False
             break
         recorder.step('apply', label, 'pass',
@@ -199,6 +215,8 @@ def execute(run, auto_rollback=True):
         passed, detail = _verify(driver, spec)
         recorder.step('verify', label, 'pass' if passed else 'fail',
                       detail, access.node_name)
+        lab_recipes.record(step, access, fact_for(access, driver), run,
+                           passed=passed, detail=detail)
         if not passed:
             ok = False
             break

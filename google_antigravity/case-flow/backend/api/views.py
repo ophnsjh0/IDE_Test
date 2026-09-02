@@ -1456,6 +1456,74 @@ class LabRunDetailView(APIView):
         return Response(_run_payload(run))
 
 
+class LabRecipeView(APIView):
+    """GET/POST /api/labs/recipes/ — 검증된 명령 사전 (엔지니어 이상).
+
+    **랩에 매이지 않는 경로다.** 사전은 (벤더, OS 버전)이 키라서 어느 랩에서
+    확인됐는지와 무관하게 조회돼야 한다 — 랩별로 두면 새 랩마다 사전이 비어
+    같은 실패를 반복한다.
+
+    POST는 사람이 직접 넣는 자리다. 벤더 문서를 보고 아는 것을 미리 넣어두면
+    에이전트가 처음부터 그걸 쓴다. 다만 **직접 넣은 것은 '검증됨'이 아니다** —
+    우리 랩에서 돌려본 적이 없으니 untested로 들어가고, 실제로 실행되면 그때
+    verified로 올라간다. 아는 실패(그 버전에 없는 명령)는 known_failure로
+    표시해 넣을 수 있다.
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    def get(self, request):
+        from .services import lab_recipes
+        rows = lab_recipes.search(
+            vendor=request.query_params.get('vendor', ''),
+            os_version=request.query_params.get('os_version', ''),
+            query=request.query_params.get('q', ''),
+            outcome=request.query_params.get('outcome', ''),
+            limit=min(int(request.query_params.get('limit') or 100), 200))
+        return Response([lab_recipes.to_dict(r) for r in rows])
+
+    def post(self, request):
+        from .models import LabCommandRecipe
+        from .services import lab_recipes
+        vendor = request.data.get('vendor') or ''
+        purpose = (request.data.get('purpose') or '').strip()
+        commands = request.data.get('apply') or []
+        if vendor not in dict(Case.VENDOR_CHOICES):
+            return Response({'error': '벤더를 지정하세요.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if not purpose or not isinstance(commands, list) or not commands:
+            return Response({'error': '목적과 apply 명령이 필요합니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if not request.data.get('rollback'):
+            # 되돌릴 방법이 없는 묶음은 실행 엔진이 거절한다. 사전에만 있으면
+            # 에이전트가 제안했다가 실행 직전에 막히는 헛걸음이 된다.
+            return Response({'error': 'rollback 명령이 필요합니다.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        verify = request.data.get('verify') or {}
+        os_version = (request.data.get('os_version') or '').strip()[:100]
+        recipe, _ = LabCommandRecipe.objects.update_or_create(
+            vendor=vendor, os_version=os_version,
+            fingerprint=lab_recipes.fingerprint(commands),
+            defaults={
+                'purpose': purpose[:200],
+                'apply_commands': commands,
+                'verify_command': (verify.get('command') or '')[:300],
+                'verify_contains': (verify.get('contains') or '')[:300],
+                'verify_not_contains': (verify.get('not_contains') or '')[:300],
+                'rollback_commands': request.data.get('rollback'),
+                'device_model': (request.data.get('device_model') or '')[:100],
+                'search_text': lab_recipes.build_search_text(
+                    purpose, commands, (verify.get('command') or '')),
+                # 돌려본 적이 없으므로 '검증됨'이 아니다. 실제로 실행되면
+                # 그때 카운터가 오르고 outcome이 바뀐다.
+                'outcome': 'failed' if request.data.get('known_failure') else 'untested',
+                'last_failure': (request.data.get('failure_note') or '')[:4000],
+                'source': 'manual',
+                'created_by': request.user,
+            })
+        return Response(lab_recipes.to_dict(recipe), status=status.HTTP_201_CREATED)
+
+
 class LabRunKnowledgeExtractView(APIView):
     """POST /api/labs/runs/<run_id>/knowledge/ — 이 실행 결과를 지식으로 저장.
 

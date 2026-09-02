@@ -12,7 +12,7 @@ import {
   IconPlayerPlay, IconPlayerStop,
   IconKey, IconListCheck, IconRefresh, IconSend, IconServerOff,
   IconArrowBackUp, IconPlayerTrackNext, IconTerminal2, IconTrash, IconX,
-  IconExternalLink, IconBulb,
+  IconExternalLink, IconBulb, IconBook,
 } from '@tabler/icons-react';
 import AppHeader from '../components/AppHeader';
 import { apiFetch } from '../lib/api';
@@ -22,7 +22,7 @@ import {
   DRIVERS, fallbackState,
   type AvailableLab, type LabDetail, type LabNode, type LabStatus,
   type Blueprint, type CheckReport, type LabSummary, type NodeAccess,
-  type NodeState, type Proposal, type Run,
+  type NodeState, type Proposal, type Recipe, type Run,
 } from './types';
 
 // Step 1 — EVE-NG를 실제로 읽는다. 전원 제어와 준비 판정은 Step 2에서 붙는다.
@@ -81,6 +81,10 @@ function LabsPageInner() {
   const [runCase, setRunCase] = useState<string | null>(null);
   const [cases, setCases] = useState<{ value: string; label: string }[] | null>(null);
   const [saving, setSaving] = useState(false);
+  // 검증된 명령 사전 — 랩에 매이지 않으므로 랩을 바꿔도 다시 받지 않는다
+  const [recipesOpen, setRecipesOpen] = useState(false);
+  const [recipes, setRecipes] = useState<Recipe[] | null>(null);
+  const [recipeQuery, setRecipeQuery] = useState('');
   const [saveResult, setSaveResult] = useState<{ ok: boolean; text: string } | null>(null);
 
   type ChatMsg = { role: 'user' | 'assistant'; text: string; proposals?: Proposal[] };
@@ -267,6 +271,17 @@ function LabsPageInner() {
       setRunning(false);
     }
   };
+
+  // 사전은 (벤더, OS 버전)이 키라 랩과 무관하다 — 열 때 한 번만 받는다.
+  const loadRecipes = useCallback(async (q = '') => {
+    setRecipes(null);
+    try {
+      const res = await apiFetch(`/api/labs/recipes/?q=${encodeURIComponent(q)}`);
+      setRecipes(res.ok ? await res.json() : []);
+    } catch {
+      setRecipes([]);
+    }
+  }, []);
 
   // 실행 결과를 지식으로 남긴다. 자동으로 만들지 않는 이유는 랩이 시행착오로도
   // 돌아가는 곳이라서 — 돌린 만큼 초안이 쌓이면 지식 베이스가 묽어진다.
@@ -505,6 +520,13 @@ function LabsPageInner() {
               disabled={!lab || nodes.length === 0} onClick={openAccess}
             >
               접속 정보
+            </Button>
+            {/* 랩에 매이지 않는다 — 어느 랩을 보고 있든 같은 사전이다 */}
+            <Button
+              variant="light" size="sm" leftSection={<IconBook size={16} />}
+              onClick={() => { setRecipesOpen(true); loadRecipes(recipeQuery); }}
+            >
+              명령 사전
             </Button>
             <Button
               variant="default" size="sm" leftSection={<IconRefresh size={16} />}
@@ -975,6 +997,77 @@ function LabsPageInner() {
             </Paper>
           </Stack>
         </Group>
+
+        {/* 검증된 명령 사전. 랩 밑이 아니라 옆에 둔다 — (벤더, OS 버전)이 키라
+            어느 랩에서 확인됐든 같은 장비면 그대로 쓸모가 있다. */}
+        <Modal opened={recipesOpen} onClose={() => setRecipesOpen(false)}
+               title="검증된 명령 사전" size="xl">
+          <Text size="sm" c="dimmed" mb="sm">
+            랩에서 실제로 돌려본 명령 묶음입니다. 버전마다 되는 명령이 달라
+            (벤더 · OS 버전)으로 모읍니다 — AI가 설정을 제안하기 전에 여기를 먼저 봅니다.
+          </Text>
+          <TextInput
+            placeholder="목적이나 명령으로 검색 (예: description, bgp)"
+            value={recipeQuery} mb="sm"
+            onChange={(e) => setRecipeQuery(e.currentTarget.value)}
+            onKeyDown={(e) => e.key === 'Enter' && loadRecipes(recipeQuery)}
+            rightSection={
+              <ActionIcon variant="subtle" onClick={() => loadRecipes(recipeQuery)}>
+                <IconRefresh size={14} />
+              </ActionIcon>
+            }
+          />
+          <ScrollArea.Autosize mah={480}>
+            {recipes === null ? (
+              <Group justify="center" py="lg"><Loader size="sm" /></Group>
+            ) : recipes.length === 0 ? (
+              <Text size="sm" c="dimmed" py="lg" ta="center">
+                아직 쌓인 것이 없습니다. 시나리오를 실행하면 그 결과가 여기 모입니다.
+              </Text>
+            ) : (
+              <Stack gap="xs">
+                {recipes.map((r) => (
+                  <Card key={r.id} withBorder radius="md" p="sm">
+                    <Group justify="space-between" wrap="nowrap" mb={6}>
+                      <Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
+                        <Badge size="sm" variant="light"
+                               color={r.outcome === 'verified' ? 'teal'
+                                 : r.outcome === 'untested' ? 'yellow' : 'red'}>
+                          {r.outcome === 'verified' ? '검증됨'
+                            : r.outcome === 'untested' ? '미검증' : '실패'}
+                        </Badge>
+                        <Text size="sm" fw={600} lineClamp={1}>{r.purpose}</Text>
+                      </Group>
+                      <Text size="xs" c="dimmed" style={{ whiteSpace: 'nowrap' }}>
+                        {r.vendor} · {r.os_version || '버전 미상'}
+                      </Text>
+                    </Group>
+                    <Text size="xs" ff="monospace" style={{ whiteSpace: 'pre-wrap' }}>
+                      {r.apply.join('\n')}
+                    </Text>
+                    {r.verify.command && (
+                      <Text size="xs" c="dimmed" ff="monospace" mt={4}>
+                        확인: {r.verify.command}
+                        {r.verify.contains && ` → "${r.verify.contains}" 포함`}
+                      </Text>
+                    )}
+                    {/* 왜 안 되는지가 여기 남는다 — 같은 명령을 또 고르지 않게 */}
+                    {r.outcome === 'failed' && r.last_failure && (
+                      <Text size="xs" c="red" mt={4} lineClamp={2}>
+                        {r.last_failure}
+                      </Text>
+                    )}
+                    <Text size="xs" c="dimmed" mt={4}>
+                      {r.source === 'manual' ? '직접 등록' : '랩 실행'}
+                      {r.verified_count > 0 && ` · 통과 ${r.verified_count}회`}
+                      {r.failed_count > 0 && ` · 실패 ${r.failed_count}회`}
+                    </Text>
+                  </Card>
+                ))}
+              </Stack>
+            )}
+          </ScrollArea.Autosize>
+        </Modal>
 
         {/* 노드별 관리 접속 정보 — EVE-NG가 모르는 값이라 사람이 적는다.
             준비 판정(프로브)이 이 정보로 장비를 찌른다. 토폴로지 갱신으로

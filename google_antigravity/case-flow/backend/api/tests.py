@@ -3348,6 +3348,194 @@ class LabCheckTests(TestCase):
 
 
 @override_settings(EVENG_URL='http://eve.test', EVENG_USER='admin', EVENG_PASSWORD='pw')
+class LabRecipeTests(TestCase):
+    """검증된 명령 사전 — 돌려본 것을 (벤더, OS 버전)으로 모은다.
+
+    이 사전이 있는 이유: 실기기 검증에서 모델이 고른 EOS 명령이 그 버전에 없어
+    verify가 실패하고 롤백됐다. 설계가 걸러내긴 했지만, 걸러내는 것과 다음에
+    안 틀리는 것은 다르다.
+    """
+
+    STEP = {
+        'role': 'core-a', 'label': '포트 설명 설정',
+        'apply': ['interface Ethernet5', 'description TAG'],
+        'verify': {'command': 'show interfaces Ethernet5 description', 'contains': 'TAG'},
+        'rollback': ['interface Ethernet5', 'no description'],
+    }
+
+    def setUp(self):
+        from .models import Lab, LabBlueprint, LabNode, LabNodeAccess, LabServer
+        from .permissions import set_user_role
+        user = User.objects.create_user('rc-e', password='rc-pass-1!')
+        set_user_role(user, 'engineer')
+        server = LabServer.objects.create(base_url='http://eve.test')
+        self.lab = Lab.objects.create(server=server, path='/x.unl', name='x')
+        LabNode.objects.create(lab=self.lab, name='Arista_1', eve_id=1,
+                               image='veos-4.28.0F')
+        LabNodeAccess.objects.create(lab=self.lab, node_name='Arista_1', role='core-a',
+                                     mgmt_ip='10.0.0.1', driver='arista_eapi',
+                                     username='u', password='p')
+        self.bp = LabBlueprint.objects.create(lab=self.lab, name='bp',
+                                              steps=[dict(self.STEP)])
+
+    def login(self):
+        self.client.post('/api/auth/login/',
+                         {'username': 'rc-e', 'password': 'rc-pass-1!'},
+                         content_type='application/json')
+
+    def driver(self, output='... TAG ...', version='4.28.0F', apply_error=None):
+        d = MagicMock()
+        d.run_command.return_value = output
+        d.device_facts.return_value = {'os_version': version, 'device_model': 'vEOS'}
+        if apply_error:
+            d.apply.side_effect = lab_drivers.DriverError(apply_error)
+        return d
+
+    def run_once(self, driver):
+        self.login()
+        with patch('api.services.lab_runner.get_driver', return_value=driver):
+            return self.client.post(f'/api/labs/{self.lab.id}/runs/',
+                                    {'blueprint': self.bp.id},
+                                    content_type='application/json').json()
+
+    def test_passing_step_is_recorded_against_the_observed_version(self):
+        from .models import LabCommandRecipe
+        self.run_once(self.driver())
+
+        recipe = LabCommandRecipe.objects.get()
+        self.assertEqual(recipe.vendor, 'Arista')
+        self.assertEqual(recipe.os_version, '4.28.0F')   # 장비가 말한 값
+        self.assertEqual(recipe.outcome, 'verified')
+        self.assertEqual(recipe.verified_count, 1)
+        self.assertEqual(recipe.apply_commands, self.STEP['apply'])
+        self.assertEqual(recipe.rollback_commands, self.STEP['rollback'])
+
+    def test_repeat_runs_do_not_grow_the_dictionary(self):
+        """지문이 없으면 사전이 아니라 실행 로그가 된다."""
+        from .models import LabCommandRecipe
+        self.run_once(self.driver())
+        self.run_once(self.driver())
+
+        recipe = LabCommandRecipe.objects.get()
+        self.assertEqual(recipe.verified_count, 2)
+
+    def test_different_versions_are_different_entries(self):
+        """버전 축이 사전의 핵심이다 — 버전마다 되는 명령이 다르다."""
+        from .models import LabCommandRecipe
+        self.run_once(self.driver(version='4.28.0F'))
+        self.run_once(self.driver(version='4.31.2F'))
+
+        self.assertEqual(
+            set(LabCommandRecipe.objects.values_list('os_version', flat=True)),
+            {'4.28.0F', '4.31.2F'})
+
+    def test_failure_is_recorded_with_what_the_device_said(self):
+        """'이 버전엔 이 명령이 없다'가 실은 더 쓸모 있다."""
+        from .models import LabCommandRecipe
+        self.run_once(self.driver(apply_error='Invalid input (at token 1)'))
+
+        recipe = LabCommandRecipe.objects.get()
+        self.assertEqual(recipe.outcome, 'failed')
+        self.assertEqual(recipe.failed_count, 1)
+        self.assertIn('Invalid input', recipe.last_failure)
+
+    def test_a_failure_then_a_success_becomes_verified(self):
+        from .models import LabCommandRecipe
+        self.run_once(self.driver(output='설명 없음'))     # verify 실패
+        self.run_once(self.driver())                        # 통과
+
+        recipe = LabCommandRecipe.objects.get()
+        self.assertEqual(recipe.outcome, 'verified')
+        self.assertEqual((recipe.verified_count, recipe.failed_count), (1, 1))
+
+    def test_version_falls_back_to_the_eveng_image_and_says_so(self):
+        """짐작한 값을 확인된 것처럼 쓰면 버전 축이 조용히 어긋난다."""
+        from .models import LabNodeFact
+        driver = self.driver()
+        driver.device_facts.side_effect = lab_drivers.DriverError('버전을 못 읽음')
+        self.run_once(driver)
+
+        fact = LabNodeFact.objects.get()
+        self.assertEqual(fact.os_version, 'veos-4.28.0F')
+        self.assertEqual(fact.source, 'image')
+
+    def test_recording_never_breaks_the_run(self):
+        """사전은 부가 기능이다. 여기서 터져서 실행이 멈추면 넣은 설정이
+        되돌아가지 않을 수 있다."""
+        from .services import lab_recipes
+        with patch.object(lab_recipes, '_record', side_effect=RuntimeError('boom')):
+            body = self.run_once(self.driver())
+        self.assertEqual(body['status'], 'passed')
+        self.assertEqual(body['pending_rollback'], 0)
+
+    def test_dictionary_is_global_not_per_lab(self):
+        """랩별로 두면 새 랩마다 사전이 비어 같은 실패를 반복한다."""
+        from .models import LabCommandRecipe
+        self.run_once(self.driver())
+
+        # 조회 경로가 랩 밑에 있지 않고, 항목에 랩 FK 자체가 없다
+        self.login()
+        rows = self.client.get('/api/labs/recipes/?vendor=Arista').json()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['purpose'], '포트 설명 설정')
+        self.assertNotIn('lab', [f.name for f in LabCommandRecipe._meta.get_fields()])
+
+    def test_version_search_matches_by_prefix(self):
+        """장비는 '4.28.0F'라고 말하는데 사람은 '4.28'로 묻는다."""
+        self.run_once(self.driver())
+        self.login()
+        self.assertEqual(len(self.client.get(
+            '/api/labs/recipes/?os_version=4.28').json()), 1)
+        self.assertEqual(len(self.client.get(
+            '/api/labs/recipes/?os_version=4.31').json()), 0)
+
+    def test_hand_added_entries_are_untested_not_verified(self):
+        """돌려보지 않은 것을 '검증됨'으로 적을 수 있으면 사전을 믿을 수 없다."""
+        self.login()
+        res = self.client.post('/api/labs/recipes/', {
+            'vendor': 'Arista', 'purpose': '문서에서 본 것',
+            'apply': ['ip routing'], 'rollback': ['no ip routing'],
+            'verify': {'command': 'show ip route', 'contains': 'C'},
+            'outcome': 'verified',     # 요청으로 정할 수 없어야 한다
+        }, content_type='application/json')
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.json()['outcome'], 'untested')
+
+    def test_hand_added_entries_need_a_way_back(self):
+        """되돌릴 방법이 없는 묶음은 실행 엔진이 거절한다 — 사전에만 있으면
+        에이전트가 제안했다가 실행 직전에 막히는 헛걸음이 된다."""
+        self.login()
+        res = self.client.post('/api/labs/recipes/',
+                               {'vendor': 'Arista', 'purpose': 'p',
+                                'apply': ['ip routing']},
+                               content_type='application/json')
+        self.assertEqual(res.status_code, 400)
+
+    def test_agent_can_look_the_dictionary_up(self):
+        from .services import lab_agent
+        self.run_once(self.driver())
+
+        rows = json.loads(lab_agent._search_recipes(query='설명', vendor='Arista'))
+        self.assertEqual(rows['count'], 1)
+        self.assertEqual(rows['results'][0]['apply'], self.STEP['apply'])
+
+    def test_verified_comes_before_failed(self):
+        """사전을 읽는 쪽이 가장 먼저 보는 것이 실패한 명령이면 곤란하다."""
+        from .models import LabCommandRecipe
+        from .services import lab_recipes
+        base = dict(vendor='Arista', os_version='4.28.0F', purpose='p',
+                    apply_commands=['a'], rollback_commands=['b'],
+                    search_text='route')
+        LabCommandRecipe.objects.create(fingerprint='f1', outcome='failed', **base)
+        LabCommandRecipe.objects.create(fingerprint='f2', outcome='untested', **base)
+        LabCommandRecipe.objects.create(fingerprint='f3', outcome='verified', **base)
+
+        found = lab_recipes.search(query='route')
+        self.assertEqual([r.outcome for r in found],
+                         ['verified', 'untested', 'failed'])
+
+
+@override_settings(EVENG_URL='http://eve.test', EVENG_USER='admin', EVENG_PASSWORD='pw')
 class LabRunnerTests(TestCase):
     """실행 엔진 — 넣고, 코드로 판정하고, 원장으로 되돌린다."""
 
@@ -3376,9 +3564,12 @@ class LabRunnerTests(TestCase):
                          {'username': 'lr2-e', 'password': 'lr2-pass-1!'},
                          content_type='application/json')
 
-    def fake_driver(self, output='... TAG ...', apply_error=None):
+    def fake_driver(self, output='... TAG ...', apply_error=None, version='4.28.0F'):
         driver = MagicMock()
         driver.run_command.return_value = output
+        # 사전이 (벤더, OS 버전)을 키로 쓴다 — 실기기처럼 버전을 답하게 둔다
+        driver.device_facts.return_value = {'os_version': version,
+                                            'device_model': 'vEOS'}
         if apply_error:
             driver.apply.side_effect = lab_drivers.DriverError(apply_error)
         return driver

@@ -70,6 +70,15 @@ class DeviceDriver:
         """[{'local_port', 'remote_host', 'remote_port'}]. 지원 안 하면 None."""
         return None
 
+    def device_facts(self):
+        """{'os_version', 'device_model'}. 못 읽는 드라이버는 빈 dict.
+
+        검증된 명령 사전이 (벤더, OS 버전)을 키로 삼기 때문에 필요하다 —
+        실기기에서 verify가 실패한 원인이 "모델이 고른 명령이 그 버전에
+        없어서"였다. 버전 축이 없으면 사전이 성립하지 않는다.
+        """
+        return {}
+
     # ---- Step 4에서 쓰는 쓰기·조회 ----
 
     def run_command(self, command):
@@ -128,6 +137,11 @@ class AristaDriver(DeviceDriver):
     def apply(self, commands):
         """configure 모드로 넣는다. EOS는 명령 하나라도 틀리면 전체가 실패한다."""
         self._run_text(['enable', 'configure'] + list(commands))
+
+    def device_facts(self):
+        row = self._run(['show version'])[0]
+        return {'os_version': row.get('version') or '',
+                'device_model': row.get('modelName') or ''}
 
     def lldp_neighbors(self):
         rows = self._run(['show lldp neighbors'])[0].get('lldpNeighbors', [])
@@ -200,6 +214,11 @@ class A10Driver(DeviceDriver):
     def apply(self, commands):
         """configure 모드 명령을 clideploy로 태운다."""
         self.cli(['configure'] + list(commands))
+
+    def device_facts(self):
+        oper = ((self._get('/version/oper') or {}).get('version') or {}).get('oper') or {}
+        return {'os_version': oper.get('sw-version') or '',
+                'device_model': oper.get('hw-platform') or oper.get('platform') or ''}
 
     def lldp_neighbors(self):
         """A10은 LLDP 이웃을 CLI 출력으로만 준다 — 표 형태를 줄 단위로 읽는다.

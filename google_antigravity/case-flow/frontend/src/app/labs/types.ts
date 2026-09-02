@@ -169,3 +169,23 @@ export interface ChatReply {
   proposals: Proposal[];
   usage: { input: number; output: number };
 }
+
+// 검증된 명령 사전 — 랩에 매이지 않는다. (벤더, OS 버전)이 키라서 어느 랩에서
+// 확인됐든 같은 장비면 그대로 쓸모가 있다.
+export interface Recipe {
+  id: number;
+  vendor: string;
+  os_version: string;          // '' = 버전 미상
+  purpose: string;
+  apply: string[];
+  verify: { command: string; contains: string; not_contains: string };
+  rollback: string[];
+  // verified=돌려서 통과 / untested=사람이 넣어둠 / failed=그 버전에서 실패
+  outcome: 'verified' | 'untested' | 'failed';
+  verified_count: number;
+  failed_count: number;
+  last_failure: string;
+  device_model: string;
+  source: 'run' | 'manual';
+  last_run: number | null;
+}

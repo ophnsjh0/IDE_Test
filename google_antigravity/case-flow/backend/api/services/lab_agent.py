@@ -23,7 +23,7 @@ import anthropic
 from django.conf import settings
 
 from api.models import AppSetting, LabProposal
-from . import help_agent, lab_check, lab_drivers, lab_probe
+from . import help_agent, lab_check, lab_drivers, lab_probe, lab_recipes
 from .analyzer import AVAILABLE_MODELS, detect_provider, provider_api_key
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,13 @@ SYSTEM_PROMPT = """당신은 네트워크 랩(EVE-NG) 테스트를 돕는 어시
 
 ## 제안을 만들 때
 
+- **먼저 search_verified_commands로 사전을 확인하세요.** 그 벤더·그 OS 버전에서
+  실제로 돌려본 명령이 기록돼 있습니다. 검증된(verified) 묶음이 있으면 그것을
+  쓰고, 실패한(failed) 묶음이 있으면 그 명령은 다시 제안하지 마세요 —
+  last_failure에 장비가 뭐라고 했는지 적혀 있습니다.
+  (이 사전이 있는 이유: 예전에 당신 자리의 모델이 고른 명령이 그 EOS 버전에
+  없어서 검증이 실패하고 롤백된 일이 있었습니다. 버전마다 되는 명령이 다릅니다.)
+- 사전에 없으면 문서·케이스를 근거로 제안하되, **검증되지 않았다고 밝히세요.**
 - 되돌릴 방법(rollback)이 없는 변경은 제안하지 마세요. 원복 명령을 반드시 함께
   적습니다.
 - 검증(verify)에는 "어떤 명령의 출력에 무엇이 있어야 하는지"를 적으세요.
@@ -99,6 +106,36 @@ LAB_TOOL_DEFS = {
         'description': ('읽기 전용 점검을 돌린다 — 장비 hostname과 LLDP 이웃을 '
                         'EVE-NG 배선·등록 정보와 대조한다. 설정은 바꾸지 않는다.'),
         'input_schema': {'type': 'object', 'properties': {}, 'required': []},
+    },
+    'search_verified_commands': {
+        'name': 'search_verified_commands',
+        'description': (
+            '이 랩과 같은 장비에서 **실제로 돌려본** 명령 묶음을 찾는다. '
+            'propose_change로 설정을 제안하기 전에 반드시 먼저 확인할 것 — '
+            '여기 있는 명령은 그 벤더·그 OS 버전에서 실행 결과가 기록된 것이다.\n'
+            'outcome=verified: 넣고 검증까지 통과한 묶음. 그대로 쓰면 된다.\n'
+            'outcome=untested: 사람이 문서를 보고 넣어둔 묶음. 랩에서 돌려본 적은 '
+            '없으니 쓰되 검증되지 않았다고 밝힐 것.\n'
+            'outcome=failed: 그 버전에서 실패한 묶음. last_failure에 장비가 뭐라고 '
+            '했는지 있다. **같은 명령을 다시 제안하지 말 것.**\n'
+            '결과가 없으면 사전에 없는 것일 뿐이니, 문서·케이스를 근거로 제안하되 '
+            '검증되지 않았다고 밝힐 것.'),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'query': {'type': 'string',
+                          'description': '목적이나 명령 키워드 (공백 AND)'},
+                'vendor': {'type': 'string',
+                           'enum': ['A10', 'Arista', 'HPE Aruba', 'Juniper'],
+                           'description': '벤더 (선택, 생략하면 전체)'},
+                'os_version': {'type': 'string',
+                               'description': "OS 버전 접두어 (선택, 예: '4.28'). "
+                                              '버전 미상 항목도 함께 나온다.'},
+                'outcome': {'type': 'string',
+                            'enum': ['verified', 'untested', 'failed'],
+                            'description': '한 종류만 보고 싶을 때 (선택)'},
+            },
+        },
     },
     'propose_change': {
         'name': 'propose_change',
@@ -217,6 +254,14 @@ def _propose(lab, title, steps, reason=''):
     }
 
 
+def _search_recipes(query='', vendor='', os_version='', outcome=''):
+    """검증된 명령 사전 조회. 랩에 매이지 않는다 — 같은 벤더·버전이면
+    다른 랩에서 확인된 것도 그대로 쓸모가 있다."""
+    rows = [lab_recipes.to_dict(r) for r in lab_recipes.search(
+        vendor=vendor, os_version=os_version, query=query, outcome=outcome)]
+    return json.dumps({'results': rows, 'count': len(rows)}, ensure_ascii=False)
+
+
 def _handlers(lab):
     """이 대화에서 쓸 도구 실행표. 랩은 클로저로 묶는다."""
     handlers = dict(help_agent.TOOL_HANDLERS)
@@ -224,6 +269,7 @@ def _handlers(lab):
     handlers['get_lab_topology'] = lambda: _lab_topology(lab)
     handlers['run_lab_check'] = lambda: _lab_check(lab)
     handlers['propose_change'] = lambda **kw: _propose(lab, **kw)
+    handlers['search_verified_commands'] = _search_recipes
     return handlers
 
 

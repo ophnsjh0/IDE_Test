@@ -603,6 +603,109 @@ class LabAppliedObject(models.Model):
         return f"run#{self.run_id} {self.node_name} ({len(self.commands)}개)"
 
 
+class LabNodeFact(models.Model):
+    """장비가 스스로 말한 것 — OS 버전·모델. **관측값이다.**
+
+    LabNodeAccess(사람이 적는 값)와 섞지 않는 이유: 그 표는 토폴로지를 다시
+    받아도 살아남아야 하는 '사람의 입력'이라는 규칙으로 서 있다. 관측값을
+    거기 끼워 넣으면 무엇을 지켜야 하는지가 흐려진다.
+
+    source가 왜 필요한가 — 장비에 붙어 읽은 값(probe)과 EVE-NG의 이미지
+    문자열로 짐작한 값(image)은 신뢰도가 다르다. 짐작한 값을 확인된 것처럼
+    쓰면 명령 사전의 버전 축이 조용히 어긋난다.
+    """
+    SOURCE_CHOICES = [
+        ('probe', '장비에서 읽음'),
+        ('image', 'EVE-NG 이미지에서 추정'),
+    ]
+
+    lab = models.ForeignKey(Lab, on_delete=models.CASCADE, related_name='facts')
+    node_name = models.CharField(max_length=100)     # LabNode.name과 같은 키
+    os_version = models.CharField(max_length=100, blank=True, default='')
+    device_model = models.CharField(max_length=100, blank=True, default='')
+    source = models.CharField(max_length=10, choices=SOURCE_CHOICES, default='probe')
+    seen_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['node_name']
+        unique_together = [('lab', 'node_name')]
+
+    def __str__(self):
+        return f"{self.lab.name}/{self.node_name} {self.os_version} ({self.source})"
+
+
+class LabCommandRecipe(models.Model):
+    """검증된 명령 사전 — (벤더, OS 버전, 명령 묶음) 하나.
+
+    **랩에 매이지 않는다.** 랩별로 두면 새 랩마다 사전이 빈 채로 시작해
+    같은 명령을 또 실패해가며 다시 배운다. 대신 어느 랩·어느 실행에서
+    확인됐는지를 항목에 붙여, 이상하면 근거를 따라갈 수 있게 한다.
+
+    항목의 단위는 명령 한 줄이 아니라 **목적별 묶음**(넣고-확인하고-되돌리는
+    한 세트)이다. 블루프린트 한 단계가 그대로 한 항목이 된다.
+
+    실패한 묶음도 남긴다. "이 버전엔 이 명령이 없다"는 기록이 실은 더
+    쓸모 있다 — 모델이 같은 명령을 다시 고르는 것을 막아준다.
+    """
+    # outcome은 **우리 랩의 증거**를 말한다. 사람이 문서를 보고 넣은 것은
+    # 아직 돌려본 적이 없으므로 verified가 아니다 — 그걸 검증됨으로 적을 수
+    # 있으면 사전을 믿을 수 없게 된다. 실제로 실행되면 그때 올라간다.
+    OUTCOME_CHOICES = [
+        ('verified', '검증됨'),
+        ('untested', '미검증 (직접 등록)'),
+        ('failed', '실패'),
+    ]
+    SOURCE_CHOICES = [
+        ('run', '랩 실행에서 확인'),
+        ('manual', '직접 등록'),
+    ]
+
+    vendor = models.CharField(max_length=50, choices=Case.VENDOR_CHOICES)
+    # 버전을 모르면 ''. 그래도 남긴다 — 벤더만 맞아도 없는 것보다는 낫고,
+    # 화면에서 "버전 미상"으로 구분해 보여준다.
+    os_version = models.CharField(max_length=100, blank=True, default='')
+    purpose = models.CharField(max_length=200)       # 이 묶음이 무엇을 하는가
+    apply_commands = models.JSONField(default=list)
+    verify_command = models.CharField(max_length=300, blank=True, default='')
+    verify_contains = models.CharField(max_length=300, blank=True, default='')
+    verify_not_contains = models.CharField(max_length=300, blank=True, default='')
+    rollback_commands = models.JSONField(default=list)
+
+    # 검색용 평문 — 목적과 명령을 합쳐 둔다. 명령이 JSONField라서 그대로는
+    # 키워드 검색이 안 되고(SQLite/Postgres에서 동작이 갈린다), 사전은 결국
+    # "이런 걸 하려는데 뭐가 통했나"로 찾는 물건이다.
+    search_text = models.TextField(blank=True, default='')
+
+    # 같은 묶음을 몇 번을 돌려도 행이 늘지 않도록 잡는 키. 명령 목록을
+    # 정규화해 해시한 값이다 — 이게 없으면 사전이 아니라 실행 로그가 된다.
+    fingerprint = models.CharField(max_length=64)
+
+    outcome = models.CharField(max_length=10, choices=OUTCOME_CHOICES)
+    verified_count = models.IntegerField(default=0)
+    failed_count = models.IntegerField(default=0)
+    # 마지막으로 실패했을 때 장비가 뭐라고 했는지. 왜 안 되는지가 여기 남는다.
+    last_failure = models.TextField(blank=True, default='')
+
+    source = models.CharField(max_length=10, choices=SOURCE_CHOICES, default='run')
+    # 근거를 따라갈 수 있게. 실행이 지워져도 항목은 남는다.
+    last_run = models.ForeignKey('LabRun', null=True, blank=True,
+                                 on_delete=models.SET_NULL, related_name='recipes')
+    device_model = models.CharField(max_length=100, blank=True, default='')
+    created_by = models.ForeignKey(django_settings.AUTH_USER_MODEL, null=True,
+                                   blank=True, on_delete=models.SET_NULL,
+                                   related_name='lab_recipes')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['vendor', 'os_version', 'purpose']
+        unique_together = [('vendor', 'os_version', 'fingerprint')]
+
+    def __str__(self):
+        version = self.os_version or '버전 미상'
+        return f"[{self.vendor} {version}] {self.purpose} ({self.outcome})"
+
+
 class LabProposal(models.Model):
     """랩 에이전트가 만든 설정 변경 제안.
 
