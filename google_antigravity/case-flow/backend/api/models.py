@@ -366,6 +366,49 @@ class LabServer(models.Model):
         return f"{self.base_url} ({self.version or 'unknown'})"
 
 
+class LabIpPool(models.Model):
+    """랩에서 쓸 IP 대역 — **랩이 아니라 랩 서버에 매인다.**
+
+    EVE-NG Community에서는 랩이 한 서버에 평면으로 놓이고 관리망(pnet0)을
+    서버가 공유한다. 그래서 옆 랩이 192.168.74.150을 쓰면 이 랩은 못 쓴다 —
+    중복 검사는 랩 안이 아니라 **서버 전체** 기준이어야 한다.
+
+    두 종류가 있다:
+    - mgmt: 장비 관리 IP. 사내망에서 떼어 받은 자리라 연속이 아니고 구멍이
+      뚫려 있다(ranges에 조각으로 적는다).
+    - data: 랩 안에서만 도는 시험 트래픽 대역. 사설 대역을 통째로 잡아두고
+      랩마다 lab_prefix 크기로 하나씩 떼어 준다(Lab.data_subnet).
+
+    **시스템은 배정하지 않고 경고만 한다.** 사람이 고른 IP를 막지 않는 이유:
+    랩은 일부러 이상한 값을 넣어보는 곳이기도 하고, 자동 배정은 사람이 장비
+    안에 이미 넣어둔 설정과 어긋나는 순간 더 큰 혼란이 된다.
+    """
+    KIND_CHOICES = [
+        ('mgmt', '관리 IP'),
+        ('data', '시험 트래픽 대역'),
+    ]
+
+    server = models.ForeignKey(LabServer, on_delete=models.CASCADE,
+                               related_name='ip_pools')
+    kind = models.CharField(max_length=10, choices=KIND_CHOICES)
+    # 대역과 게이트웨이. mgmt는 장비가 실제로 붙는 망, data는 떼어 쓸 상위 대역.
+    cidr = models.CharField(max_length=50, blank=True, default='')
+    gateway = models.CharField(max_length=50, blank=True, default='')
+    # 쓸 수 있는 조각들. "a.b.c.d" 또는 "a.b.c.d-a.b.c.h" 문자열의 목록.
+    # mgmt에서만 의미가 있다 — 받은 자리가 연속이 아니라서.
+    ranges = models.JSONField(default=list, blank=True)
+    # data에서만: 랩 하나에 떼어 줄 크기 (24 = /24)
+    lab_prefix = models.IntegerField(default=24)
+    note = models.CharField(max_length=200, blank=True, default='')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [('server', 'kind')]
+
+    def __str__(self):
+        return f"{self.server.base_url} {self.kind} {self.cidr}"
+
+
 class Lab(models.Model):
     """Case-Flow에 등록된 랩. EVE-NG에 있는 모든 랩이 아니라 관리자가 고른 것만.
 
@@ -377,6 +420,10 @@ class Lab(models.Model):
     name = models.CharField(max_length=200)          # 화면 표시 이름
     vendor = models.CharField(max_length=50, blank=True, default='')
     description = models.CharField(max_length=300, blank=True, default='')
+    # 이 랩에 떼어 준 시험 트래픽 대역 (LabIpPool.kind='data'에서 나온 /24 등).
+    # 비어 있으면 아직 배정되지 않은 것이다 — 랩끼리 대역이 겹치면 서버를
+    # 공유하는 구조상 트래픽이 섞인다.
+    data_subnet = models.CharField(max_length=50, blank=True, default='')
     topology_synced_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

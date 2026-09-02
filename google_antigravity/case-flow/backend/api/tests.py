@@ -3068,7 +3068,7 @@ class LabPowerAndAccessTests(TestCase):
         ]}, content_type='application/json')
 
         body = self.client.get(f'/api/labs/{self.lab.id}/access/').json()
-        row = [r for r in body if r['node_name'] == 'A10_1'][0]
+        row = [r for r in body['rows'] if r['node_name'] == 'A10_1'][0]
         self.assertTrue(row['has_password'])
         self.assertNotIn('lab-secret', json.dumps(body))
         self.assertNotIn('password', row)
@@ -3345,6 +3345,108 @@ class LabCheckTests(TestCase):
             body = self.client.post(f'/api/labs/{lab.id}/check/').json()
 
         self.assertEqual(body['counts']['fail'], 0, body['results'])
+
+
+@override_settings(EVENG_URL='http://eve.test', EVENG_USER='admin', EVENG_PASSWORD='pw')
+class LabIpPlanTests(TestCase):
+    """IP 설계 — 서버 전체 기준으로 겹침을 경고한다. 막지는 않는다."""
+
+    def setUp(self):
+        from .models import Lab, LabNode, LabServer
+        from .permissions import set_user_role
+        for username, role in (('ip-e', 'engineer'), ('ip-a', 'admin')):
+            user = User.objects.create_user(username, password='ip-pass-1!')
+            set_user_role(user, role)
+        self.server = LabServer.objects.create(base_url='http://eve.test')
+        self.lab = Lab.objects.create(server=self.server, path='/a.unl', name='A')
+        self.other = Lab.objects.create(server=self.server, path='/b.unl', name='B')
+        for lab in (self.lab, self.other):
+            LabNode.objects.create(lab=lab, name='Arista_1', eve_id=1)
+
+    def login(self, username='ip-e'):
+        self.client.post('/api/auth/login/',
+                         {'username': username, 'password': 'ip-pass-1!'},
+                         content_type='application/json')
+
+    def put_access(self, lab, ip, node='Arista_1'):
+        return self.client.put(
+            f'/api/labs/{lab.id}/access/',
+            {'rows': [{'node_name': node, 'mgmt_ip': ip, 'driver': 'arista_eapi'}]},
+            content_type='application/json').json()
+
+    def test_another_lab_on_the_same_server_conflicts(self):
+        """Community에서는 랩이 pnet0을 공유한다 — 옆 랩이 쓰면 실제로 충돌한다."""
+        self.login()
+        self.put_access(self.other, '192.168.74.150')
+        body = self.put_access(self.lab, '192.168.74.150')
+
+        self.assertEqual(len(body['warnings']), 1)
+        self.assertIn('B/Arista_1', body['warnings'][0]['message'])
+
+    def test_conflicting_ip_is_warned_not_rejected(self):
+        """랩은 일부러 이상한 값을 넣어보는 곳이기도 하다 — 막지 않는다."""
+        from .models import LabNodeAccess
+        self.login()
+        self.put_access(self.other, '192.168.74.150')
+        self.put_access(self.lab, '192.168.74.150')
+
+        saved = LabNodeAccess.objects.get(lab=self.lab, node_name='Arista_1')
+        self.assertEqual(saved.mgmt_ip, '192.168.74.150')
+
+    def test_pool_outside_addresses_are_flagged(self):
+        self.login()
+        body = self.put_access(self.lab, '192.168.74.200')   # 풀에 없는 자리
+        self.assertEqual([w['message'] for w in body['warnings']],
+                         ['관리 IP 풀 밖의 주소입니다.'])
+
+    def test_pool_addresses_are_clean(self):
+        self.login()
+        body = self.put_access(self.lab, '192.168.74.139')
+        self.assertEqual(body['warnings'], [])
+
+    def test_free_list_excludes_what_is_taken(self):
+        self.login()
+        self.put_access(self.other, '192.168.74.139')
+        body = self.client.get(f'/api/labs/{self.lab.id}/access/').json()
+
+        self.assertNotIn('192.168.74.139', body['free_ips'])
+        self.assertIn('192.168.74.140', body['free_ips'])
+
+    def test_data_subnets_do_not_overlap_between_labs(self):
+        """서버를 공유하는 구조라 대역이 겹치면 트래픽이 섞인다."""
+        from .services import lab_ipplan
+        first = lab_ipplan.suggest_data_subnet(self.server)
+        self.other.data_subnet = first
+        self.other.save()
+
+        self.assertEqual(first, '172.16.0.0/24')
+        self.assertEqual(lab_ipplan.suggest_data_subnet(self.server), '172.16.1.0/24')
+
+    def test_pool_edits_are_admin_only(self):
+        url = f'/api/labs/servers/{self.server.id}/ip-pools/'
+        self.login('ip-e')
+        self.assertEqual(self.client.get(url).status_code, 200)
+        self.assertEqual(self.client.put(url, {'pools': []},
+                                         content_type='application/json').status_code, 403)
+
+        self.login('ip-a')
+        res = self.client.put(url, {'pools': [
+            {'kind': 'mgmt', 'cidr': '10.0.0.0/24', 'gateway': '10.0.0.1',
+             'ranges': ['10.0.0.5-10.0.0.6']},
+        ]}, content_type='application/json')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()['free_mgmt'], ['10.0.0.5', '10.0.0.6'])
+
+    def test_a_broken_range_does_not_kill_the_warnings(self):
+        """풀 정의가 조금 틀렸다고 경고 기능 전체가 죽으면 안 된다."""
+        from .models import LabIpPool
+        from .services import lab_ipplan
+        lab_ipplan.ensure_defaults(self.server)
+        pool = LabIpPool.objects.get(server=self.server, kind='mgmt')
+        pool.ranges = ['이건 IP가 아니다', '192.168.74.139']
+        pool.save()
+
+        self.assertEqual(lab_ipplan.free_mgmt_ips(self.server), ['192.168.74.139'])
 
 
 @override_settings(EVENG_URL='http://eve.test', EVENG_USER='admin', EVENG_PASSWORD='pw')

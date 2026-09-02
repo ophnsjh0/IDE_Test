@@ -23,6 +23,7 @@ import {
   type AvailableLab, type LabDetail, type LabNode, type LabStatus,
   type Blueprint, type CheckReport, type LabSummary, type NodeAccess,
   type NodeState, type Proposal, type Recipe, type Run,
+  type AccessPayload, type IpWarning,
 } from './types';
 
 // Step 1 — EVE-NG를 실제로 읽는다. 전원 제어와 준비 판정은 Step 2에서 붙는다.
@@ -70,6 +71,12 @@ function LabsPageInner() {
   const [accessOpen, setAccessOpen] = useState(false);
   const [access, setAccess] = useState<NodeAccess[]>([]);
   const [savingAccess, setSavingAccess] = useState(false);
+  // IP는 서버 전체 기준으로 겹친다 — 랩이 pnet0을 공유하기 때문이다.
+  // 경고는 IP를 적는 그 자리에서 보여야 고칠 수 있다.
+  const [ipWarnings, setIpWarnings] = useState<IpWarning[]>([]);
+  const [freeIps, setFreeIps] = useState<string[]>([]);
+  const [dataSubnet, setDataSubnet] = useState('');
+  const [suggestedSubnet, setSuggestedSubnet] = useState('');
 
   const [check, setCheck] = useState<CheckReport | null>(null);
   const [checking, setChecking] = useState(false);
@@ -322,17 +329,24 @@ function LabsPageInner() {
     }
   };
 
-  const openAccess = async () => {
-    if (!labId) return;
-    setAccessOpen(true);
-    const res = await apiFetch(`/api/labs/${labId}/access/`);
-    const saved: NodeAccess[] = res.ok ? await res.json() : [];
-    const byName = new Map(saved.map((a) => [a.node_name, a]));
+  const applyAccessPayload = (data: AccessPayload) => {
+    const byName = new Map((data.rows ?? []).map((a) => [a.node_name, a]));
     // 토폴로지의 모든 노드를 한 줄씩 보여준다 — 어디가 비었는지 보이는 게 목적
     setAccess(nodes.map((n) => byName.get(n.name) ?? {
       node_name: n.name, role: '', mgmt_ip: '', driver: 'none',
       username: '', has_password: false,
     }));
+    setIpWarnings(data.warnings ?? []);
+    setFreeIps(data.free_ips ?? []);
+    setDataSubnet(data.data_subnet ?? '');
+    setSuggestedSubnet(data.suggested_data_subnet ?? '');
+  };
+
+  const openAccess = async () => {
+    if (!labId) return;
+    setAccessOpen(true);
+    const res = await apiFetch(`/api/labs/${labId}/access/`);
+    if (res.ok) applyAccessPayload(await res.json());
   };
 
   const saveAccess = async () => {
@@ -342,10 +356,14 @@ function LabsPageInner() {
       const res = await apiFetch(`/api/labs/${labId}/access/`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rows: access }),
+        body: JSON.stringify({ rows: access, data_subnet: dataSubnet }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setAccessOpen(false);
+      // 저장한 값 기준으로 경고를 다시 받는다. 닫지 않는 이유: 겹치는 IP를
+      // 적었으면 그 자리에서 봐야 고친다 (저장은 막지 않는다).
+      const data: AccessPayload = await res.json();
+      applyAccessPayload(data);
+      if ((data.warnings ?? []).length === 0) setAccessOpen(false);
     } catch (e) {
       setError(`접속 정보 저장 실패: ${e instanceof Error ? e.message : e}`);
     } finally {
@@ -1080,6 +1098,33 @@ function LabsPageInner() {
               여기 적은 정보로 &ldquo;부팅이 끝났는지&rdquo;를 판정합니다.
               비워두면 그 노드는 <b>확인 불가</b>로 표시됩니다.
             </Text>
+
+            {/* 겹침은 이 랩 안이 아니라 서버 전체 기준이다 — Community에서는
+                랩들이 관리망(pnet0)을 공유해서 옆 랩이 쓰면 실제로 충돌한다.
+                막지는 않는다: 랩은 일부러 이상한 값을 넣어보는 곳이기도 하다. */}
+            {ipWarnings.length > 0 && (
+              <Alert color="orange" variant="light"
+                     icon={<IconAlertTriangle size={16} />}
+                     title="IP를 확인하세요 (저장은 됩니다)">
+                <Stack gap={2}>
+                  {ipWarnings.map((w, i) => (
+                    <Text size="xs" key={i}>
+                      <b>{w.node}</b> {w.ip} — {w.message}
+                    </Text>
+                  ))}
+                </Stack>
+              </Alert>
+            )}
+
+            <Group gap="xs" align="flex-start" wrap="nowrap">
+              <Text size="xs" c="dimmed" style={{ whiteSpace: 'nowrap', paddingTop: 3 }}>
+                비어 있는 관리 IP:
+              </Text>
+              <Text size="xs" ff="monospace" style={{ flex: 1 }}>
+                {freeIps.length > 0 ? freeIps.join(', ') : '풀에 남은 자리가 없습니다.'}
+              </Text>
+            </Group>
+
             <div style={{ overflowX: 'auto' }}>
               <Table>
                 <Table.Thead>
@@ -1131,6 +1176,22 @@ function LabsPageInner() {
                 </Table.Tbody>
               </Table>
             </div>
+            {/* 랩끼리 대역이 겹치면 서버를 공유하는 구조상 트래픽이 섞인다 */}
+            <Group gap="xs" align="flex-end">
+              <TextInput
+                size="xs" label="시험 트래픽 대역" style={{ width: 180 }}
+                placeholder={suggestedSubnet || '172.16.0.0/24'}
+                value={dataSubnet}
+                onChange={(e) => setDataSubnet(e.currentTarget.value)}
+              />
+              {suggestedSubnet && suggestedSubnet !== dataSubnet && (
+                <Button size="compact-xs" variant="subtle"
+                        onClick={() => setDataSubnet(suggestedSubnet)}>
+                  비어 있는 {suggestedSubnet} 쓰기
+                </Button>
+              )}
+            </Group>
+
             <Text size="xs" c="dimmed">
               비밀번호는 DB에 저장되고 화면으로 다시 내려오지 않습니다.
               DB 백업은 암호화되지만 DB 자체에는 평문으로 들어가므로,

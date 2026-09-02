@@ -189,3 +189,19 @@ export interface Recipe {
   source: 'run' | 'manual';
   last_run: number | null;
 }
+
+// IP 경고 — 시스템은 배정하지 않고 경고만 한다. 사람이 고른 IP를 막지 않는
+// 이유는 랩이 일부러 이상한 값을 넣어보는 곳이기도 해서다.
+export interface IpWarning {
+  node: string;
+  ip: string;
+  message: string;
+}
+
+export interface AccessPayload {
+  rows: NodeAccess[];
+  warnings: IpWarning[];
+  free_ips: string[];            // 서버 전체에서 아직 아무도 안 쓰는 관리 IP
+  data_subnet: string;           // 이 랩에 떼어 준 시험 트래픽 대역
+  suggested_data_subnet: string; // 아직 아무 랩도 안 쓰는 다음 대역
+}

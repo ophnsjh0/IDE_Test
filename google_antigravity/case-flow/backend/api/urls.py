@@ -71,6 +71,8 @@ urlpatterns = [
     path('labs/<int:id>/runs/', views.LabRunView.as_view(), name='lab-runs'),
     path('cases/<int:id>/lab-runs/', views.CaseLabRunView.as_view(),
          name='case-lab-runs'),
+    path('labs/servers/<int:server_id>/ip-pools/', views.LabIpPoolView.as_view(),
+         name='lab-ip-pools'),
     path('labs/recipes/', views.LabRecipeView.as_view(), name='lab-recipes'),
     path('labs/runs/<int:run_id>/', views.LabRunDetailView.as_view(),
          name='lab-run-detail'),

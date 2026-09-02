@@ -1140,11 +1140,27 @@ class LabAccessView(APIView):
 
     def get(self, request, id):
         from .models import Lab
-        lab = Lab.objects.filter(id=id).first()
+        lab = Lab.objects.select_related('server').filter(id=id).first()
         if lab is None:
             return Response({'error': '등록되지 않은 랩입니다.'},
                             status=status.HTTP_404_NOT_FOUND)
-        return Response(LabNodeAccessSerializer(lab.accesses.all(), many=True).data)
+        return Response(self._payload(lab))
+
+    def _payload(self, lab):
+        """접속 정보 + IP 경고. 화면이 IP를 적는 그 자리에서 바로 보여줘야
+        고칠 수 있어서 한 응답에 같이 낸다."""
+        from .services import lab_ipplan
+        rows = list(lab.accesses.all())
+        return {
+            'rows': LabNodeAccessSerializer(rows, many=True).data,
+            'warnings': lab_ipplan.check_assignments(
+                lab, [{'node_name': a.node_name, 'mgmt_ip': a.mgmt_ip}
+                      for a in rows]),
+            # 사람이 고르는 방식이라, 뭘 고를 수 있는지는 보여준다
+            'free_ips': lab_ipplan.free_mgmt_ips(lab.server),
+            'data_subnet': lab.data_subnet,
+            'suggested_data_subnet': lab_ipplan.suggest_data_subnet(lab.server, lab),
+        }
 
     def put(self, request, id):
         from .models import Lab, LabNodeAccess
@@ -1175,7 +1191,13 @@ class LabAccessView(APIView):
                 if row.get('password'):
                     access.password = row['password'][:200]
                 access.save()
-        return Response(LabNodeAccessSerializer(lab.accesses.all(), many=True).data)
+            # 시험 트래픽 대역도 여기서 같이 받는다 — 사람이 IP를 정하는
+            # 자리가 한 군데여야 어디서 뭘 바꿨는지 헷갈리지 않는다.
+            # 목록만 보낸 예전 형식에는 이 값이 없으므로 건드리지 않는다.
+            if isinstance(request.data, dict) and 'data_subnet' in request.data:
+                lab.data_subnet = (request.data.get('data_subnet') or '').strip()[:50]
+                lab.save(update_fields=['data_subnet'])
+        return Response(self._payload(lab))
 
 
 class LabStatusView(APIView):
@@ -1454,6 +1476,65 @@ class LabRunDetailView(APIView):
             return Response({'error': '없는 실행입니다.'},
                             status=status.HTTP_404_NOT_FOUND)
         return Response(_run_payload(run))
+
+
+class LabIpPoolView(APIView):
+    """GET/PUT /api/labs/servers/<server_id>/ip-pools/ — IP 대역 정의.
+
+    **랩이 아니라 서버 밑에 있다.** Community에서는 랩이 한 서버에 평면으로
+    놓이고 관리망(pnet0)을 공유해서, 옆 랩이 쓰는 IP는 이 랩이 못 쓴다.
+    풀을 랩마다 두면 같은 얘기를 랩 수만큼 적게 되고 곧 서로 어긋난다.
+
+    수정은 관리자만. 여기를 잘못 고치면 모든 랩의 IP 경고가 함께 틀어진다.
+    """
+
+    def get_permissions(self):
+        if self.request.method == 'PUT':
+            return [IsAdminRole()]
+        return [IsEngineerOrAbove()]
+
+    def get(self, request, server_id):
+        from .models import LabServer
+        from .services import lab_ipplan
+        server = LabServer.objects.filter(id=server_id).first()
+        if server is None:
+            return Response({'error': '없는 랩 서버입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        pools = lab_ipplan.ensure_defaults(server)
+        return Response({
+            'server': server.base_url,
+            'pools': [lab_ipplan.to_dict(p) for p in pools.values()],
+            'free_mgmt': lab_ipplan.free_mgmt_ips(server, limit=50),
+            # 어느 랩이 어느 대역을 쓰고 있는지 — 겹침을 눈으로 확인하는 자리
+            'lab_subnets': [{'lab': l.name, 'subnet': l.data_subnet}
+                            for l in server.labs.exclude(data_subnet='')],
+        })
+
+    def put(self, request, server_id):
+        from .models import LabIpPool, LabServer
+        from .services import lab_ipplan
+        server = LabServer.objects.filter(id=server_id).first()
+        if server is None:
+            return Response({'error': '없는 랩 서버입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        lab_ipplan.ensure_defaults(server)
+        for row in request.data.get('pools') or []:
+            kind = row.get('kind')
+            if kind not in dict(LabIpPool.KIND_CHOICES):
+                continue
+            pool = LabIpPool.objects.get(server=server, kind=kind)
+            pool.cidr = (row.get('cidr') or '').strip()[:50]
+            pool.gateway = (row.get('gateway') or '').strip()[:50]
+            # 문자열 목록만 받는다 — 화면이 줄 단위로 보내는 형식이다
+            pool.ranges = [str(r).strip() for r in (row.get('ranges') or [])
+                           if str(r).strip()]
+            try:
+                pool.lab_prefix = int(row.get('lab_prefix') or pool.lab_prefix)
+            except (TypeError, ValueError):
+                pass
+            pool.note = (row.get('note') or '').strip()[:200]
+            pool.save()
+        return self.get(request, server_id)
 
 
 class LabRecipeView(APIView):
