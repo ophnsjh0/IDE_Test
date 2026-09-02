@@ -1,8 +1,9 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import {
-  ActionIcon, Alert, AppShell, Badge, Button, Card, Divider, Group, Loader,
+  ActionIcon, Alert, AppShell, Badge, Button, Card, Center, Divider, Group, Loader,
   Menu, Modal, Paper,
   ScrollArea, Select, Stack, Table, Text, Textarea, TextInput, Title, Tooltip,
 } from '@mantine/core';
@@ -11,6 +12,7 @@ import {
   IconPlayerPlay, IconPlayerStop,
   IconKey, IconListCheck, IconRefresh, IconSend, IconServerOff,
   IconArrowBackUp, IconPlayerTrackNext, IconTerminal2, IconTrash, IconX,
+  IconExternalLink,
 } from '@tabler/icons-react';
 import AppHeader from '../components/AppHeader';
 import { apiFetch } from '../lib/api';
@@ -45,8 +47,10 @@ const STEPS = [
   { label: '롤백', hint: '적용 원장 역순' },
 ];
 
-export default function LabsPage() {
+function LabsPageInner() {
   const { isAdmin } = useMe();
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const [eveng, setEveng] = useState<{ configured: boolean; server: string } | null>(null);
   const [labs, setLabs] = useState<LabSummary[]>([]);
   const [labId, setLabId] = useState<string | null>(null);
@@ -72,6 +76,10 @@ export default function LabsPage() {
   const [blueprints, setBlueprints] = useState<Blueprint[]>([]);
   const [run, setRun] = useState<Run | null>(null);
   const [running, setRunning] = useState(false);
+  // 이 실행이 무엇을 재현하려는 것인지. 비워두면 그냥 랩 테스트다 —
+  // 채우면 결과가 케이스 이력과 지식으로 돌아간다.
+  const [runCase, setRunCase] = useState<string | null>(null);
+  const [cases, setCases] = useState<{ value: string; label: string }[] | null>(null);
 
   type ChatMsg = { role: 'user' | 'assistant'; text: string; proposals?: Proposal[] };
   const [chat, setChat] = useState<ChatMsg[]>([]);
@@ -105,7 +113,10 @@ export default function LabsPage() {
     setLoading(true);
     setSelected(null);
     setCheck(null);   // 이전 랩의 결과가 남아 있으면 오해한다
-    setRun(null);
+    // 다른 랩의 실행 결과는 지운다. 같은 랩이면 남긴다 — 지식·케이스에서
+    // 실행 하나를 딥링크로 열면 labId가 뒤늦게 잡히는데, 무조건 지우면
+    // 열자마자 사라진다.
+    setRun((prev) => (prev && String(prev.lab.id) === labId ? prev : null));
     apiFetch(`/api/labs/${labId}/blueprints/`)
       .then((r) => (r.ok ? r.json() : []))
       .then(setBlueprints)
@@ -197,6 +208,41 @@ export default function LabsPage() {
     }
   };
 
+  // 케이스 목록은 드롭다운을 열 때 한 번만 받는다 — 랩 화면에 들어올 때마다
+  // 전체 케이스를 끌어오면 쓰지도 않을 목록에 매번 값을 치른다.
+  const loadCases = useCallback(async () => {
+    if (cases !== null) return;
+    try {
+      const res = await apiFetch('/api/cases/');
+      const data = res.ok ? await res.json() : [];
+      setCases(data.map((c: { id: number; case_id: string; summary: string }) => ({
+        value: String(c.id), label: `${c.case_id} · ${c.summary}`,
+      })));
+    } catch {
+      setCases([]);
+    }
+  }, [cases]);
+
+  // 케이스 화면의 "랩에서 재현"으로 들어온 경우 재현 대상을 미리 잡아둔다
+  useEffect(() => {
+    const fromCase = searchParams.get('case');
+    if (fromCase) { setRunCase(fromCase); loadCases(); }
+  }, [searchParams, loadCases]);
+
+  // 지식·케이스에서 "이 실행 보기"로 들어온 경우 그 실행을 연다
+  useEffect(() => {
+    const runId = searchParams.get('run');
+    if (!runId) return;
+    apiFetch(`/api/labs/runs/${runId}/`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: Run | null) => {
+        if (!data) return;
+        setLabId(String(data.lab.id));
+        setRun(data);
+      })
+      .catch(() => {});
+  }, [searchParams]);
+
   const startRun = async (blueprintId: number) => {
     setRunning(true);
     setError('');
@@ -204,7 +250,10 @@ export default function LabsPage() {
       const res = await apiFetch(`/api/labs/${labId}/runs/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ blueprint: blueprintId }),
+        body: JSON.stringify({
+          blueprint: blueprintId,
+          ...(runCase ? { case: Number(runCase) } : {}),
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
@@ -621,6 +670,16 @@ export default function LabsPage() {
                           : run.status === 'rolled_back' ? '롤백됨' : '오류'}
                       </Badge>
                       <Text size="xs" c="dimmed">#{run.id} {run.blueprint}</Text>
+                      {/* 무엇을 재현한 실행인지. 케이스가 지워졌으면 나오지 않는다 */}
+                      {run.case && (
+                        <Button
+                          size="compact-xs" variant="subtle"
+                          rightSection={<IconExternalLink size={12} />}
+                          onClick={() => router.push(`/cases/${run.case!.id}`)}
+                        >
+                          {run.case.case_id}
+                        </Button>
+                      )}
                     </Group>
                     <Group gap="xs">
                       {/* 되돌리지 않은 것이 장비에 남아 있으면 눈에 띄게 알린다 */}
@@ -733,6 +792,17 @@ export default function LabsPage() {
                 <>
                   <Divider my="sm" />
                   <Text size="xs" fw={700} c="dimmed" mb={6}>테스트 시나리오</Text>
+                  {/* 무엇을 재현하려는 실행인지 남긴다. 비워두면 그냥 랩 테스트고,
+                      채우면 결과가 그 케이스의 이력과 지식으로 돌아간다. */}
+                  <Select
+                    size="xs" mb={8} clearable searchable
+                    placeholder="재현할 케이스 (선택)"
+                    data={cases ?? []}
+                    value={runCase}
+                    onChange={setRunCase}
+                    onDropdownOpen={loadCases}
+                    nothingFoundMessage={cases === null ? '불러오는 중…' : '케이스 없음'}
+                  />
                   <Stack gap={6}>
                     {blueprints.map((bp) => (
                       <Group key={bp.id} justify="space-between" gap="xs" wrap="nowrap">
@@ -1007,5 +1077,15 @@ export default function LabsPage() {
         </Modal>
       </AppShell.Main>
     </AppShell>
+  );
+}
+
+// useSearchParams는 Suspense 경계 안에서만 쓸 수 있다 (지식·케이스에서
+// /labs?case=…, /labs?run=… 으로 건너오는 링크를 받기 위해 필요하다).
+export default function LabsPage() {
+  return (
+    <Suspense fallback={<Center h="100vh"><Loader /></Center>}>
+      <LabsPageInner />
+    </Suspense>
   );
 }

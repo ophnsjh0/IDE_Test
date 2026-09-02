@@ -1328,8 +1328,13 @@ class LabBlueprintView(APIView):
 def _run_payload(run):
     return {
         'id': run.id,
+        'lab': {'id': run.lab_id, 'name': run.lab.name},
         'blueprint': run.blueprint.name,
         'status': run.status,
+        # 무엇을 재현하려던 실행인가. 케이스가 지워졌으면 None이 된다.
+        'case': ({'id': run.case.id, 'case_id': run.case.case_id,
+                  'summary': run.case.summary, 'vendor': run.case.vendor}
+                 if run.case else None),
         'started_at': run.started_at,
         'finished_at': run.finished_at,
         'topology_synced_at': run.topology_synced_at,
@@ -1352,11 +1357,12 @@ class LabRunView(APIView):
     def get(self, request, id):
         from .models import LabRun
         runs = (LabRun.objects.filter(lab_id=id)
-                .select_related('blueprint').prefetch_related('steps', 'applied')[:20])
+                .select_related('blueprint', 'lab', 'case')
+                .prefetch_related('steps', 'applied')[:20])
         return Response([_run_payload(r) for r in runs])
 
     def post(self, request, id):
-        from .models import Lab, LabBlueprint, LabRun
+        from .models import Case, Lab, LabBlueprint, LabRun
         lab = Lab.objects.filter(id=id).first()
         if lab is None:
             return Response({'error': '등록되지 않은 랩입니다.'},
@@ -1365,14 +1371,62 @@ class LabRunView(APIView):
         if bp is None:
             return Response({'error': '이 랩의 시나리오가 아닙니다.'},
                             status=status.HTTP_400_BAD_REQUEST)
+        # 케이스 재현으로 시작한 실행이면 어느 케이스인지 남긴다 (선택).
+        # 없는 케이스 번호가 오면 조용히 무시하지 않고 거절한다 — 연결됐다고
+        # 믿고 돌렸는데 기록이 안 남으면 나중에 결과를 케이스로 못 돌린다.
+        case = None
+        if request.data.get('case') is not None:
+            case = Case.objects.filter(id=request.data.get('case')).first()
+            if case is None:
+                return Response({'error': '없는 케이스입니다.'},
+                                status=status.HTTP_400_BAD_REQUEST)
 
         run = LabRun.objects.create(
-            blueprint=bp, lab=lab, started_by=request.user,
+            blueprint=bp, lab=lab, case=case, started_by=request.user,
             # 어떤 배선 상태에서 돌린 결과인지 나중에 답할 수 있게 남긴다
             topology_synced_at=lab.topology_synced_at)
         lab_runner.execute(run, auto_rollback=request.data.get('rollback', True))
         run.refresh_from_db()
         return Response(_run_payload(run), status=status.HTTP_201_CREATED)
+
+
+class CaseLabRunView(APIView):
+    """GET /api/cases/<id>/lab-runs/ — 이 케이스를 재현한 랩 실행들.
+
+    시작은 여기서 하지 않는다. 케이스 화면의 "랩에서 재현"은 랩 화면으로
+    건너가기만 한다 — 랩을 돌리려면 노드가 켜져 있고 준비됐는지부터 봐야
+    하는데 그 판정은 랩 화면에만 있다. 실행 경로를 두 벌로 만들지 않는다.
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    def get(self, request, id):
+        from .models import Case, LabRun
+        case = Case.objects.filter(id=id).first()
+        if case is None:
+            return Response({'error': '없는 케이스입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        runs = (LabRun.objects.filter(case=case)
+                .select_related('blueprint', 'lab', 'case')
+                .prefetch_related('steps', 'applied')[:20])
+        return Response({'runs': [_run_payload(r) for r in runs]})
+
+
+class LabRunDetailView(APIView):
+    """GET /api/labs/runs/<run_id>/ — 실행 1건.
+
+    지식·케이스 화면이 "이 결과가 나온 실행"으로 건너뛸 수 있어야 해서 둔다.
+    랩 화면을 거치지 않고 실행 하나만 집어 올 수 있는 유일한 경로다.
+    """
+    permission_classes = [IsEngineerOrAbove]
+
+    def get(self, request, run_id):
+        from .models import LabRun
+        run = (LabRun.objects.select_related('blueprint', 'lab', 'case')
+               .prefetch_related('steps', 'applied').filter(id=run_id).first())
+        if run is None:
+            return Response({'error': '없는 실행입니다.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        return Response(_run_payload(run))
 
 
 class LabRollbackView(APIView):

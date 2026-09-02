@@ -128,8 +128,18 @@ export interface RunStep {
   detail: string;
 }
 
+export interface RunCase {
+  id: number;
+  case_id: string;         // C-1001
+  summary: string;
+  vendor: string;
+}
+
 export interface Run {
   id: number;
+  lab: { id: number; name: string };
+  // 무엇을 재현하려던 실행인가. 케이스가 지워졌으면 null이 된다.
+  case: RunCase | null;
   blueprint: string;
   status: 'running' | 'passed' | 'failed' | 'rolled_back' | 'error';
   started_at: string;

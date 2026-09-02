@@ -29,6 +29,8 @@ import {
   IconMailUp,
   IconLanguage,
   IconBulb,
+  IconFlask,
+  IconExternalLink,
   IconTrash,
 } from '@tabler/icons-react'; // IconDeviceFloppy for Save
 import ScrollToTopButton from '../../components/ScrollToTopButton';
@@ -59,6 +61,15 @@ interface RelatedCase {
   status: string;
   summary: string;
   vendor_case_number: string | null;
+}
+
+// 랩 실행 요약 — /api/cases/<id>/lab-runs/ 가 주는 모양 (랩 화면의 Run과 같은 payload)
+interface LabRunSummary {
+  id: number;
+  lab: { id: number; name: string };
+  blueprint: string;
+  status: string;
+  started_at: string;
 }
 
 interface CaseDetail {
@@ -95,6 +106,9 @@ export default function CaseDetailPage() {
   const { canWrite, isAdmin } = useMe();
   const [extracting, setExtracting] = useState(false);
   const [extractResult, setExtractResult] = useState<{ ok: boolean; text: string } | null>(null);
+  // 이 케이스를 랩에서 재현한 기록. 엔지니어 이상만 볼 수 있는 API라
+  // canWrite일 때만 부른다 (뷰어에게 403이 나가지 않게).
+  const [labRuns, setLabRuns] = useState<LabRunSummary[]>([]);
 
   // 케이스에서 재사용 지식을 뽑아 지식 베이스에 draft로 등록한다.
   // 케이스가 해결되기 전이라도 벤더 확답 같은 건 남길 가치가 있어 상태와 무관하게 동작한다.
@@ -158,6 +172,14 @@ export default function CaseDetailPage() {
     if (id) loadCase();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  useEffect(() => {
+    if (!id || !canWrite) return;
+    apiFetch(`/api/cases/${id}/lab-runs/`)
+      .then((res) => (res.ok ? res.json() : { runs: [] }))
+      .then((data) => setLabRuns(data.runs ?? []))
+      .catch(() => setLabRuns([]));
+  }, [id, canWrite]);
 
   const [relationInput, setRelationInput] = useState('');
   const [relationError, setRelationError] = useState('');
@@ -495,6 +517,57 @@ export default function CaseDetailPage() {
               </Group>
             )}
           </Paper>
+
+          {/* 랩 재현 — 이 케이스를 우리 장비에서 실제로 돌려본 기록.
+              시작은 랩 화면에서 한다(노드가 준비됐는지 판정이 거기 있다). */}
+          {canWrite && (
+            <Paper shadow="xs" p="xl" withBorder mt="lg">
+              <Group justify="space-between" mb="md">
+                <Title order={3}>랩 재현 ({labRuns.length})</Title>
+                <Button
+                  size="xs"
+                  variant="light"
+                  color="teal"
+                  leftSection={<IconFlask size={14} />}
+                  onClick={() => router.push(`/labs?case=${caseDetail.id}`)}
+                >
+                  랩에서 재현
+                </Button>
+              </Group>
+              <Stack gap="xs">
+                {labRuns.map((r) => (
+                  <Group key={r.id} justify="space-between" wrap="nowrap">
+                    <Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
+                      <Badge color={r.status === 'passed' ? 'teal'
+                        : r.status === 'rolled_back' ? 'gray' : 'red'} variant="light">
+                        {r.status === 'passed' ? '통과'
+                          : r.status === 'failed' ? '실패'
+                          : r.status === 'rolled_back' ? '롤백됨'
+                          : r.status === 'running' ? '진행 중' : '오류'}
+                      </Badge>
+                      <Text size="sm" lineClamp={1}>{r.lab.name} · {r.blueprint}</Text>
+                      <Text size="xs" c="dimmed" style={{ whiteSpace: 'nowrap' }}>
+                        {r.started_at.slice(0, 10)}
+                      </Text>
+                    </Group>
+                    <Button
+                      size="compact-xs" variant="subtle"
+                      rightSection={<IconExternalLink size={12} />}
+                      onClick={() => router.push(`/labs?run=${r.id}`)}
+                    >
+                      결과 보기
+                    </Button>
+                  </Group>
+                ))}
+                {labRuns.length === 0 && (
+                  <Text c="dimmed" size="sm">
+                    아직 랩에서 재현한 기록이 없습니다. 랩에서 돌려보면 결과가 여기 쌓이고,
+                    거기서 지식으로 저장할 수 있습니다.
+                  </Text>
+                )}
+              </Stack>
+            </Paper>
+          )}
 
           {caseDetail.emails && caseDetail.emails.length > 0 && (
             <Paper shadow="xs" p="xl" withBorder mt="lg">

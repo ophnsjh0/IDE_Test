@@ -3399,6 +3399,45 @@ class LabRunnerTests(TestCase):
                          ['precheck', 'apply', 'verify', 'rollback'])
         self.assertEqual(body['pending_rollback'], 0)
 
+    def test_run_records_the_case_it_reproduces(self):
+        """무엇을 재현하려던 실행인지 남아야 결과가 케이스로 돌아간다."""
+        case = make_case(vendor='Arista', summary='포트 설명이 사라짐')
+        self.login()
+        with patch('api.services.lab_runner.get_driver', return_value=self.fake_driver()):
+            body = self.client.post(f'/api/labs/{self.lab.id}/runs/',
+                                    {'blueprint': self.bp.id, 'case': case.id},
+                                    content_type='application/json').json()
+        self.assertEqual(body['case']['case_id'], case.case_id)
+
+        # 케이스 화면에서도 같은 실행이 보인다
+        runs = self.client.get(f'/api/cases/{case.id}/lab-runs/').json()['runs']
+        self.assertEqual([r['id'] for r in runs], [body['id']])
+
+        # 실행 하나만 집어 올 수 있다 (지식·케이스가 결과로 건너뛰는 경로)
+        one = self.client.get(f"/api/labs/runs/{body['id']}/").json()
+        self.assertEqual(one['lab']['id'], self.lab.id)
+
+    def test_unknown_case_is_rejected_not_ignored(self):
+        """연결됐다고 믿고 돌렸는데 기록이 안 남으면 결과를 케이스로 못 돌린다."""
+        self.login()
+        with patch('api.services.lab_runner.get_driver', return_value=self.fake_driver()):
+            res = self.client.post(f'/api/labs/{self.lab.id}/runs/',
+                                   {'blueprint': self.bp.id, 'case': 99999},
+                                   content_type='application/json')
+        self.assertEqual(res.status_code, 400)
+
+    def test_run_survives_the_case_being_deleted(self):
+        case = make_case(vendor='Arista', summary='지워질 케이스')
+        self.login()
+        with patch('api.services.lab_runner.get_driver', return_value=self.fake_driver()):
+            run_id = self.client.post(f'/api/labs/{self.lab.id}/runs/',
+                                      {'blueprint': self.bp.id, 'case': case.id},
+                                      content_type='application/json').json()['id']
+        case.delete()
+        body = self.client.get(f'/api/labs/runs/{run_id}/').json()
+        self.assertIsNone(body['case'])
+        self.assertEqual(body['status'], 'passed')   # 실행 기록 자체는 남는다
+
     def test_ledger_is_written_before_the_command_is_sent(self):
         """명령을 보낸 뒤에 기록하면, 중간에 죽었을 때 장비에는 들어갔는데
         원장에는 없는 찌꺼기가 남는다."""

@@ -534,6 +534,12 @@ class LabRun(models.Model):
     blueprint = models.ForeignKey(LabBlueprint, on_delete=models.CASCADE,
                                   related_name='runs')
     lab = models.ForeignKey(Lab, on_delete=models.CASCADE, related_name='runs')
+    # 이 실행이 어떤 케이스를 재현하려던 것인가. 랩을 돌리는 이유가 대개
+    # "그 케이스가 우리 장비에서도 그러는지 보려고"라서, 이 연결이 있어야
+    # 실행 결과가 케이스 이력으로 돌아가고 지식으로도 흘러간다.
+    # 케이스가 지워져도 실행 기록 자체는 남아야 하므로 SET_NULL.
+    case = models.ForeignKey(Case, null=True, blank=True, on_delete=models.SET_NULL,
+                             related_name='lab_runs')
     started_by = models.ForeignKey(django_settings.AUTH_USER_MODEL, null=True,
                                    blank=True, on_delete=models.SET_NULL)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='running')
