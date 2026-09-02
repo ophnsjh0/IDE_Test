@@ -25,7 +25,8 @@ from .models import AppSetting, Case, ChatSession, ChatTurn, KnowledgeItem, Usag
 from .permissions import IsAdminRole, IsEngineerOrAbove
 from .serializers import (CaseSerializer, CaseDetailSerializer,
                           ChatSessionDetailSerializer, ChatSessionSerializer,
-                          KnowledgeItemSerializer, LabDetailSerializer,
+                          KnowledgeCreateSerializer, KnowledgeItemSerializer,
+                          LabDetailSerializer,
                           LabNodeAccessSerializer, LabSerializer)
 from .services.usage import log_event
 from .services.analyzer import (
@@ -144,17 +145,43 @@ class CaseRelationView(APIView):
         return Response({'message': f'{other.case_id} 참조가 해제되었습니다.'})
 
 
-class KnowledgeListView(generics.ListAPIView):
-    """GET /api/knowledge/ — 지식 베이스 목록 (전 역할 조회).
+class KnowledgeListView(generics.ListCreateAPIView):
+    """GET/POST /api/knowledge/ — 지식 베이스 목록(전 역할) · 직접 작성(엔지니어 이상).
 
-    항목 생성은 extract_knowledge 커맨드(AI 추출)로만 이루어진다.
+    직접 작성이 필요한 자리: 랩에서 재현이 실패했을 때. 실패도 값진 기록이지만
+    왜 안 됐는지는 실행 기록에 남지 않고 돌려본 사람 머릿속에 있어서, AI 추출
+    경로로는 담을 수 없다.
+
+    직접 작성도 draft로 시작한다 — 쓴 사람이 바로 확정을 누를 수 있지만,
+    "누군가 확인했다"는 표시를 글쓰기와 같은 동작으로 만들지는 않는다.
     """
     queryset = KnowledgeItem.objects.select_related('case')
     serializer_class = KnowledgeItemSerializer
 
+    def get_permissions(self):
+        if self.request.method == 'POST':
+            return [IsEngineerOrAbove()]
+        return super().get_permissions()
+
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return KnowledgeCreateSerializer
+        return KnowledgeItemSerializer
+
     def get(self, request, *args, **kwargs):
         log_event(request.user, 'knowledge_view', detail='list')
         return super().get(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        # 출처와 작성자는 요청이 아니라 경로가 정한다
+        serializer.save(source='manual', created_by=self.request.user)
+
+    def create(self, request, *args, **kwargs):
+        response = super().create(request, *args, **kwargs)
+        # 목록·상세와 같은 모양으로 돌려준다 (작성 후 바로 상세로 보내기 위해)
+        item = KnowledgeItem.objects.get(id=response.data['id'])
+        response.data = KnowledgeItemSerializer(item).data
+        return response
 
 
 class KnowledgeDetailView(generics.RetrieveUpdateDestroyAPIView):

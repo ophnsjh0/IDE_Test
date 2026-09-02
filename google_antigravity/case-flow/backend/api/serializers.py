@@ -36,6 +36,7 @@ class KnowledgeItemSerializer(serializers.ModelSerializer):
     source_case = serializers.SerializerMethodField()
     source_session = serializers.SerializerMethodField()
     source_run = serializers.SerializerMethodField()
+    author = serializers.SerializerMethodField()
 
     def get_source_case(self, obj):
         if obj.case is None:
@@ -50,6 +51,10 @@ class KnowledgeItemSerializer(serializers.ModelSerializer):
             return None
         return {'id': obj.chat_session.id, 'title': obj.chat_session.title}
 
+    def get_author(self, obj):
+        # 직접 작성 항목에서 "누가 썼나"는 근거의 일부다
+        return obj.created_by.username if obj.created_by else None
+
     def get_source_run(self, obj):
         if obj.lab_run is None:
             return None
@@ -63,9 +68,31 @@ class KnowledgeItemSerializer(serializers.ModelSerializer):
                   'diagnosis', 'root_cause', 'resolution', 'verification', 'caveats',
                   'related_refs', 'device_model', 'software_version', 'status',
                   'analyzed_by', 'references', 'source', 'source_case',
-                  'source_session', 'source_run', 'created_at', 'updated_at']
+                  'source_session', 'source_run', 'author',
+                  'created_at', 'updated_at']
         # source는 출처 서열이라 사람이 고쳐 쓰면 안 된다 — 만든 경로가 정한다
         read_only_fields = ['vendor', 'analyzed_by', 'references', 'source']
+
+
+class KnowledgeCreateSerializer(serializers.ModelSerializer):
+    """직접 작성 전용.
+
+    본 시리얼라이저와 갈라둔 이유는 vendor 때문이다. 추출된 지식은 벤더가
+    출처에서 정해지므로 읽기 전용이지만, 직접 작성은 사람이 골라야 한다.
+    source·created_by는 뷰가 채운다 — 사람이 출처를 '벤더 케이스'라고
+    적어 넣을 수 있으면 신뢰도 서열이 무너진다.
+    """
+
+    class Meta:
+        model = KnowledgeItem
+        fields = ['id', 'vendor', 'title', 'environment', 'problem', 'diagnosis',
+                  'root_cause', 'resolution', 'verification', 'caveats',
+                  'related_refs', 'device_model', 'software_version']
+
+    def validate_title(self, value):
+        if not value.strip():
+            raise serializers.ValidationError('제목이 필요합니다.')
+        return value.strip()
 
 
 class ChatTurnSerializer(serializers.ModelSerializer):

@@ -190,6 +190,11 @@ class KnowledgeItem(models.Model):
                                 related_name='knowledge_items')
     source = models.CharField(max_length=10, choices=SOURCE_CHOICES,
                               blank=True, default='')
+    # 직접 작성한 사람. AI가 만든 항목에는 없다 — 손으로 쓴 지식은 "누가 썼나"가
+    # 근거의 일부라서, 계정이 지워져도 항목은 남도록 SET_NULL.
+    created_by = models.ForeignKey(django_settings.AUTH_USER_MODEL, null=True,
+                                   blank=True, on_delete=models.SET_NULL,
+                                   related_name='knowledge_items')
     vendor = models.CharField(max_length=50, choices=Case.VENDOR_CHOICES)
     title = models.CharField(max_length=200)          # 문제 한 줄 요약 (목록 표시용)
     # 본문 8칸. 처음엔 케이스 분석 스키마(문제-원인-해결)를 그대로 썼는데, 그쪽은

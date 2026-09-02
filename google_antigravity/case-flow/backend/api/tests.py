@@ -3973,6 +3973,46 @@ class KnowledgeBaseTests(TestCase):
         mocked.assert_not_called()  # 기존 항목이 있으면 AI 호출 자체를 안 함
         self.assertEqual((outcome, item), ('exists', existing))
 
+    def test_direct_authoring_is_engineer_only_and_marked_manual(self):
+        """직접 작성 — AI가 뽑지 못하는 것(랩에서 안 되더라 등)을 남기는 자리."""
+        from .models import KnowledgeItem
+        body = {'vendor': 'Arista', 'title': '이 방법으로는 안 됩니다',
+                'problem': 'BGP가 안 붙습니다.',
+                'resolution': '이 랩 버전에서는 해당 명령이 없습니다.'}
+
+        self.login('kv1')   # viewer는 쓸 수 없다
+        self.assertEqual(
+            self.client.post('/api/knowledge/', body,
+                             content_type='application/json').status_code, 403)
+
+        self.login('ke1')
+        res = self.client.post('/api/knowledge/', body, content_type='application/json')
+        self.assertEqual(res.status_code, 201)
+        item = KnowledgeItem.objects.get(id=res.json()['id'])
+        self.assertEqual(item.source, 'manual')
+        self.assertEqual(item.created_by.username, 'ke1')
+        self.assertEqual(item.status, 'draft')   # 쓴 사람이 따로 확정한다
+        self.assertEqual(item.vendor, 'Arista')  # 직접 작성은 벤더를 사람이 고른다
+
+    def test_authoring_cannot_forge_a_stronger_source(self):
+        """source를 요청으로 정할 수 있으면 신뢰도 서열이 무너진다."""
+        from .models import KnowledgeItem
+        self.login('ke1')
+        res = self.client.post('/api/knowledge/',
+                               {'vendor': 'A10', 'title': 't', 'problem': 'p',
+                                'resolution': 'r', 'source': 'case'},
+                               content_type='application/json')
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(KnowledgeItem.objects.get(id=res.json()['id']).source, 'manual')
+
+    def test_authoring_requires_problem_and_resolution(self):
+        """이 두 칸이 없으면 지식이 아니라 메모다."""
+        self.login('ke1')
+        res = self.client.post('/api/knowledge/',
+                               {'vendor': 'A10', 'title': '제목만 있음'},
+                               content_type='application/json')
+        self.assertEqual(res.status_code, 400)
+
     def test_api_roles_and_confirm_flow(self):
         item = self.make_item()
         url = f'/api/knowledge/{item.id}/'

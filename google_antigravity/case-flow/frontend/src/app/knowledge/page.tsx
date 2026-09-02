@@ -28,12 +28,14 @@ import {
   IconSelector,
   IconDatabaseImport,
   IconSparkles,
+  IconPlus,
 } from '@tabler/icons-react';
 import AppHeader from '../components/AppHeader';
 import ScrollToTopButton from '../components/ScrollToTopButton';
 import { apiFetch } from '../lib/api';
 import { useMe } from '../lib/useMe';
 import { SOURCE_COLOR, SOURCE_SHORT, sourceOf } from './source';
+import NewKnowledgeModal from './NewKnowledgeModal';
 
 // 모델 id -> 화면 표기. 지식 추출 선택지는 서버(analyzer.KNOWLEDGE_MODELS)와 맞춘다.
 const MODEL_LABELS: Record<string, string> = {
@@ -59,6 +61,7 @@ interface KnowledgeItem {
   status: string; // draft | confirmed
   analyzed_by: string;
   source: string; // case | lab | chat | manual | '' (불명)
+  author: string | null;   // 직접 작성한 사람 (AI 추출 항목은 null)
   source_case: { id: number; case_id: string; status: string; vendor_case_number: string | null } | null;
   source_session: { id: number; title: string } | null;
   source_run: { id: number; lab: string; blueprint: string; status: string } | null;
@@ -134,7 +137,8 @@ function KnowledgeListPage() {
   const [syncing, setSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState('');
   const [knowledgeModel, setKnowledgeModel] = useState<string | null>(null);
-  const { isAdmin } = useMe();
+  const { isAdmin, canWrite } = useMe();
+  const [writeOpen, setWriteOpen] = useState(false);
   const router = useRouter();
 
   // 지식 추출 전용 모델(메일 분석 모델과 별개). 여기서는 표시만 하고,
@@ -309,7 +313,8 @@ function KnowledgeListPage() {
       </Table.Td>
       <Table.Td style={{ whiteSpace: 'nowrap' }}>
         <Badge color={getKnowledgeStatusColor(element.status)} variant="dot">
-          {element.status === 'confirmed' ? '확정' : 'AI 초안'}
+          {element.status === 'confirmed' ? '확정'
+            : sourceOf(element) === 'manual' ? '작성 초안' : 'AI 초안'}
         </Badge>
       </Table.Td>
       <Table.Td style={{ wordBreak: 'break-word' }}>{element.title}</Table.Td>
@@ -354,9 +359,17 @@ function KnowledgeListPage() {
           <Group justify="space-between" mb="lg">
             <div>
               <Title order={2}>Knowledge Base</Title>
-              <Text c="dimmed">해결된 케이스에서 추출한 문제-원인-해결 지식</Text>
+              <Text c="dimmed">케이스·랩 재현·대화에서 모은 문제-원인-해결 지식</Text>
             </div>
             <Group gap="xs">
+              {/* AI가 뽑지 못하는 것을 남기는 자리 — 랩에서 안 되더라고 확인한 것,
+                  문서에 없는 제약 같은 것 */}
+              {canWrite && (
+                <Button variant="light" leftSection={<IconPlus size={16} />}
+                        onClick={() => setWriteOpen(true)}>
+                  직접 작성
+                </Button>
+              )}
               {/* 여기 있던 모델 셀렉터는 '메일 분석' 전역 설정이었다 — 지식 화면에서
                   바꾸면 메일 동기화 모델까지 바뀌어 오해를 샀다. 지식 추출 모델은
                   관리자 페이지에서 바꾸고, 여기서는 무엇으로 뽑는지만 보여준다. */}
@@ -471,7 +484,7 @@ function KnowledgeListPage() {
                 >
                   {[
                     { value: 'all', label: 'All Status' },
-                    { value: 'draft', label: 'AI 초안' },
+                    { value: 'draft', label: '초안' },
                     { value: 'confirmed', label: '확정' },
                   ].map((s) => {
                     const active = statusTab === s.value;
@@ -588,6 +601,12 @@ function KnowledgeListPage() {
             )}
           </Paper>
         </Container>
+
+        <NewKnowledgeModal
+          opened={writeOpen}
+          onClose={() => setWriteOpen(false)}
+          onCreated={(id) => { setWriteOpen(false); router.push(`/knowledge/${id}`); }}
+        />
 
         <ScrollToTopButton />
       </AppShell.Main>

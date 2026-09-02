@@ -33,6 +33,7 @@ import AppHeader from '../../components/AppHeader';
 import { apiFetch, apiUrl } from '../../lib/api';
 import { useMe } from '../../lib/useMe';
 import { SOURCE_COLOR, SOURCE_LABEL, SOURCE_NOTE, sourceOf } from '../source';
+import { SECTIONS, type SectionKey } from '../sections';
 
 // 커맨드/로그의 줄바꿈 유지 + 긴 문자열 강제 줄바꿈. 지식 본문은 명령어가 섞인
 // 긴 글이라 줄간격을 기본값보다 넉넉히 준다 (읽기 어렵다는 피드백이 있었음).
@@ -42,34 +43,6 @@ const bodyTextStyle = {
   lineHeight: 1.75,
 } as const;
 
-// 본문 8칸의 표시 순서·라벨·설명. 보기 화면과 수정 폼이 같은 목록에서 나오므로
-// 필드를 추가할 때 한 군데만 고치면 된다. 순서는 읽는 흐름 그대로 —
-// 어떤 환경에서(환경) 무엇이 잘못됐고(문제) 어떻게 좁혀(진단) 원인을 찾아(원인)
-// 무엇을 했고(해결) 어떻게 확인하며(검증) 무엇을 조심하는지(주의).
-type SectionKey =
-  | 'environment' | 'problem' | 'diagnosis' | 'root_cause'
-  | 'resolution' | 'verification' | 'caveats' | 'related_refs';
-
-interface Section {
-  key: SectionKey;
-  label: string;
-  hint: string;
-  rows: number;
-  mono?: boolean;   // 명령어·식별자가 들어가는 칸은 고정폭으로
-  cards?: boolean;  // 한 줄에 하나씩인 항목은 보기 화면에서 카드로 (공식 문서 근거와 동일)
-  tone?: 'warn';    // 주의사항은 경고 색 강조
-}
-
-const SECTIONS: Section[] = [
-  { key: 'environment', label: '환경 · 전제 조건', hint: '구성 방식, 토폴로지, 장비 모델, 버전, 라이선스', rows: 3 },
-  { key: 'problem', label: '문제 상황', hint: '어떤 조건에서 무엇이 잘못됐는지', rows: 4 },
-  { key: 'diagnosis', label: '진단 절차', hint: '원인을 좁혀간 명령·로그·테스트를 순서대로', rows: 4 },
-  { key: 'root_cause', label: '근본 원인', hint: '밝혀진 원인 (모르면 비워둡니다)', rows: 3 },
-  { key: 'resolution', label: '해결 조치', hint: 'CLI 명령어·설정 라인·패치 버전을 그대로', rows: 6, mono: true },
-  { key: 'verification', label: '검증 방법', hint: '조치 후 어떤 명령의 어떤 출력을 확인하는지', rows: 3, mono: true },
-  { key: 'caveats', label: '주의사항', hint: '부작용, 재발 조건, 적용 범위 밖인 상황', rows: 3, tone: 'warn' },
-  { key: 'related_refs', label: '관련 참조', hint: '벤더 버그 ID·케이스 번호·문서명 (한 줄에 하나)', rows: 2, mono: true, cards: true },
-];
 
 const monoStyle = {
   ...bodyTextStyle,
@@ -103,6 +76,7 @@ interface KnowledgeDetail {
   analyzed_by: string;
   references: KnowledgeReference[];
   source: string; // case | lab | chat | manual | '' (불명)
+  author: string | null;   // 직접 작성한 사람 (AI 추출 항목은 null)
   source_case: { id: number; case_id: string; status: string; vendor_case_number: string | null } | null;
   source_session: { id: number; title: string } | null;
   source_run: { id: number; lab: string; blueprint: string; status: string } | null;
@@ -286,7 +260,9 @@ export default function KnowledgeDetailPage() {
               <Text fw={700} c="dimmed">{item.knowledge_id}</Text>
               <Badge color={getVendorColor(item.vendor)} variant="light">{item.vendor}</Badge>
               <Badge color={item.status === 'confirmed' ? 'green' : 'yellow'} variant="dot">
-                {item.status === 'confirmed' ? '확정' : 'AI 초안'}
+                {/* 사람이 쓴 초안까지 'AI 초안'이라 부르면 거짓말이 된다 */}
+                {item.status === 'confirmed' ? '확정'
+                  : sourceOf(item) === 'manual' ? '작성 초안' : 'AI 초안'}
               </Badge>
               {item.device_model && (
                 <Badge variant="outline" color="gray">
@@ -450,6 +426,7 @@ export default function KnowledgeDetailPage() {
               </Group>
               <Text size="xs" c="dimmed">
                 {item.analyzed_by && `추출 모델: ${item.analyzed_by} · `}
+                {item.author && `작성 ${item.author} · `}
                 등록 {item.created_at.slice(0, 10)}
               </Text>
             </Group>
