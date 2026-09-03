@@ -2876,7 +2876,6 @@ class LabRegistryTests(TestCase):
         self.login('lr-a')
         with patch('api.views.eveng.EvengClient', return_value=fake_eveng()):
             self.register()
-        self.login('lr-e')
         labs = self.client.get('/api/labs/').json()
 
         self.assertEqual([l['path'] for l in labs], ['/AI-LAB-A10-OneArm.unl'])
@@ -2934,11 +2933,15 @@ class LabRegistryTests(TestCase):
             self.register()
             self.assertEqual(self.register().status_code, 409)
 
-    def test_engineer_cannot_register_but_can_view(self):
-        """등록은 관리자, 조회·갱신은 엔지니어."""
+    def test_engineer_is_blocked_everywhere(self):
+        """랩은 동시에 한 사람만 쓸 수 있어 엔지니어에게도 닫혀 있다.
+
+        여럿이 나눠 쓸 수 있게 되면 IsLabUser를 IsEngineerOrAbove로 되돌리고
+        이 테스트는 등록만 관리자로 남는 형태로 돌아간다.
+        """
         self.login('lr-e')
         self.assertEqual(self.register().status_code, 403)
-        self.assertEqual(self.client.get('/api/labs/').status_code, 200)
+        self.assertEqual(self.client.get('/api/labs/').status_code, 403)
 
     def test_viewer_is_blocked_everywhere(self):
         self.login('lr-v')
@@ -3009,7 +3012,8 @@ class LabPowerAndAccessTests(TestCase):
     def setUp(self):
         from .models import Lab, LabNode, LabServer
         from .permissions import set_user_role
-        for username, role in (('lp-v', 'viewer'), ('lp-e', 'engineer')):
+        for username, role in (('lp-v', 'viewer'), ('lp-e', 'engineer'),
+                               ('lp-a', 'admin')):
             user = User.objects.create_user(username, password='lp-pass-1!')
             set_user_role(user, role)
         server = LabServer.objects.create(base_url='http://eve.test')
@@ -3017,7 +3021,7 @@ class LabPowerAndAccessTests(TestCase):
         LabNode.objects.create(lab=self.lab, name='A10_1', eve_id=3, ram=8192)
         LabNode.objects.create(lab=self.lab, name='Arista_1', eve_id=1, ram=4096)
 
-    def login(self, username='lp-e'):
+    def login(self, username='lp-a'):
         self.client.post('/api/auth/login/',
                          {'username': username, 'password': 'lp-pass-1!'},
                          content_type='application/json')
@@ -3056,6 +3060,13 @@ class LabPowerAndAccessTests(TestCase):
 
     def test_viewer_cannot_control_power(self):
         self.login('lp-v')
+        res = self.client.post(f'/api/labs/{self.lab.id}/power/', {'action': 'stop'},
+                               content_type='application/json')
+        self.assertEqual(res.status_code, 403)
+
+    def test_engineer_cannot_control_power(self):
+        """랩은 동시에 한 사람만 쓸 수 있어 엔지니어에게도 닫혀 있다."""
+        self.login('lp-e')
         res = self.client.post(f'/api/labs/{self.lab.id}/power/', {'action': 'stop'},
                                content_type='application/json')
         self.assertEqual(res.status_code, 403)
@@ -3203,7 +3214,7 @@ class LabCheckTests(TestCase):
         from .models import Lab, LabLink, LabNode, LabNodeAccess, LabServer
         from .permissions import set_user_role
         user = User.objects.create_user('lc-e', password='lc-pass-1!')
-        set_user_role(user, 'engineer')
+        set_user_role(user, 'admin')   # 랩은 관리자 전용 (IsLabUser)
         server = LabServer.objects.create(base_url='http://eve.test')
         self.lab = Lab.objects.create(server=server, path='/x.unl', name='x')
         for name in ('Arista_1', 'A10_1'):
@@ -3363,7 +3374,7 @@ class LabIpPlanTests(TestCase):
         for lab in (self.lab, self.other):
             LabNode.objects.create(lab=lab, name='Arista_1', eve_id=1)
 
-    def login(self, username='ip-e'):
+    def login(self, username='ip-a'):
         self.client.post('/api/auth/login/',
                          {'username': username, 'password': 'ip-pass-1!'},
                          content_type='application/json')
@@ -3422,12 +3433,16 @@ class LabIpPlanTests(TestCase):
         self.assertEqual(first, '172.16.0.0/24')
         self.assertEqual(lab_ipplan.suggest_data_subnet(self.server), '172.16.1.0/24')
 
-    def test_pool_edits_are_admin_only(self):
+    def test_engineer_cannot_touch_pools(self):
+        """랩이 관리자 전용이라 풀은 읽기조차 막힌다 (전에는 읽기만 열려 있었다)."""
         url = f'/api/labs/servers/{self.server.id}/ip-pools/'
         self.login('ip-e')
-        self.assertEqual(self.client.get(url).status_code, 200)
+        self.assertEqual(self.client.get(url).status_code, 403)
         self.assertEqual(self.client.put(url, {'pools': []},
                                          content_type='application/json').status_code, 403)
+
+    def test_admin_can_edit_pools(self):
+        url = f'/api/labs/servers/{self.server.id}/ip-pools/'
 
         self.login('ip-a')
         res = self.client.put(url, {'pools': [
@@ -3469,7 +3484,7 @@ class LabRecipeTests(TestCase):
         from .models import Lab, LabBlueprint, LabNode, LabNodeAccess, LabServer
         from .permissions import set_user_role
         user = User.objects.create_user('rc-e', password='rc-pass-1!')
-        set_user_role(user, 'engineer')
+        set_user_role(user, 'admin')   # 랩은 관리자 전용 (IsLabUser)
         server = LabServer.objects.create(base_url='http://eve.test')
         self.lab = Lab.objects.create(server=server, path='/x.unl', name='x')
         LabNode.objects.create(lab=self.lab, name='Arista_1', eve_id=1,
@@ -3652,7 +3667,7 @@ class LabRunnerTests(TestCase):
         from .models import (Lab, LabBlueprint, LabNode, LabNodeAccess, LabServer)
         from .permissions import set_user_role
         user = User.objects.create_user('lr2-e', password='lr2-pass-1!')
-        set_user_role(user, 'engineer')
+        set_user_role(user, 'admin')   # 랩은 관리자 전용 (IsLabUser)
         server = LabServer.objects.create(base_url='http://eve.test')
         self.lab = Lab.objects.create(server=server, path='/x.unl', name='x')
         LabNode.objects.create(lab=self.lab, name='Arista_1', eve_id=1)
@@ -3917,7 +3932,8 @@ class LabAgentTests(TestCase):
     def setUp(self):
         from .models import Lab, LabNode, LabNodeAccess, LabServer
         from .permissions import set_user_role
-        for username, role in (('la-v', 'viewer'), ('la-e', 'engineer')):
+        for username, role in (('la-v', 'viewer'), ('la-e', 'engineer'),
+                               ('la-a', 'admin')):
             user = User.objects.create_user(username, password='la-pass-1!')
             set_user_role(user, role)
         server = LabServer.objects.create(base_url='http://eve.test')
@@ -3927,7 +3943,7 @@ class LabAgentTests(TestCase):
                                      mgmt_ip='10.0.0.1', driver='arista_eapi',
                                      username='u', password='p')
 
-    def login(self, username='la-e'):
+    def login(self, username='la-a'):
         self.client.post('/api/auth/login/',
                          {'username': username, 'password': 'la-pass-1!'},
                          content_type='application/json')
@@ -4033,7 +4049,7 @@ class LabAgentTests(TestCase):
         AppSetting.set(lab_agent.LAB_AGENT_MODEL_SETTING_KEY, 'claude-haiku-4-5')
         self.assertEqual(lab_agent.get_model(), 'claude-opus-5')
 
-        self.login()
+        self.login('la-e')
         res = self.client.put('/api/settings/lab-agent-model/',
                               {'model': 'claude-haiku-4-5'},
                               content_type='application/json')
@@ -4066,7 +4082,8 @@ class LabConfigTests(TestCase):
 
     def setUp(self):
         from .permissions import set_user_role
-        for username, role in (('lab-v', 'viewer'), ('lab-e', 'engineer')):
+        for username, role in (('lab-v', 'viewer'), ('lab-e', 'engineer'),
+                               ('lab-a', 'admin')):
             user = User.objects.create_user(username, password='lab-pass-1!')
             set_user_role(user, role)
 
@@ -4078,7 +4095,7 @@ class LabConfigTests(TestCase):
     @override_settings(EVENG_URL='', EVENG_USER='', EVENG_PASSWORD='')
     def test_reports_unconfigured_without_failing(self):
         """설정이 없어도 500이 아니라 configured=false를 돌려줘야 화면이 안내를 띄운다."""
-        self.login('lab-e')
+        self.login('lab-a')
         res = self.client.get('/api/labs/config/')
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json(), {'configured': False, 'server': ''})
@@ -4086,7 +4103,7 @@ class LabConfigTests(TestCase):
     @override_settings(EVENG_URL='http://10.0.0.5', EVENG_USER='admin',
                        EVENG_PASSWORD='secret')
     def test_reports_configured_without_leaking_credentials(self):
-        self.login('lab-e')
+        self.login('lab-a')
         body = self.client.get('/api/labs/config/').json()
 
         self.assertTrue(body['configured'])
@@ -4098,13 +4115,14 @@ class LabConfigTests(TestCase):
     @override_settings(EVENG_URL='http://10.0.0.5', EVENG_USER='admin', EVENG_PASSWORD='')
     def test_partial_settings_count_as_unconfigured(self):
         """셋 중 하나라도 비면 접속이 안 되므로 설정된 것으로 보지 않는다."""
-        self.login('lab-e')
+        self.login('lab-a')
         self.assertFalse(self.client.get('/api/labs/config/').json()['configured'])
 
-    def test_viewer_is_blocked(self):
-        """노드 전원 제어가 엔지니어 이상이라 랩 화면 자체를 같은 기준으로 막는다."""
-        self.login('lab-v')
-        self.assertEqual(self.client.get('/api/labs/config/').status_code, 403)
+    def test_non_admin_is_blocked(self):
+        """랩은 동시에 한 사람만 쓸 수 있어 화면 자체를 관리자에게만 연다."""
+        for username in ('lab-v', 'lab-e'):
+            self.login(username)
+            self.assertEqual(self.client.get('/api/labs/config/').status_code, 403)
 
 
 class KnowledgeModelSettingTests(TestCase):

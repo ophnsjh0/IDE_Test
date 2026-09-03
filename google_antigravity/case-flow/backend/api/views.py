@@ -23,7 +23,7 @@ from django.conf import settings
 
 from . import knowledge_image_views
 from .models import AppSetting, Case, ChatSession, ChatTurn, KnowledgeItem, UsageEvent
-from .permissions import IsAdminRole, IsEngineerOrAbove
+from .permissions import IsAdminRole, IsEngineerOrAbove, IsLabUser
 from .serializers import (CaseSerializer, CaseDetailSerializer,
                           ChatSessionDetailSerializer, ChatSessionSerializer,
                           KnowledgeCreateSerializer, KnowledgeItemSerializer,
@@ -933,7 +933,7 @@ class LabConfigView(APIView):
     미설정일 때 빈 화면 대신 무엇을 해야 하는지 알려주기 위한 값이다.
     """
 
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def get(self, request):
         configured = bool(settings.EVENG_URL and settings.EVENG_USER
@@ -971,7 +971,7 @@ def _eveng_error_response(exc):
 
 class LabListView(generics.ListAPIView):
     """GET /api/labs/ — Case-Flow에 등록된 랩 목록 (엔지니어 이상)."""
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
     serializer_class = LabSerializer
 
     def get_queryset(self):
@@ -1062,7 +1062,7 @@ class LabRegisterView(APIView):
 
 class LabTopologyView(APIView):
     """GET /api/labs/<id>/ — 저장된 토폴로지 스냅샷 (엔지니어 이상)."""
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def get(self, request, id):
         from .models import Lab
@@ -1081,7 +1081,7 @@ class LabRefreshView(APIView):
     노드 행을 재사용한다 — eve_id·console 포트는 서버를 옮기면 재부여되므로
     갱신되는 값으로만 다룬다.
     """
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def post(self, request, id):
         from .models import Lab, LabLink, LabNetwork, LabNode
@@ -1126,7 +1126,7 @@ class LabIconView(APIView):
     브라우저가 EVE-NG에 직접 붙지 않게 한다(자격증명 비노출 + 사내망에서
     EVE-NG에 못 닿는 자리에서도 화면이 뜬다).
     """
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def get(self, request, filename):
         try:
@@ -1144,7 +1144,7 @@ class LabAccessView(APIView):
     EVE-NG가 모르는 값이라 사람이 적는다. 토폴로지 스냅샷과 분리돼 있어
     "토폴로지 갱신"으로 덮이지 않는다. 비밀번호는 저장만 하고 돌려주지 않는다.
     """
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def get(self, request, id):
         from .models import Lab
@@ -1217,7 +1217,7 @@ class LabStatusView(APIView):
     SSE 대신 폴링인 이유: 부팅은 분 단위로 진행되고 백엔드도 결국 EVE-NG를
     폴링해야 한다. 긴 연결을 유지하는 값이 크지 않고, 취소·재시도가 단순하다.
     """
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def get(self, request, id):
         from .models import Lab
@@ -1286,7 +1286,7 @@ class LabPowerView(APIView):
     nodes를 생략하면 랩 전체. 조작은 백그라운드에서 순차로 돌고, 진행 상황은
     /status/ 폴링으로 본다 — 9노드를 동기로 처리하면 요청이 수십 초 걸린다.
     """
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def post(self, request, id):
         from .models import Lab
@@ -1326,7 +1326,7 @@ class LabCheckView(APIView):
     대조한다. 설정은 건드리지 않는다. 판정은 전부 코드가 한다 — LLM은 나중에
     이 결과를 설명할 뿐 통과/실패를 정하지 않는다.
     """
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def post(self, request, id):
         from .models import Lab
@@ -1348,7 +1348,7 @@ class LabCheckView(APIView):
 
 class LabBlueprintView(APIView):
     """GET/POST /api/labs/<id>/blueprints/ — 시나리오 목록·등록 (엔지니어 이상)."""
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def get(self, request, id):
         from .models import Lab
@@ -1409,7 +1409,7 @@ class LabRunView(APIView):
     동기로 돈다. 랩 시나리오는 단계가 많지 않고, 진행 중에 화면을 떠나도
     적용 원장이 남아 롤백 버튼으로 되돌릴 수 있다.
     """
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def get(self, request, id):
         from .models import LabRun
@@ -1454,7 +1454,7 @@ class CaseLabRunView(APIView):
     건너가기만 한다 — 랩을 돌리려면 노드가 켜져 있고 준비됐는지부터 봐야
     하는데 그 판정은 랩 화면에만 있다. 실행 경로를 두 벌로 만들지 않는다.
     """
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def get(self, request, id):
         from .models import Case, LabRun
@@ -1474,7 +1474,7 @@ class LabRunDetailView(APIView):
     지식·케이스 화면이 "이 결과가 나온 실행"으로 건너뛸 수 있어야 해서 둔다.
     랩 화면을 거치지 않고 실행 하나만 집어 올 수 있는 유일한 경로다.
     """
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def get(self, request, run_id):
         from .models import LabRun
@@ -1499,7 +1499,7 @@ class LabIpPoolView(APIView):
     def get_permissions(self):
         if self.request.method == 'PUT':
             return [IsAdminRole()]
-        return [IsEngineerOrAbove()]
+        return [IsLabUser()]
 
     def get(self, request, server_id):
         from .models import LabServer
@@ -1558,7 +1558,7 @@ class LabRecipeView(APIView):
     verified로 올라간다. 아는 실패(그 버전에 없는 명령)는 known_failure로
     표시해 넣을 수 있다.
     """
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def get(self, request):
         from .services import lab_recipes
@@ -1624,7 +1624,7 @@ class LabRunKnowledgeExtractView(APIView):
     왜 안 됐는지는 기록에 남지 않고 돌려본 사람 머릿속에 있다 — AI가 요약할
     것이 아니라 사람이 직접 적어야 한다.
     """
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     ERROR_MESSAGES = {
         'not_verified': '검증에 통과한 단계가 없는 실행입니다. 통과한 실행만 '
@@ -1671,7 +1671,7 @@ class LabRollbackView(APIView):
     대화와 무관하게 사람이 누른다. 실행이 중간에 죽었어도 원장만 있으면
     되돌아간다 — 두 번 눌러도 안전하다(이미 되돌린 항목은 건너뛴다).
     """
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def post(self, request, run_id):
         from .models import LabRun
@@ -1716,7 +1716,7 @@ class LabChatView(APIView):
     에이전트는 설정을 바꿀 수 없다. 변경은 제안(LabProposal)으로만 나오고,
     적용은 사람이 승인 엔드포인트를 눌렀을 때 이뤄진다.
     """
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def post(self, request, id):
         from .models import Lab, LabProposal
@@ -1749,7 +1749,7 @@ class LabProposalView(APIView):
     사람이 이 엔드포인트를 부를 때만 일어난다. 프롬프트가 아니라 코드로 막는
     자리라, 도구 쪽에서 우회할 방법이 없어야 한다.
     """
-    permission_classes = [IsEngineerOrAbove]
+    permission_classes = [IsLabUser]
 
     def post(self, request, proposal_id):
         from .models import LabBlueprint, LabProposal, LabRun

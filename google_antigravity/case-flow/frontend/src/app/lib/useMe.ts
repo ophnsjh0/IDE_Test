@@ -36,5 +36,9 @@ export function useMe() {
     me,
     canWrite: role === 'engineer' || role === 'admin',
     isAdmin: role === 'admin',
+    // Lab Tests는 아직 동시에 한 사람만 쓸 수 있어 관리자만 연다.
+    // 서버의 대응 게이트는 permissions.IsLabUser — 여럿이 쓸 수 있게 되면
+    // 양쪽 한 줄씩만 되돌린다.
+    canUseLabs: role === 'admin',
   };
 }

@@ -1282,6 +1282,32 @@ function LabsPageInner() {
 // useSearchParams는 Suspense 경계 안에서만 쓸 수 있다 (지식·케이스에서
 // /labs?case=…, /labs?run=… 으로 건너오는 링크를 받기 위해 필요하다).
 export default function LabsPage() {
+  const { me, canUseLabs } = useMe();
+
+  // 권한 판정이 끝나기 전에는 본체를 띄우지 않는다. 안쪽이 붙자마자 랩 API를
+  // 부르는데, 권한이 없으면 apiFetch가 403을 세션 만료로 보고 로그인 페이지로
+  // 보내버려서 "로그아웃됐다"로 오해하게 된다.
+  if (me === null) {
+    return <Center h="100vh"><Loader /></Center>;
+  }
+
+  if (!canUseLabs) {
+    return (
+      <AppShell header={{ height: 60 }} padding="md">
+        <AppShell.Header><AppHeader /></AppShell.Header>
+        <AppShell.Main>
+          <Center h="60vh">
+            <Alert color="gray" title="Lab Tests는 관리자 전용입니다" maw={520}>
+              랩은 아직 동시에 한 사람만 쓸 수 있습니다 — 같은 랩을 둘이 함께
+              켜고 설정을 넣으면 서로의 상태를 덮어씁니다. 여러 사람이 나눠 쓸 수
+              있게 되면 엔지니어에게도 열 예정입니다.
+            </Alert>
+          </Center>
+        </AppShell.Main>
+      </AppShell>
+    );
+  }
+
   return (
     <Suspense fallback={<Center h="100vh"><Loader /></Center>}>
       <LabsPageInner />

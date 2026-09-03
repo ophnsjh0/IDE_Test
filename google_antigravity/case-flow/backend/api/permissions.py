@@ -47,3 +47,13 @@ class IsAdminRole(BasePermission):
 
     def has_permission(self, request, view):
         return _has_role_level(request.user, 'admin')
+
+
+# Lab Tests 전용 게이트. 랩은 아직 **동시에 한 사람만** 쓸 수 있다 — EVE-NG 랩
+# 하나를 둘이 같이 켜고 설정을 넣으면 서로의 상태를 덮고, 롤백 원장도 누구 것인지
+# 갈리지 않는다. 전사 공개 중인 운영 서버에 올라가 있는 동안은 관리자만 들어온다.
+#
+# 별칭으로 둔 이유는 되돌리기 위해서다 — 여러 사람이 쓸 수 있게 되면
+# IsEngineerOrAbove로 이 한 줄만 바꾸면 랩 엔드포인트 전체가 함께 풀린다.
+# 프론트의 대응 게이트는 useMe().canUseLabs.
+IsLabUser = IsAdminRole

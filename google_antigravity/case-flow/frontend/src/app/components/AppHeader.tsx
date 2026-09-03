@@ -94,8 +94,9 @@ export default function AppHeader() {
         >
           Documents
         </Button>
-        {/* 랩 노드 전원 제어가 엔지니어 이상이라 메뉴도 같은 기준으로 노출한다 */}
-        {isEngineer && (
+        {/* 랩은 아직 동시에 한 사람만 쓸 수 있어 관리자에게만 보인다
+            (서버도 permissions.IsLabUser로 같이 막는다) */}
+        {isAdmin && (
           <Button
             component={Link}
             href="/labs"

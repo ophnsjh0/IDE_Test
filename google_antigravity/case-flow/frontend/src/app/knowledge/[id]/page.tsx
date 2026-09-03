@@ -94,7 +94,7 @@ export default function KnowledgeDetailPage() {
   const [isEditing, setIsEditing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
-  const { canWrite, isAdmin } = useMe();
+  const { canWrite, isAdmin, canUseLabs } = useMe();
 
   const form = useForm({
     initialValues: {
@@ -434,7 +434,9 @@ export default function KnowledgeDetailPage() {
                     {item.source_case.vendor_case_number && ` (${item.source_case.vendor_case_number})`}
                   </Button>
                 )}
-                {item.source_run && (
+                {/* 랩 화면에 못 들어가는 사람에게는 링크 대신 글로 보여준다 —
+                    출처가 무엇인지는 알아야 하지만, 눌러봐야 막힌다 */}
+                {item.source_run && (canUseLabs ? (
                   <Button
                     size="compact-sm"
                     variant="light"
@@ -444,7 +446,11 @@ export default function KnowledgeDetailPage() {
                   >
                     {item.source_run.lab} · {item.source_run.blueprint}
                   </Button>
-                )}
+                ) : (
+                  <Text size="sm" c="teal">
+                    {item.source_run.lab} · {item.source_run.blueprint}
+                  </Text>
+                ))}
                 {item.source_session && (
                   <Text size="sm" c="grape">{item.source_session.title}</Text>
                 )}

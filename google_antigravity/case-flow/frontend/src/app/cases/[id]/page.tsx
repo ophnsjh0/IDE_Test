@@ -103,7 +103,7 @@ export default function CaseDetailPage() {
   const [deleteOpened, setDeleteOpened] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState('');
-  const { canWrite, isAdmin } = useMe();
+  const { canWrite, isAdmin, canUseLabs } = useMe();
   const [extracting, setExtracting] = useState(false);
   const [extractResult, setExtractResult] = useState<{ ok: boolean; text: string } | null>(null);
   // 이 케이스를 랩에서 재현한 기록. 엔지니어 이상만 볼 수 있는 API라
@@ -173,13 +173,15 @@ export default function CaseDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
+  // 랩 권한이 없으면 아예 부르지 않는다. apiFetch는 403을 세션 만료로 보고
+  // 로그인 페이지로 보내버려서, 케이스를 열기만 해도 로그아웃된 것처럼 보인다.
   useEffect(() => {
-    if (!id || !canWrite) return;
+    if (!id || !canUseLabs) return;
     apiFetch(`/api/cases/${id}/lab-runs/`)
       .then((res) => (res.ok ? res.json() : { runs: [] }))
       .then((data) => setLabRuns(data.runs ?? []))
       .catch(() => setLabRuns([]));
-  }, [id, canWrite]);
+  }, [id, canUseLabs]);
 
   const [relationInput, setRelationInput] = useState('');
   const [relationError, setRelationError] = useState('');
@@ -519,8 +521,10 @@ export default function CaseDetailPage() {
           </Paper>
 
           {/* 랩 재현 — 이 케이스를 우리 장비에서 실제로 돌려본 기록.
-              시작은 랩 화면에서 한다(노드가 준비됐는지 판정이 거기 있다). */}
-          {canWrite && (
+              시작은 랩 화면에서 한다(노드가 준비됐는지 판정이 거기 있다).
+              랩을 못 쓰는 사람에게는 통째로 감춘다 — 눌러도 서버가 막아
+              빈 화면만 보게 된다. */}
+          {canUseLabs && (
             <Paper shadow="xs" p="xl" withBorder mt="lg">
               <Group justify="space-between" mb="md">
                 <Title order={3}>랩 재현 ({labRuns.length})</Title>
