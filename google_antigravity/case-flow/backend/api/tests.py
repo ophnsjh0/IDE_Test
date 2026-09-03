@@ -15,7 +15,7 @@ from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from .models import AppSetting, Case, CaseEmail
+from .models import AppSetting, Case, CaseEmail, KnowledgeItem
 from .services import (analyzer, eveng, gmail_sync, help_agent, lab_agent,
                        lab_drivers, lab_probe)
 from .services.email_parser import (build_gmail_query, clean_subject,
@@ -5245,3 +5245,182 @@ class CaseKnowledgeExtractTests(TestCase):
         self.client.force_login(self.engineer)
         self.assertEqual(
             self.client.post('/api/cases/999999/knowledge/').status_code, 404)
+
+
+# PNG/JPEG/WEBP 시그니처 — 업로드 검사가 확장자가 아니라 내용을 본다는 것을
+# 확인하려면 진짜 앞머리 바이트가 필요하다.
+PNG_BYTES = b'\x89PNG\r\n\x1a\n' + b'\x00' * 32
+JPG_BYTES = b'\xff\xd8\xff' + b'\x00' * 32
+WEBP_BYTES = b'RIFF' + b'\x00' * 4 + b'WEBP' + b'\x00' * 32
+
+
+class KnowledgeImageTests(TestCase):
+    """지식 항목 첨부 이미지 — 업로드/열람/수정/삭제와 역할별 권한 경계."""
+
+    def setUp(self):
+        from .permissions import set_user_role
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        images_override = override_settings(KNOWLEDGE_IMAGES_DIR=self.root)
+        images_override.enable()
+        self.addCleanup(images_override.disable)
+
+        self.viewer = User.objects.create_user('img-viewer', password='x')
+        set_user_role(self.viewer, 'viewer')
+        self.engineer = User.objects.create_user('img-eng', password='x')
+        set_user_role(self.engineer, 'engineer')
+        self.admin = User.objects.create_user('img-admin', password='x')
+        set_user_role(self.admin, 'admin')
+
+        self.item = KnowledgeItem.objects.create(
+            vendor='Arista', title='MLAG 이중화 구성', problem='문제',
+            resolution='조치', source='manual')
+
+    def _upload(self, content=PNG_BYTES, name='diagram.png', **extra):
+        data = {'file': SimpleUploadedFile(name, content, content_type='image/png')}
+        data.update(extra)
+        return self.client.post(f'/api/knowledge/{self.item.id}/images/', data)
+
+    def test_upload_stores_file_and_meta(self):
+        self.client.force_login(self.engineer)
+        response = self._upload(caption='One-Arm 구성도', section='environment')
+        self.assertEqual(response.status_code, 201)
+
+        images = response.json()['images']
+        self.assertEqual(len(images), 1)
+        meta = images[0]
+        self.assertEqual(meta['caption'], 'One-Arm 구성도')
+        self.assertEqual(meta['section'], 'environment')
+        self.assertEqual(meta['original_name'], 'diagram.png')
+        self.assertEqual(meta['uploaded_by'], 'img-eng')
+        # 파일명은 uuid로 새로 짓는다 — 올린 이름을 그대로 쓰지 않는다
+        self.assertNotIn('diagram', meta['filename'])
+        self.assertTrue((self.root / meta['filename']).is_file())
+
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.images, images)
+
+    def test_upload_accepts_jpg_and_webp(self):
+        self.client.force_login(self.engineer)
+        self.assertEqual(self._upload(JPG_BYTES, 'a.jpg').status_code, 201)
+        self.assertEqual(self._upload(WEBP_BYTES, 'b.webp').status_code, 201)
+
+    def test_upload_rejects_non_image_content(self):
+        """확장자를 png로 바꿔 붙여도 내용이 이미지가 아니면 거절한다."""
+        self.client.force_login(self.engineer)
+        response = self._upload(b'<html>not an image</html>', 'evil.png')
+        self.assertEqual(response.status_code, 400)
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.images, [])
+
+    def test_upload_rejects_riff_that_is_not_webp(self):
+        """RIFF 컨테이너는 WEBP 말고도 있다 — 형식 태그까지 봐야 한다."""
+        self.client.force_login(self.engineer)
+        wav = b'RIFF' + b'\x00' * 4 + b'WAVE' + b'\x00' * 32
+        self.assertEqual(self._upload(wav, 'sound.webp').status_code, 400)
+
+    def test_upload_rejects_oversized_file(self):
+        from .knowledge_image_views import MAX_UPLOAD_BYTES
+        self.client.force_login(self.engineer)
+        big = PNG_BYTES + b'\x00' * MAX_UPLOAD_BYTES
+        response = self._upload(big, 'big.png')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('5MB', response.json()['error'])
+
+    def test_upload_rejects_unknown_section(self):
+        self.client.force_login(self.engineer)
+        response = self._upload(section='nowhere')
+        self.assertEqual(response.status_code, 400)
+
+    def test_upload_caps_image_count(self):
+        from .knowledge_image_views import MAX_IMAGES_PER_ITEM
+        self.client.force_login(self.engineer)
+        for _ in range(MAX_IMAGES_PER_ITEM):
+            self.assertEqual(self._upload().status_code, 201)
+        response = self._upload()
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(str(MAX_IMAGES_PER_ITEM), response.json()['error'])
+
+    def test_viewer_cannot_upload_but_can_view(self):
+        self.client.force_login(self.engineer)
+        filename = self._upload().json()['images'][0]['filename']
+
+        self.client.force_login(self.viewer)
+        self.assertEqual(self._upload().status_code, 403)
+        # 지식은 전사 공개라 그림도 전 역할이 본다
+        response = self.client.get(f'/api/knowledge/images/{filename}')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'image/png')
+        self.assertEqual(response['X-Content-Type-Options'], 'nosniff')
+
+    def test_file_view_blocks_directory_escape(self):
+        secret = self.root.parent / 'secret.png'
+        secret.write_bytes(PNG_BYTES)
+        self.addCleanup(secret.unlink)
+        self.client.force_login(self.viewer)
+        response = self.client.get('/api/knowledge/images/../secret.png')
+        self.assertEqual(response.status_code, 404)
+
+    def test_patch_updates_caption_and_section(self):
+        self.client.force_login(self.engineer)
+        filename = self._upload(section='environment').json()['images'][0]['filename']
+        response = self.client.patch(
+            f'/api/knowledge/{self.item.id}/images/',
+            {'filename': filename, 'caption': '수정된 설명', 'section': 'diagnosis'},
+            content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        meta = response.json()['images'][0]
+        self.assertEqual(meta['caption'], '수정된 설명')
+        self.assertEqual(meta['section'], 'diagnosis')
+
+    def test_delete_removes_meta_and_file(self):
+        self.client.force_login(self.engineer)
+        filename = self._upload().json()['images'][0]['filename']
+        path = self.root / filename
+
+        response = self.client.delete(
+            f'/api/knowledge/{self.item.id}/images/',
+            {'filename': filename}, content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['images'], [])
+        self.assertFalse(path.exists())
+
+    def test_delete_unknown_filename_is_404(self):
+        self.client.force_login(self.engineer)
+        response = self.client.delete(
+            f'/api/knowledge/{self.item.id}/images/',
+            {'filename': '999/nope.png'}, content_type='application/json')
+        self.assertEqual(response.status_code, 404)
+
+    def test_deleting_knowledge_item_removes_images(self):
+        self.client.force_login(self.engineer)
+        filename = self._upload().json()['images'][0]['filename']
+        path = self.root / filename
+
+        self.client.force_login(self.admin)  # 지식 삭제는 관리자만
+        response = self.client.delete(f'/api/knowledge/{self.item.id}/')
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(path.exists())
+        self.assertFalse(path.parent.exists())
+
+    def test_body_patch_cannot_overwrite_images(self):
+        """본문 수정이 images를 덮으면 파일은 남고 메타만 사라진다."""
+        self.client.force_login(self.engineer)
+        self._upload()
+        response = self.client.patch(
+            f'/api/knowledge/{self.item.id}/',
+            {'problem': '고쳐 쓴 문제', 'images': []},
+            content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()['images']), 1)
+        self.assertEqual(response.json()['problem'], '고쳐 쓴 문제')
+
+    def test_images_appear_in_detail_response(self):
+        self.client.force_login(self.engineer)
+        self._upload(caption='구성도')
+        self.client.force_login(self.viewer)
+        data = self.client.get(f'/api/knowledge/{self.item.id}/').json()
+        self.assertEqual(len(data['images']), 1)
+        self.assertEqual(data['images'][0]['caption'], '구성도')

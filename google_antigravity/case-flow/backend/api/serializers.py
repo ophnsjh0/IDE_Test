@@ -67,11 +67,13 @@ class KnowledgeItemSerializer(serializers.ModelSerializer):
         fields = ['id', 'knowledge_id', 'vendor', 'title', 'environment', 'problem',
                   'diagnosis', 'root_cause', 'resolution', 'verification', 'caveats',
                   'related_refs', 'device_model', 'software_version', 'status',
-                  'analyzed_by', 'references', 'source', 'source_case',
+                  'analyzed_by', 'references', 'images', 'source', 'source_case',
                   'source_session', 'source_run', 'author',
                   'created_at', 'updated_at']
-        # source는 출처 서열이라 사람이 고쳐 쓰면 안 된다 — 만든 경로가 정한다
-        read_only_fields = ['vendor', 'analyzed_by', 'references', 'source']
+        # source는 출처 서열이라 사람이 고쳐 쓰면 안 된다 — 만든 경로가 정한다.
+        # images는 전용 엔드포인트로만 바뀐다 — 본문 PATCH가 목록을 통째로
+        # 덮으면 파일은 남고 메타만 사라져 고아가 된다.
+        read_only_fields = ['vendor', 'analyzed_by', 'references', 'images', 'source']
 
 
 class KnowledgeCreateSerializer(serializers.ModelSerializer):

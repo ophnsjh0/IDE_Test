@@ -216,6 +216,16 @@ class KnowledgeItem(models.Model):
     # 이 지식을 뒷받침하는 벤더 공식 문서 발췌 목록 — 벡터 검색 후보를 AI가 선별.
     # [{'document', 'pages', 'score', 'note'}], 관련 문서 없으면 빈 목록.
     references = models.JSONField(default=list, blank=True)
+    # 구성도·캡처 이미지 [{'filename', 'original_name', 'caption', 'section',
+    # 'uploaded_by', 'uploaded_at', 'size_bytes'}]. 원본은 KNOWLEDGE_IMAGES_DIR에
+    # 있고 여기엔 참조만 남는다 (ChatTurn.attachments와 같은 방식).
+    #
+    # 본문 8칸 *밖에* 두는 이유: 지식 본문은 사람만 읽는 게 아니라 에이전트가
+    # 검색해 읽고 임베딩에도 들어간다. 이미지 경로를 본문 문자열에 섞으면
+    # 그 경로가 컨텍스트에 실려 나가고, 파일을 옮기는 순간 본문이 깨진다.
+    # 분리해 두면 본문은 순수 텍스트로 남아 기존 항목과 검색 경로가 같다.
+    # section은 본문 어느 칸 아래에 그릴지 — 빈 값이면 맨 아래 묶음.
+    images = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

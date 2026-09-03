@@ -34,6 +34,7 @@ import { apiFetch, apiUrl } from '../../lib/api';
 import { useMe } from '../../lib/useMe';
 import { SOURCE_COLOR, SOURCE_LABEL, SOURCE_NOTE, sourceOf } from '../source';
 import { SECTIONS, type SectionKey } from '../sections';
+import { ImageGallery, ImageManager, type KnowledgeImage } from '../ImageAttachments';
 
 // 커맨드/로그의 줄바꿈 유지 + 긴 문자열 강제 줄바꿈. 지식 본문은 명령어가 섞인
 // 긴 글이라 줄간격을 기본값보다 넉넉히 준다 (읽기 어렵다는 피드백이 있었음).
@@ -75,6 +76,7 @@ interface KnowledgeDetail {
   status: string; // draft | confirmed
   analyzed_by: string;
   references: KnowledgeReference[];
+  images: KnowledgeImage[];
   source: string; // case | lab | chat | manual | '' (불명)
   author: string | null;   // 직접 작성한 사람 (AI 추출 항목은 null)
   source_case: { id: number; case_id: string; status: string; vendor_case_number: string | null } | null;
@@ -186,7 +188,12 @@ export default function KnowledgeDetailPage() {
     );
   }
 
-  const filledSections = SECTIONS.filter((s) => (item[s.key] || '').trim());
+  const images = item.images ?? [];
+  const imagesOf = (key: SectionKey | '') => images.filter((i) => i.section === key);
+  // 글이 비어 있어도 그림이 붙어 있으면 그 칸은 보여준다 — 안 그러면 올린
+  // 구성도가 어디에도 안 나타난다
+  const filledSections = SECTIONS.filter(
+    (s) => (item[s.key] || '').trim() || imagesOf(s.key).length > 0);
   const emptyKeys: SectionKey[] = SECTIONS
     .filter((s) => !(item[s.key] || '').trim())
     .map((s) => s.key);
@@ -294,6 +301,14 @@ export default function KnowledgeDetailPage() {
                     {...form.getInputProps(s.key)}
                   />
                 ))}
+                <Divider my="xs" />
+                <ImageManager
+                  knowledgeId={item.id}
+                  images={images}
+                  // 그림은 즉시 저장되므로 화면의 item만 갈아끼운다. 본문 폼
+                  // 값은 건드리지 않는다 — 편집 중인 글이 날아가면 안 된다.
+                  onChange={(next) => setItem({ ...item, images: next })}
+                />
               </Stack>
             ) : (
               <>
@@ -312,7 +327,7 @@ export default function KnowledgeDetailPage() {
                             style={{ letterSpacing: '0.04em' }}>
                         {s.label}
                       </Text>
-                      {s.cards ? (
+                      {!(item[s.key] || '').trim() ? null : s.cards ? (
                         <Stack gap="xs">
                           {item[s.key].split('\n')
                             .map((line) => line.trim())
@@ -330,8 +345,23 @@ export default function KnowledgeDetailPage() {
                       ) : (
                         <Text size="sm" style={bodyTextStyle}>{item[s.key]}</Text>
                       )}
+                      <ImageGallery images={imagesOf(s.key)} />
                     </div>
                   ))}
+
+                  {/* 어느 칸에도 붙이지 않은 그림은 본문 끝에 모아 둔다 */}
+                  {imagesOf('').length > 0 && (
+                    <div style={{
+                      borderLeft: '3px solid var(--mantine-color-blue-3)',
+                      paddingLeft: 'var(--mantine-spacing-md)',
+                    }}>
+                      <Text fw={700} size="xs" c="dimmed" tt="uppercase" mb={8}
+                            style={{ letterSpacing: '0.04em' }}>
+                        구성도 · 이미지
+                      </Text>
+                      <ImageGallery images={imagesOf('')} />
+                    </div>
+                  )}
 
                   {/* 빈 칸을 감추면 무엇이 빠졌는지 아무도 모른다 — 채울 수 있는
                       사람에게만 한 줄로 알린다 */}

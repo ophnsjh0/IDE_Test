@@ -59,6 +59,9 @@ services:
       # 벤더 문서 PDF — 웹 Documents 페이지 업로드가 여기 저장되므로 쓰기 가능 마운트
       # (scp 이관 + ingest_references 방식도 계속 동작, docs/EMBEDDING.md)
       - ./backend/reference_docs:/app/backend/reference_docs
+      # 지식 항목의 구성도·캡처 이미지 — 웹에서 업로드되므로 쓰기 가능 마운트.
+      # 마운트가 없으면 이미지 재빌드 때 그림이 통째로 사라진다.
+      - ./backend/knowledge_images:/app/backend/knowledge_images
     ports:
       - "8000:8000"
     depends_on:

@@ -35,3 +35,6 @@ backend/reference_docs/
 
 # pull-vm-data.sh가 남기는 타임스탬프 백업 (수백 MB, 운영 데이터 포함)
 backend/db.sqlite3.bak-*
+
+# 지식 항목에 붙는 구성도·캡처 이미지 (운영 데이터, 저장소에 넣지 않는다)
+backend/knowledge_images/

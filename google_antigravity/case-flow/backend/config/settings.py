@@ -317,6 +317,11 @@ EVENG_PASSWORD = os.environ.get('CASEFLOW_EVENG_PASSWORD', '')
 # 모델 교체 시 전체 재임베딩 필요(ingest_references --force) — 비용은 전체 문서
 # 기준 $0.1 미만이라 부담 없음.
 REFERENCE_DOCS_DIR = BASE_DIR / 'reference_docs'
+# 지식 항목에 붙는 구성도·캡처 이미지. 벤더 문서와 폴더를 나누는 이유 —
+# 저쪽은 임베딩 대상인 공식 문서고 이쪽은 사람이 보는 그림이다.
+# 도커에서는 볼륨 마운트가 있어야 재빌드에도 남는다 (docker-compose.yml).
+KNOWLEDGE_IMAGES_DIR = Path(os.environ.get(
+    'CASEFLOW_KNOWLEDGE_IMAGES_DIR', BASE_DIR / 'knowledge_images'))
 EMBEDDING_MODEL = os.environ.get('CASEFLOW_EMBEDDING_MODEL', 'text-embedding-3-small')
 
 # 헬프 에이전트 역할별 모델 (합의 매핑: 트리아지·DB검색=haiku, 리포팅·기술지원=sonnet)

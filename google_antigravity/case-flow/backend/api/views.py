@@ -21,6 +21,7 @@ from rest_framework.views import APIView
 
 from django.conf import settings
 
+from . import knowledge_image_views
 from .models import AppSetting, Case, ChatSession, ChatTurn, KnowledgeItem, UsageEvent
 from .permissions import IsAdminRole, IsEngineerOrAbove
 from .serializers import (CaseSerializer, CaseDetailSerializer,
@@ -200,6 +201,13 @@ class KnowledgeDetailView(generics.RetrieveUpdateDestroyAPIView):
     def get(self, request, *args, **kwargs):
         log_event(request.user, 'knowledge_view', detail=f"K-{100 + kwargs['id']}")
         return super().get(request, *args, **kwargs)
+
+    def perform_destroy(self, instance):
+        # 붙어 있던 그림도 함께 지운다 — 안 그러면 참조가 사라진 파일만
+        # 디스크에 남고, 어느 항목 것이었는지 알 방법이 없어 정리도 못 한다
+        knowledge_id = instance.id
+        super().perform_destroy(instance)
+        knowledge_image_views.delete_images_dir(knowledge_id)
 
 
 class TranslationModelView(APIView):

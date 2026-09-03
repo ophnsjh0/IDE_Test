@@ -1,5 +1,5 @@
 from django.urls import path
-from . import auth_views, reference_views, views
+from . import auth_views, knowledge_image_views, reference_views, views
 
 urlpatterns = [
     path('health/', views.health_check, name='health_check'),
@@ -21,6 +21,13 @@ urlpatterns = [
          name='case-relation-remove'),
     path('knowledge/', views.KnowledgeListView.as_view(), name='knowledge-list'),
     path('knowledge/sync/', views.KnowledgeSyncView.as_view(), name='knowledge-sync'),
+    # 이미지 경로가 <int:id>보다 먼저 와야 'images'가 id로 잡히지 않는다
+    path('knowledge/images/<path:name>',
+         knowledge_image_views.KnowledgeImageFileView.as_view(),
+         name='knowledge-image-file'),
+    path('knowledge/<int:id>/images/',
+         knowledge_image_views.KnowledgeImageListView.as_view(),
+         name='knowledge-images'),
     path('knowledge/<int:id>/', views.KnowledgeDetailView.as_view(),
          name='knowledge-detail'),
     path('references/', reference_views.ReferenceListView.as_view(),
